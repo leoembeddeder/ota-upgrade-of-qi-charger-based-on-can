@@ -71,8 +71,8 @@ CCU (0x03)  ──── CAN 总线 ────  MCU (0x0D)  ──── UART 
 
 ```
 APB1 = 180 MHz → CAN 时钟 18 MHz (DIV=10)
-SJW=4, BTS1=54, BTS2=18
-标称 250 kbps，采样点约 76.4%
+SJW=4, BTS1=63, BTS2=9
+标称 250 kbps，采样点 87.5%
 ```
 
 **SIT1145 低功耗**：Standby 时 CAN 收发器处于低功耗监听，任意 250kbps 扩展帧即可唤醒。APP 启动后恢复 Normal 模式。
