@@ -1,0 +1,884 @@
+# Qi 无线充电模块 — CAN 通信与 OTA 完整手册
+
+> 本文档合并自「通用CAN协议规范」「CAN-UDS通信协议结构」「CAN-UDS OTA 工作流程」三份文档，
+> 去除重复内容，按「基础 → 协议 → 项目 → 实操」的顺序重新组织。
+>
+> 配套文档：Flash 分配方案 / APP镜像打包与产线烧录 / 签名校验与脚本使用
+
+---
+
+## 目录
+
+- [第一部分 CAN 基础](#第一部分-can-基础)
+  - [1. 网络拓扑](#1-网络拓扑)
+  - [2. 物理层参数](#2-物理层参数)
+  - [3. CAN ID 寻址](#3-can-id-寻址)
+- [第二部分 传输层 ISO-TP](#第二部分-传输层-iso-tp)
+  - [4. 四种帧类型](#4-四种帧类型)
+  - [5. 单帧与多帧示例](#5-单帧与多帧示例)
+  - [6. 定时参数](#6-定时参数)
+- [第三部分 UDS 诊断服务](#第三部分-uds-诊断服务)
+  - [7. 请求与响应格式](#7-请求与响应格式)
+  - [8. 常用 UDS 服务](#8-常用-uds-服务)
+  - [9. 会话管理](#9-会话管理)
+  - [10. 安全访问](#10-安全访问)
+  - [11. 否定响应码 NRC](#11-否定响应码-nrc)
+- [第四部分 项目结构](#第四部分-项目结构)
+  - [12. 硬件平台](#12-硬件平台)
+  - [13. 两个工程：Bootloader 与 APP](#13-两个工程bootloader-与-app)
+  - [14. Flash 布局](#14-flash-布局)
+  - [15. DID 一览](#15-did-一览)
+  - [16. 生命周期广播](#16-生命周期广播)
+- [第五部分 OTA 升级流程](#第五部分-ota-升级流程)
+  - [17. 端到端 OTA 全景](#17-端到端-ota-全景)
+  - [18. Bootloader 工作流](#18-bootloader-工作流)
+  - [19. APP 工作流](#19-app-工作流)
+  - [20. Safe Mode 逐步 CAN 帧](#20-safe-mode-逐步-can-帧)
+  - [21. Trial 试运行与回滚](#21-trial-试运行与回滚)
+  - [22. 错误与回滚速查](#22-错误与回滚速查)
+- [第六部分 参考](#第六部分-参考)
+  - [23. 关键常量](#23-关键常量)
+  - [24. 中断与时基](#24-中断与时基)
+  - [25. 实现约束](#25-实现约束)
+
+---
+
+# 第一部分 CAN 基础
+
+## 1. 网络拓扑
+
+CCU（地址 0x03）是诊断主节点，Qi 充电模块（地址 0x0D）是诊断目标节点。
+
+```
+CCU (0x03)  ──── CAN 总线 ────  Qi 模块 (0x0D)
+  诊断主节点                        诊断目标节点
+```
+
+多个外设可共享同一 CAN 总线，每个外设使用唯一的源地址。
+
+## 2. 物理层参数
+
+| 参数 | 值 |
+|------|-----|
+| CAN 标准 | CAN 2.0B，Classical CAN |
+| 波特率 | 250 kbps |
+| 帧格式 | 29-bit 扩展帧 |
+| 最大 DLC | 8 字节 |
+| 字节序 | 小端（Little-endian），除非另有说明 |
+| CAN 收发器 | SIT1145（SPI1 控制） |
+
+**位时序配置**：
+
+```
+APB1 = 180 MHz → CAN 时钟 18 MHz (DIV=10)
+SJW=4, BTS1=63, BTS2=9
+标称 250 kbps，采样点约 87.5%
+```
+
+**SIT1145 低功耗**：Standby 时 CAN 收发器处于低功耗监听，任意 250kbps 扩展帧即可唤醒。APP 启动后恢复 Normal 模式。
+
+## 3. CAN ID 寻址
+
+采用 J1939 风格 PDU1 寻址，CAN ID 布局：`0x18DA{TA}{SA}`
+
+- 优先级 = 6，PF = 0xDA（点对点诊断）
+- TA = 目标地址，SA = 源地址
+
+| CAN ID | 方向 | 用途 |
+|--------|------|------|
+| `0x18DA0D03` | CCU → Qi 模块 | UDS 物理寻址请求 |
+| `0x18DA030D` | Qi 模块 → CCU | UDS 物理寻址响应 |
+| `0x18DB33xx` | CCU → 所有外设 | 功能寻址广播（PF=0xDB，PS=0x33） |
+| `0x18FF260D` | Qi 模块 → 总线 | 生命周期状态广播（1Hz） |
+
+**功能寻址**：PS 字段为功能组地址 0x33，SA 无限制，接收端通过 PS=0x33 识别。Safe Mode 下也接收功能寻址帧。
+
+---
+
+# 第二部分 传输层 ISO-TP
+
+## 4. 四种帧类型
+
+ISO-TP（ISO 15765-2）负责将 UDS 报文封装到 CAN 帧中。通过 PCI（Protocol Control Information）的高 4 位区分：
+
+| 帧类型 | PCI 高 4 位 | 用途 |
+|--------|------------|------|
+| 单帧 (SF) | 0x0 | 载荷 ≤ 7 字节，单帧传输 |
+| 首帧 (FF) | 0x1 | 多帧传输的第一帧 |
+| 连续帧 (CF) | 0x2 | 多帧传输的后续帧 |
+| 流控制帧 (FC) | 0x3 | 接收方控制发送方节奏 |
+
+## 5. 单帧与多帧示例
+
+### 单帧（SF）
+
+最常用。UDS 载荷 ≤ 7 字节时，直接放在一个 CAN 帧里：
+
+```
+CAN 数据: [PCI | SF_DL | UDS 数据 ...]
+          Byte0   Byte1    Byte2~7
+
+示例 — 读 DID 0xF195 [22 F1 95]:
+  CAN: 03 22 F1 95 00 00 00 00
+       ─┬─ ───────┬───────
+        │          └── UDS: 3 字节
+        └── PCI: SF=0, DL=3
+```
+
+### 多帧（FF + FC + CF）
+
+UDS 载荷 > 7 字节时，需要分帧传输：
+
+```
+发送方（CCU）                        接收方（ECU）
+  │                                     │
+  │  FF: [10 xx xx 前5字节数据]  ────▶  │  首帧
+  │                                     │
+  │  ◀── FC: [30 00 01] ──────────────  │  流控（允许继续，STmin=1ms）
+  │                                     │
+  │  CF: [21 后7字节] ────────────────▶  │  连续帧 SN=1
+  │  CF: [22 后7字节] ────────────────▶  │  连续帧 SN=2
+  │  ...                                │
+```
+
+**FF 结构**：`[FF_PCI(1B) | FF_DL(2B, 12bit) | UDS前5字节]`
+
+**FC 结构**：`[FC_PCI | FS | BS | STmin]`
+- FS=0 允许继续，FS=1 等待，FS=2 溢出
+- BS=0 无限制连续帧，STmin=1ms 最小间隔
+
+**CF 结构**：`[CF_PCI | UDS后续数据]`，SN 从 1 递增到 15 后回绕到 0
+
+## 6. 定时参数
+
+| 参数 | 含义 | 默认值 |
+|------|------|--------|
+| N_As | 发送方发送 CAN 帧的超时 | 1000 ms |
+| N_Ar | 接收方发送 FC 帧的超时 | 1000 ms |
+| N_Bs | 发送方等待 FC 帧的超时 | 1000 ms |
+| N_Cr | 接收方等待 CF 帧的超时 | 1000 ms |
+
+外设应拒绝畸形的 ISO-TP 传输，并在不需重新上电的情况下恢复。
+
+---
+
+# 第三部分 UDS 诊断服务
+
+## 7. 请求与响应格式
+
+### 请求
+
+```
+[SID] [SubFunction] [Data...]
+```
+
+- SID：服务标识符（1 字节）
+- SubFunction：子功能（可选，第 7 位 = 抑制肯定响应位）
+
+### 肯定响应
+
+```
+[SID + 0x40] [SubFunction] [Data...]
+```
+
+### 否定响应
+
+```
+7F [SID] [NRC]
+```
+
+- 固定前缀 0x7F
+- 原始 SID
+- NRC：否定响应码
+
+## 8. 常用 UDS 服务
+
+### 0x10 — DiagnosticSessionControl（会话切换）
+
+切换 ECU 诊断会话模式。
+
+| 子功能 | 值 | 用途 |
+|--------|-----|------|
+| Default | 0x01 | 正常运行，只读诊断 |
+| Programming | 0x02 | 固件更新，Flash 操作 |
+| Extended | 0x03 | 受保护配置，扩展诊断 |
+
+```
+请求: 10 02           → 切到编程会话
+响应: 50 02 13 FF 00 CC → 确认, P2=5119ms, P2*=204ms
+```
+
+**P2 与 P2\***：
+- **P2**（`13 FF` = 5119ms）：正常响应超时，MCU 必须在此时间内回复
+- **P2\***（`00 CC` = 204ms）：发出 NRC 0x78（ResponsePending）后的扩展超时
+
+### 0x11 — ECUReset（复位）
+
+| 子功能 | 值 | 说明 |
+|--------|-----|------|
+| hardReset | 0x01 | 硬复位（最常用） |
+| hardReset(suppress) | 0x81 | 硬复位，不发响应 |
+
+```
+请求: 11 01     → 硬复位
+响应: 51 01     → 确认
+```
+
+### 0x22 — ReadDataByIdentifier（按标识符读数据）
+
+```
+请求: 22 [DID_H] [DID_L]
+响应: 62 [DID_H] [DID_L] [Data...]
+```
+
+支持单次读取多个 DID（在一次请求中列出多个 DID）。
+
+### 0x2E — WriteDataByIdentifier（按标识符写数据）
+
+```
+请求: 2E [DID_H] [DID_L] [Data...]
+响应: 6E [DID_H] [DID_L]
+```
+
+受保护 DID 需要 SecurityAccess Level 1。
+
+### 0x27 — SecurityAccess（安全访问）
+
+详见[第 10 节](#10-安全访问)。
+
+### 0x31 — RoutineControl（例程控制）
+
+| 子功能 | 值 | 说明 |
+|--------|-----|------|
+| Start | 0x01 | 启动例程 |
+| Stop | 0x02 | 停止例程 |
+| RequestResults | 0x03 | 请求结果 |
+
+```
+请求: 31 01 FF 00 [addr 4B] [size 4B]  → 擦除 Flash
+响应: 71 01 FF 00                       → 完成
+```
+
+### 0x34 — RequestDownload（请求下载）
+
+```
+请求: 34 [DataFormatID] [AddrAndLenFormatID] [MemAddr...] [MemSize...]
+响应: 74 [LengthFormatID] [MaxNumberOfBlockLength...]
+```
+
+需 SecurityAccess Level 1。正响应中 `maxNumberOfBlockLength` 定义了后续 0x36 每包最大数据量。
+
+### 0x36 — TransferData（传输数据）
+
+```
+请求: 36 [BlockSequenceCounter] [Data...]
+响应: 76 [BlockSequenceCounter]
+```
+
+- BlockSequenceCounter 从 0x01 开始，每帧递增，到 0xFF 后回绕到 0x01
+- 0x00 不作为正常序号使用
+
+### 0x37 — RequestTransferExit（退出传输）
+
+```
+请求: 37
+响应: 77
+```
+
+ECU 收到后执行校验（CRC32 + ECDSA 签名）。
+
+### 0x3E — TesterPresent（测试仪在线）
+
+保持非默认会话活跃，防止超时。
+
+```
+请求: 3E 00     → 有响应
+响应: 7E 00
+
+请求: 3E 80     → 抑制肯定响应（静默保活）
+响应: 无
+```
+
+## 9. 会话管理
+
+### 会话类型
+
+| 会话 | 值 | 用途 | 安全状态 |
+|------|-----|------|---------|
+| Default | 0x01 | 正常运行，只读诊断 | 自动清除 |
+| Programming | 0x02 | 固件更新，Flash 操作 | 需重新解锁 |
+| Extended | 0x03 | 受保护配置，扩展诊断 | 需重新解锁 |
+
+### 会话切换状态机
+
+```
+                    0x10 0x02
+    ┌────────────┐ ──────────▶ ┌─────────────┐
+    │   Default  │             │ Programming  │
+    │   (0x01)   │ ◀────────── │   (0x02)     │
+    └────────────┘  0x10 0x01  └─────────────┘
+         ▲                         ▲
+         │ 0x10 0x01               │ 0x10 0x02
+         │ (或超时 5s)             │
+    ┌────────────┐                 │
+    │  Extended  │ ────────────────┘
+    │   (0x03)   │   0x10 0x02（清除安全状态）
+    └────────────┘
+```
+
+### 会话超时规则
+
+- 非默认会话 5 秒内未收到 TesterPresent → 自动回退到 Default，清除安全解锁
+- 从一个非默认切到另一个非默认 → 清除安全解锁状态
+- 进入 Default → 中止固件传输，清除安全状态
+
+### 何时需要重新验签
+
+| 场景 | 是否需要重新走 27 01→03→02 |
+|------|:--------------------------:|
+| 同一编程会话内的多条指令 | ❌ 一次通过即可 |
+| 从 Default 切到 Programming | ✅ |
+| 从 Programming 切到 Default 再切回 | ✅ |
+| S3 超时回退后重新进编程会话 | ✅ |
+| 同一编程会话内读 DID | ❌ 只读操作不需要 |
+
+### 各指令与安全权限
+
+| 指令 | 是否需要验签 | 说明 |
+|------|:----------:|------|
+| `10 02` 编程会话 | ❌ | 前置条件，不需要验签 |
+| `27 01/03/02` 验签 | — | 本身即验签操作，只做一次 |
+| `22 21 33` 读版本 | ❌ | 只读操作，无需安全权限 |
+| `2E 21 30` 启动升级 | ✅ | 写操作，必须先验签 |
+| `2E 21 31` 发数据 | ✅ | 写操作，必须先验签 |
+| `22 21 32` 查状态 | ❌ | 只读操作，无需安全权限 |
+| `2E 21 30 02` 中止 | ✅ | 写操作，必须先验签 |
+| `31 01 FF00` 擦槽 | ✅ | 写操作，必须先验签 |
+| `34` / `36` / `37` 下载 | ✅ | 写操作，必须先验签 |
+
+## 10. 安全访问
+
+### 挑战-响应流程（ECDSA P-256）
+
+```
+CCU (客户端)                        MCU (服务器)
+    │                                    │
+    │  27 01  ──────────────────────▶    │  请求种子
+    │  ◀── 67 01 [seed 4B] ──────────   │  返回 4 字节随机种子
+    │                                    │
+    │  3. CCU 用私钥对 SHA256(seed) 签名  │
+    │                                    │
+    │  27 03 分片送 64B 签名 ────────▶    │  共 16 帧，每帧 4B
+    │  27 02 触发验签 ──────────────▶    │
+    │  ◀── 7F 27 78 (等待中) ────────   │  先收到 ResponsePending
+    │  ◀── 67 02 (成功) ─────────────   │  数秒后出结果
+```
+
+**签名生成**（PC 侧）：
+
+```python
+import hashlib
+seed = bytes([s0, s1, s2, s3])  # 从 27 01 响应取
+h = hashlib.sha256(seed).digest()
+sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
+```
+
+**签名分片发送**（27 03）：
+
+```
+帧1:  07 27 03 01 [sig0-3]   → 03 67 03 01
+帧2:  07 27 03 02 [sig4-7]   → 03 67 03 02
+...
+帧16: 07 27 03 10 [sig60-63]  → 03 67 03 10
+```
+
+**安全要求**：
+- 种子每次请求必须唯一（硬件 RNG）
+- 公钥存储在 Device Info 区（`0x0801D000+56`），支持后期更换
+- 连续 3 次验签失败锁定 30 秒（NRC `0x36`）
+- 锁定期间返回 NRC `0x37`（requiredTimeDelayNotExpired）
+- 切 Default Session **不**清失败计数
+
+## 11. 否定响应码 NRC
+
+| NRC | 名称 | 常见场景 |
+|-----|------|---------|
+| 0x11 | ServiceNotSupported | APP 收到下载类 SID（APP 不支持 0x34/0x36/0x37） |
+| 0x12 | SubFunctionNotSupported | 非法 session / resetType |
+| 0x13 | IncorrectMessageLength | 请求长度错误 |
+| 0x22 | ConditionsNotCorrect | 非 Programming 就擦/下载；非 Programming 就写固件类型 |
+| 0x24 | RequestSequenceError | 未擦就 0x34；未 0x34 就 0x36 |
+| 0x31 | RequestOutOfRange | 固件类型不是 APP；size 过大；DID 无效 |
+| 0x33 | SecurityAccessDenied | 未解锁安全级别 |
+| 0x35 | InvalidKey | ECDSA 验签失败 |
+| 0x36 | ExceededNumberOfAttempts | 连续安全访问失败 3 次 |
+| 0x37 | RequiredTimeDelayNotExpired | 锁定冷却期内 |
+| 0x72 | GeneralProgrammingFailure | Flash 擦写/CRC/签名验证失败 |
+| 0x73 | WrongBlockSequenceCounter | 0x36 blockSeq 不连续 |
+| 0x78 | ResponsePending | 擦 Flash/验签/0x73 等长操作，先回 78 再出最终结果 |
+
+---
+
+# 第四部分 项目结构
+
+## 12. 硬件平台
+
+| 项 | 值 |
+|-----|-----|
+| 主控 | AT32F426KBU7-4，Cortex-M4F |
+| 主频 | 180 MHz |
+| Flash / SRAM | 128 KB / 20 KB |
+| CAN | CAN1，PA11=RX / PA12=TX，250 kbps |
+| CAN 收发器 | SIT1145（SPI1，PA4=CS/PA5=SCK/PA6=MISO/PA7=MOSI） |
+| USART2 | PA2/PA3，9600 8N1，接 Qi 芯片 |
+| 霍尔 | PA0：低电平=有手机，高电平=无手机 |
+| 12V Buck | PB1，低电平开启 |
+| 无线充 5V | PB2，高电平开启 |
+
+## 13. 两个工程：Bootloader 与 APP
+
+```
+                CAN 250 kbps, ISO-TP, ID 0x18DA0D03 / 0x18DA030D
+                ┌──────────────────────▲──────────────────────┐
+                │                      │                      │
+      ┌─────────┴──────────┐  ┌────────┴─────────┐
+      │ Bootloader 28 KB   │  │ APP 42 KB/槽     │
+      │ 0x08000000         │  │ 槽基址+256 入口  │
+      │ 引导 / 验签 / 跳转 │  │ 充电业务 + 触发  │
+      │ Safe Mode UDS 下载 │  │ Trial 确认/超时  │
+      └─────────┬──────────┘  └────────┬─────────┘
+                │   共享 metadata / XATO 头
+                ▼
+      0x0801C000 Primary  +  0x0801C800 Backup  +  0x0801D000 Device Info  +  0x0801E000 NVM
+```
+
+| 工程 | 目录 | 职责 |
+|------|------|------|
+| Bootloader | `qi_wireless_bootloader/` | 上电引导、槽选择、镜像校验、跳转；Safe Mode 完成全部下载 UDS |
+| APP Slot A | `qi_wireless_code_slotA/` | 充电业务、生命周期广播、UDS 查询；只负责把 MCU 送进 Boot |
+| APP Slot B | `qi_wireless_code_slotB/` | 同 Slot A，IROM1 Start = `0x08011900` |
+
+**产线只烧 Bootloader + Slot A**。Slot B 出厂为空，第一次现场 OTA 写入。
+
+### APP 与 Boot 的能力对比
+
+| 能力 | APP | Bootloader Safe Mode |
+|------|-----|---------------------|
+| `0x10` 会话 | Default/Programming/Extended | 同左 |
+| `0x11` hardReset | Programming 下先写 DOWNLOADING 再复位 | 回 0x51 后复位 |
+| `0x27` SecurityAccess | ECDSA 解锁（与 Boot 共用公钥） | ECDSA 解锁，下载硬门禁 |
+| `0x22` 读 DID | 版本、槽、OTA 状态等 | 同左 |
+| `0x2E 2010` 写固件类型 | Programming + 解锁后可写 01 | 只接受 01=APP |
+| `0x31 FF00` 擦槽 | NRC 0x11（不支持） | 擦非活跃槽 |
+| `0x34/0x36/0x37/0x38` | 一律 NRC 0x11 | 完整下载路径 |
+| Trial 确认/超时 | 100 ms 健康后确认 | 超限回滚 |
+
+**识别当前固件**：不要用 `0xF180` 或 `0x2113` 判断。APP 和 Boot 都实现了 `0x27`。正确方法：发 `0x34`——APP 回 `7F 34 11`，Boot 不回 `0x11`。
+
+## 14. Flash 布局
+
+| 区域 | 起始 | 大小 | 说明 |
+|------|------|------|------|
+| Bootloader | `0x08000000` | 28 KB | 引导 + Safe Mode |
+| Slot A | `0x08007000` | 42 KB | 头 256B + 代码，入口 `0x08007100` |
+| Slot B | `0x08011800` | 42 KB | 同上，入口 `0x08011900` |
+| Metadata 主 | `0x0801C000` | 2 KB | `ota_metadata_t` 272B |
+| Metadata 备 | `0x0801C800` | 2 KB | 先写备、再写主 |
+| Device Info | `0x0801D000` | 4 KB | SN、ECDSA 公钥，OTA 擦写跳过 |
+| NVM | `0x0801E000` | 8 KB | APP 配置 |
+
+**Flash 擦除粒度**：AT32F426 的 Flash 页大小为 **1 KB（0x400）**。
+
+### Metadata 结构（272B，magic `"MATO"`）
+
+| 字段 | 含义 |
+|------|------|
+| `active_slot` | 最近一次已确认的槽（0=A，1=B） |
+| `pending_slot` | 刚下完待试运行的槽；0xFE = 无 |
+| `trial_state` | 0 IDLE / 1 PENDING / 2 ACTIVE / 3 CONFIRMED |
+| `trial_slot` / `trial_retry_count` | 试运行槽与重试（默认上限 3） |
+| `trial_timeout_sec` | APP 确认窗口，默认 10 秒 |
+| `ota_state` | 0 IDLE / 1 DOWNLOADING（为 1 时 Boot 不跳 APP） |
+| `last_boot_reason` | 0x00 上电 / 0x01 软件复位 / 0x02 WDG / 0x03 OTA 激活 / 0x04 回滚 |
+
+### Image Header（槽起始 256B，magic `"XATO"`）
+
+```
+槽基址 + 0x000  magic / image_length / crc32 / signature[64] / version[16] / timestamp
+槽基址 + 0x100  应用镜像（向量表 + 代码），长度 ≤ 0xA700
+```
+
+CRC32 和 ECDSA 只覆盖头后面的固件（不含头本身）。跳转地址 = 槽基址 + 256。
+
+## 15. DID 一览
+
+### 标识类 DID（定长 32 字节，右补 ASCII 空格）
+
+| DID | 名称 | 访问 | 说明 |
+|-----|------|------|------|
+| 0xF180 | Bootloader 版本 | 读 | 编译期字符串 |
+| 0xF18C | 序列号 SN | 读；产线可写 | Device Info 区，写需 Programming + Level 1 |
+| 0xF193 | 硬件版本 | 读 | 优先 Device Info，否则编译期字符串 |
+| 0xF195 | APP 软件版本 | 读 | 来自本槽 XATO 头 version[] |
+
+### 固件管理 DID
+
+| DID | 名称 | R/W | 说明 |
+|-----|------|-----|------|
+| 0x2010 | 固件类型 | R/W | 读固定 0x01；写需 Programming + 解锁 |
+| 0x2120 | ECDSA 公钥 | R/W | 65 字节 SEC1 未压缩，写需解锁 |
+
+### OTA 状态 DID
+
+| DID | 名称 | R/W | 说明 |
+|-----|------|-----|------|
+| 0x2112 | OTA 状态 | R | metadata ota_state |
+| 0x2113 | 活跃槽 | R | 正在运行的槽（VTOR） |
+| 0x2114 | 待定槽 | R | pending_slot |
+| 0x2115 | 上次启动原因 | R | last_boot_reason |
+| 0x2116 | 回滚次数 | R | retry_count 低 8 位 |
+
+### 充电控制 DID
+
+| DID | 名称 | R/W | 说明 |
+|-----|------|-----|------|
+| 0x2100 | 充电器能力 | R | 4B，byte0=15（15W） |
+| 0x2101 | 充电器使能 | W | 0x00=禁用，0x01=使能，复位后默认 0x00 |
+| 0x2102 | 充电状态 | R | PB2 电平映射 |
+| 0x2103 | 设备在位 | R | 从 Qi 帧回调更新 |
+| 0x2104 | 输出功率 | R | uint16 mW，从 Qi 帧回调更新 |
+| 0x2109 | FOD 状态 | R | 0x00=正常，0x02=FOD |
+| 0x210B | 故障码 | R | 0x00=无，0x04=过压，0x05=欠压，0x06=FOD，0x07=过温，0x0A=过流 |
+| 0x210C | 热降额等级 | R | 85 度保护/60 度恢复 |
+| 0x210D | 功率限值 | W | 三档 5W/10W/15W，NVM 持久化 |
+| 0x2118 | 夹臂状态 | R | PA0 低=0x00(有手机)，高=0x01(无手机) |
+
+### Qi IAP DID
+
+| DID | 名称 | R/W | 说明 |
+|-----|------|-----|------|
+| 0x2130 | Qi IAP 控制 | W | 0x01=启动（+大小）/0x02=中止 |
+| 0x2131 | Qi IAP 数据 | W | 地址 + 最多 22B |
+| 0x2132 | Qi IAP 状态 | R | 8B：state/progress/version/sent/total |
+| 0x2133 | Qi 芯片版本 | R | uint16 LE，来自 UART 0x01 上报 |
+
+## 16. 生命周期广播
+
+ECU 通过 CAN ID `0x18FF260D` 广播生命周期状态（1Hz）：
+
+```
+Byte0: 状态码
+Byte1: 0x41 (APP) / 0x42 (Boot)
+Byte2~7: 扩展信息
+```
+
+| 状态码 | 名称 | 含义 |
+|--------|------|------|
+| 0x01 | BOOTUP | 上电或复位后 100ms 内发送 |
+| 0x02 | INITIALIZING | 正在初始化 |
+| 0x03 | OPERATIONAL | 已就绪 |
+| 0x04 | DEGRADED | 降级运行 |
+| 0x05 | FAULT | 严重故障 |
+| 0x06 | SHUTDOWN | 准备断电 |
+
+---
+
+# 第五部分 OTA 升级流程
+
+## 17. 端到端 OTA 全景
+
+### 场景 A — 板子正在跑 APP（现场升级）
+
+```
+主机                        APP                        Bootloader
+ │  10 02                    │                             │
+ ├─────────────────────────▶│ 50 02                       │
+ │  11 01                    │ prepare DOWNLOADING         │
+ ├─────────────────────────▶│ 51 01 → reset ─────────────▶│
+ │                           │                             │ DOWNLOADING → Safe Mode
+ │  （等 ~2.5s）             │                             │
+ │  10 02 / 27 / 2E / 31 …  │                             │
+ ├─────────────────────────────────────────────────────────▶│ 擦对面槽、写镜像
+ │  11 01                    │                             │ 37 置 PENDING
+ ├─────────────────────────────────────────────────────────▶│ reset
+ │                           │◀──── 跳 trial 槽入口 ───────┤
+ │  22 F195 读版本           │ 100ms 后 CONFIRMED           │
+```
+
+### 场景 B — 已在 Safe Mode（空片/双槽无效/上次下载未完成）
+
+直接从下面第 20 节的 Safe Mode 逐步 CAN 帧开始，不需要先发 `10 02 + 11`。
+
+### 两种场景的差别
+
+| | 场景 A（APP → Boot） | 场景 B（Safe Mode） |
+|--|--|--|
+| 触发方式 | `10 02` + `11 01` → APP 写 DOWNLOADING 后复位 | 直接在 Safe Mode |
+| 镜像链接要求 | 必须链接到**非活跃槽**（Reset Handler 落在目标槽） | 空片时链接到 Slot A |
+| 首帧 | `10 02`（进编程会话） | 同左 |
+
+## 18. Bootloader 工作流
+
+入口：`qi_wireless_bootloader/mdk_user/Src/main.c`
+
+```
+上电 / 复位
+  │
+  ├─ system_clock_config()  180 MHz
+  ├─ boot_metadata_init(&g_meta)  主区 → 备份 → 默认值
+  ├─ last_boot_reason = detect_boot_reason()
+  │
+  ├─ ota_state == DOWNLOADING ?
+  │     是 → enter_safe_mode()  （不返回）
+  │
+  ├─ process_trial_state(&g_meta)
+  ├─ select_boot_slot()
+  ├─ try_boot_slot(选中槽)  只验签，通过后 jump
+  │     失败 → try_boot_slot(另一槽)
+  └─ 双槽失败 → enter_safe_mode()
+```
+
+### enter_safe_mode
+
+- 事件循环：`timer_poll` + `can_driver_poll` + `isotp_poll` + SIT1145 保活（每 500ms 重发 `sit1145_normal_mode_set()`）
+- **不清 ota_state**，保持 DOWNLOADING，直到：
+  - `0x37` 成功（写成 IDLE + PENDING）
+  - S3 超时 / 切回 Default，且至少有一个槽 valid（写成 IDLE）
+
+### select_inactive_slot（选非活跃槽）
+
+擦写永远对着**对面槽**，不覆盖正在跑的：
+
+| 条件 | 下载目标 |
+|------|---------|
+| A valid 且 active_slot == A | B |
+| B valid 且 active_slot == B | A |
+| A 无效（含出厂空片） | A |
+| 其余 | B |
+
+### boot_verify_image（镜像校验 5 步）
+
+| 步骤 | 校验内容 |
+|------|---------|
+| 1 | magic == XATO |
+| 2 | 0 < image_length ≤ 槽大小 − 256 |
+| 3 | CRC32(固件) == header.crc32 |
+| 4 | Reset Handler（清 Thumb 位）落在 [入口, 槽末) |
+| 5 | SHA256(固件) + uECC_verify(Boot 内公钥, signature) |
+
+### boot_jump_to_app
+
+关中断 → 复位 CAN1 → 关 SPI1 → **SIT1145 Standby** → 关 SysTick → 清 NVIC → VTOR = app_addr → 读 MSP / Reset_Handler → Thumb 跳转
+
+## 19. APP 工作流
+
+入口：`qi_wireless_code_slotA/mdk_user/Src/main.c`
+
+```
+SCB->VTOR = &__Vectors
+system_clock_config / NVIC GROUP_4
+can_driver_init  (SIT1145 先 Standby)
+can_protocol_init  (trial 则直接 Normal，否则 offline 等唤醒)
+qi_uart_init
+__enable_irq()
+lifecycle_init  (发 BOOTUP)
+ota_trial_init  (若本镜像正在 trial，启动 10s 窗口)
+
+while (1)
+  timer_poll / can_driver_poll / can_protocol_poll / qi_uart_poll
+  lifecycle_poll  (OPERATIONAL 时每 1000ms 广播)
+  ota_trial_poll  (健康 100ms 后 CONFIRMED；超时 NVIC_SystemReset)
+```
+
+### APP 触发 OTA（唯一入口）
+
+```
+主机 → APP : 10 02          Programming Session
+主机 → APP : 11 01          hardReset
+APP: ota_trigger_prepare()  写 ota_state = DOWNLOADING
+    → SHUTDOWN + 等 TX
+    → NVIC_SystemReset
+Bootloader: DOWNLOADING → Safe Mode
+```
+
+`ota_trigger_prepare()`：
+- 读 metadata；两份都坏则填默认值，把当前运行槽标 valid（避免误判"没有 APP"）
+- **不擦槽、不改 active_slot**
+- 只写 `ota_state = DOWNLOADING`，先 Backup 再 Primary
+
+非 Programming 会话下的 `11 01`：不写 DOWNLOADING，只复位。此时 Bootloader 会再跳回 APP。
+
+### Trial 确认
+
+`ota_trial_init`：仅当 `trial_state==ACTIVE` 且 `trial_slot == ota_running_slot()`（VTOR 判断）才打开窗口。
+
+`ota_trial_poll`：
+- 超过 `trial_timeout_sec`（10s）→ `NVIC_SystemReset()`，Bootloader 看到仍是 ACTIVE，累加 retry，超限回滚
+- 启动满 100ms 后 `ota_confirm_trial()`：`active_slot = trial_slot`，`trial_state = CONFIRMED`
+
+## 20. Safe Mode 逐步 CAN 帧
+
+适用：Bootloader 已进入 Safe Mode（空片、双槽无效，或 ota_state=DOWNLOADING）。
+
+请求 ID `0x18DA0D03`，响应 ID `0x18DA030D`，扩展帧，250 kbps。
+
+### 必做顺序
+
+```
+10 02 进编程会话
+  → 27 01 要 seed
+  → 27 03 分片送 64B 签名（16帧）
+  → 27 02 验签（可能先 7F 27 78）
+  → 2E 2010 01 选 APP 固件类型
+  → 31 01 FF00 擦非活跃槽        ← 不擦直接 34 会 NRC 0x24
+  → 34 申请下载
+  → 36 按块写镜像（必须是 pack_image.py 打的包）
+  → 37 结束传输并验签
+  → 11 01 复位进试用
+```
+
+### 逐步 CAN 数据
+
+| 步 | 作用 | 发出 (8字节) | 期望响应 |
+|----|------|-------------|---------|
+| 1 | Programming Session | `02 10 02 00 00 00 00 00` | `02 50 02 ...` |
+| 2 | RequestSeed | `02 27 01 00 00 00 00 00` | `06 67 01 s0 s1 s2 s3` |
+| 3 | 签名分片 ×16 | `07 27 03 ss d0 d1 d2 d3` | `03 67 03 ss ...` |
+| 4 | SendKey 验签 | `02 27 02 00 00 00 00 00` | 先 `7F 27 78`，再 `02 67 02` |
+| 5 | 固件类型 APP | `04 2E 20 10 01 00 00 00` | `03 6E 20 10 ...` |
+| 6 | 擦非活跃槽 | `04 31 01 FF 00 00 00 00` | 先 `7F 31 78`，再 `04 71 01 FF 00` |
+| 7 | RequestDownload | 见下文 | `04 74 20 01 00` (maxBlock=256) |
+| 8 | TransferData | `36` + blockSeq + 数据 | `02 76 ss ...` |
+| 9 | TransferExit | `01 37 00 00 00 00 00 00` | 先 `7F 37 78`，再 `01 77` |
+| 10 | 复位 | `02 11 01 00 00 00 00 00` | `02 51 01`，MCU 复位 |
+
+**注意**：第 6 步擦槽只擦固件 Slot 区域，不擦 Device Info 保留区（`0x0801D000`~`0x0801DFFF`），SN 等设备信息 OTA 后仍保留。
+
+### 0x34 RequestDownload 示例
+
+简单版（不校验总长）：
+
+```
+02 34 00 00 00 00 00 00
+```
+
+正式版（size = 打包文件总长，含 256B 头）：
+
+```
+UDS: 34 00 44 00 00 00 00 00 00 10 00
+     SID ALFID  4B 地址(忽略)   4B 长度
+
+FF:  10 0B 34 00 44 00 00 00    (ISO-TP 首帧)
+CF:  21 00 00 00 10 00 00 00    (ISO-TP 连续帧)
+```
+
+### 0x36 TransferData
+
+blockSeq 从 0x01 起，FF 下一帧是 0x01（跳过 0x00）。
+
+单帧最多塞 5 字节数据：
+
+```
+07 36 01 d0 d1 d2 d3 d4
+```
+
+完整刷写走 ISO-TP 多帧，每包最多 254 字节数据。
+
+### S3 超时保活
+
+擦 Flash / 多帧传输过程中，每 5 秒要发一次 `02 3E 00` 防止掉回 Default Session。长步骤会先回 `7F xx 78`（ResponsePending），超时放到 8~10 秒。
+
+## 21. Trial 试运行与回滚
+
+### Trial 状态机
+
+| 进入 | 动作 |
+|------|------|
+| IDLE | 无 |
+| PENDING | → ACTIVE，retry++，last_boot_reason=OTA_ACT，保存 |
+| ACTIVE | 未确认又回到 Boot → retry++；> max_retries → 回滚 |
+| CONFIRMED | → IDLE，清 retry |
+
+**回滚动作**：IDLE、pending_slot=none、切 active_slot 到另一 valid 槽、BOOT_REASON_ROLLBACK
+
+**回滚原则**：
+- 未通过 5 项校验的镜像不会被跳转
+- Trial 未确认不会改写 active_slot
+- 双槽无效永远能进 Safe Mode
+
+## 22. 错误与回滚速查
+
+| 现象 | 处理 |
+|------|------|
+| `7F 34 11` | 还在 APP，先 `10 02` + `11` |
+| `7F 34 24` | 没擦就 34 |
+| `7F xx 33` | 没过 0x27 |
+| `7F xx 22` | 不是 Programming Session，或 S3 掉线 |
+| `7F 36 73` | blockSeq 错，需重新 34 |
+| `7F 37 72` | 长度/CRC/槽内 Reset/ECDSA 失败 |
+| 新 APP 10s 内无确认 | APP 自己复位；retry 超限切回上一 valid 槽 |
+| 双槽都验不过 | Safe Mode，可再刷 |
+
+---
+
+# 第六部分 参考
+
+## 23. 关键常量
+
+```c
+/* Flash */
+BOOT_BASE_ADDR      0x08000000    BOOT_SIZE 0x7000
+APP_A_BASE_ADDR     0x08007000    APP_A_SIZE 0xA800    入口 0x08007100
+APP_B_BASE_ADDR     0x08011800    APP_B_SIZE 0xA800    入口 0x08011900
+IMAGE_HEADER_SIZE   256
+FLASH_SECTOR_SIZE   0x400         /* AT32F426 Flash 页大小: 1 KB */
+META_PRIMARY_ADDR   0x0801C000    META_BACKUP_ADDR 0x0801C800
+DEVICE_INFO_ADDR    0x0801D000    DEVICE_INFO_SIZE 0x1000
+
+/* UDS 时序 */
+UDS_MAX_BLOCK_LEN   256
+UDS_S3_TIMEOUT_MS   5000
+UDS_P2_TIMEOUT_MS   50
+UDS_P2_STAR_TIMEOUT_MS 5000
+
+/* Trial */
+TRIAL_MAX_RETRIES   3
+TRIAL_TIMEOUT_SEC   10
+TRIAL_HEALTH_DELAY_MS 100
+
+/* 安全访问 */
+SECURITY_MAX_FAILURES 3
+SECURITY_LOCKOUT_MS   30000
+```
+
+Keil Target（不用 scatter）：
+
+| | Slot A | Slot B |
+|--|--------|--------|
+| IROM1 Start | `0x08007100` | `0x08011900` |
+| IROM1 Size | `0xA700` | `0xA700` |
+| IRAM1 | `0x20000000` / `0x5000` | 同左 |
+
+## 24. 中断与时基
+
+Bootloader 与 APP 各有一份 `at32f422_426_int.c`，结构相同。优先级分组 4 位抢占。
+
+| 中断 | 优先级 | 处理 |
+|------|--------|------|
+| SysTick | 内核 | `timer_tick_inc()`，1ms |
+| CAN1 RX | (1,0) | 硬件缓冲 → 软件 FIFO，协议在主循环 |
+| CAN1 ERR | (2,0) | 总线关闭恢复 |
+| USART2 | (3,0) | 仅 APP：Qi RX FIFO |
+| Fault | — | `while(1)` |
+
+软件定时器最多 16 个。APP 生命周期用 `timer_get_tick()` 自己数 1000ms，不是独立硬件定时器。
+
+## 25. 实现约束
+
+1. **下载只在 Bootloader。** 不要用 `0xF180`+`0x2113` 判断当前固件。探测：`0x34` 回 `7F xx 11` → APP
+2. **镜像必须带 XATO 头**，且 Reset Handler 落在将要写入的槽。OTA 到 B 必须用 B 链接的 bin
+3. **私钥与 Bootloader 公钥绑定。** 路径 `docs/keys/private.pem`。换密钥后重烧 Bootloader
+4. **0x38 可选。** 打包时头里已签名则不必发 0x38
+5. **不实现看门狗。** Trial 失败靠 APP 10s 后 `NVIC_SystemReset`
+6. **metadata 掉电安全：** 先 Backup 再 Primary。APP 触发时不把运行槽标无效
+7. **S3 = 5s。** 擦写/多帧传输过程中要插 `3E 00`
