@@ -65,7 +65,7 @@ def main(argv=None):
     parser.add_argument("--bin", default=None, help="指定单个 Keil bin 路径（不指定则自动打包 Slot A + Slot B）")
     parser.add_argument("--key", default=DEFAULT_KEY, help="ECDSA P-256 私钥 PEM（须与 Bootloader 公钥成对）")
     parser.add_argument("--out", default=None, help="输出镜像路径（仅 --bin 模式有效）")
-    parser.add_argument("--version", default="1.0.0", help="写入头的版本字符串，默认 1.0.0")
+    parser.add_argument("--version", default="1.1.1", help="写入头的版本字符串，默认 1.1.1")
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.key):
