@@ -315,7 +315,7 @@ def validate_image(image):
     return linked
 
 
-def pack_image_if_needed(fw_path, priv, version="1.0.0"):
+def pack_image_if_needed(fw_path, priv, version="1.1.1"):
     data = open(fw_path, "rb").read()
     if len(data) >= IMAGE_HEADER_SIZE and struct.unpack_from("<I", data, 0)[0] == IMAGE_MAGIC:
         _log("固件已带 XATO 头, 总长 %d" % len(data))
