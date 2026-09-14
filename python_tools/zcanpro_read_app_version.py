@@ -79,7 +79,9 @@ def _uds_deinit():
 
 
 def _make_frame(can_id, data):
-    cid = int(can_id) & 0x1FFFFFFF
+    # ZLG：bit31=1 表示扩展帧。上次 raw 发出的是 18da0d03（无 x）标准帧，MCU 滤掉。
+    cid29 = int(can_id) & 0x1FFFFFFF
+    cid = cid29 | 0x80000000
     return {
         "can_id": cid,
         "id": cid,
@@ -88,8 +90,10 @@ def _make_frame(can_id, data):
         "is_extend": 1,
         "is_extended": 1,
         "extend": 1,
+        "extern_flag": 1,
+        "is_extern": 1,
         "eff": 1,
-        "frame_type": 1,
+        "id_type": 1,
         "data": _pad8(data),
     }
 
@@ -308,19 +312,23 @@ def wake_mcu(bus_id):
 def read_did_string(bus_id, did):
     payload = [(did >> 8) & 0xFF, did & 0xFF]
     last = []
-    try:
-        rx = uds_req(bus_id, SID_RDBI, payload)
-        return parse_did_string(did, rx)
-    except Exception as e:
-        last.append("uds=" + str(e))
-        _log("uds_request 失败，改原始组帧: " + str(e))
-    _uds_deinit()
+    # 先原始扩展帧组包：uds_request 会自己发 FC STmin=0，CF 乱序后直接超时，
+    # 且把 MCU 那一轮多帧吃掉，后面 raw 再发已晚。
     try:
         rx = isotp_raw_request(bus_id, SID_RDBI, payload)
         return parse_did_string(did, rx)
     except Exception as e:
         last.append("raw=" + str(e))
+        _log("原始组帧失败，改试 uds_request: " + str(e))
+    _uds_init()
+    try:
+        rx = uds_req(bus_id, SID_RDBI, payload)
+        return parse_did_string(did, rx)
+    except Exception as e:
+        last.append("uds=" + str(e))
         raise RuntimeError(" ; ".join(last))
+    finally:
+        _uds_deinit()
 
 
 def run(bus_id):
@@ -332,6 +340,8 @@ def run(bus_id):
 
     wake_mcu(bus_id)
     time.sleep(0.05)
+    _uds_deinit()
+    _log("UDS 已释放，改原始扩展帧读 DID（CAN 视图应变为 18da0d03x）")
 
     results = []
     for did, name in DID_LIST:
