@@ -28,6 +28,9 @@ static int8_t isotp_can_send(uint32_t can_id, uint8_t *frame, uint8_t len)
   {
     if (can_driver_send(can_id, frame, len) == 0)
     {
+      /* PTB 优先于 STB。CF 若未等上一帧上总线就塞进 STB，SN 会乱序，
+       * 主机 ISO-TP 组帧失败（ZCANPRO 表现为 22 F195 无应答）。 */
+      (void)can_driver_wait_tx_idle(ISOTP_N_AS_TIMEOUT_MS);
       return 0;
     }
   }
@@ -351,7 +354,14 @@ int8_t isotp_tx_send(uint32_t can_id, uint8_t *payload, uint16_t len)
       cf_in_block = 0;
     }
 
-    isotp_delay_ms(isotp_stmin_to_ms(stmin));
+    {
+      uint32_t gap = isotp_stmin_to_ms(stmin);
+      if (gap < 1U)
+      {
+        gap = 1U;
+      }
+      isotp_delay_ms(gap);
+    }
 
     frame[0] = ISOTP_PCI_TYPE_CF | (sn & 0x0FU);
     copy_len = (uint8_t)(len - offset);
