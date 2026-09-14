@@ -16,7 +16,7 @@ import sys
 
 try:
     import zcanpro
-except ImportError:
+except Exception:
     zcanpro = None
 
 # ======== UDS 常量 ========
@@ -51,11 +51,18 @@ def z_notify(type, obj):
 
 def _log(msg):
     text = str(msg)
-    if zcanpro is not None:
-        zcanpro.write_log(text)
-    else:
-        sys.stdout.write(text + "\n")
-        sys.stdout.flush()
+    try:
+        if zcanpro is not None:
+            zcanpro.write_log(text)
+            return
+    except Exception:
+        pass
+    try:
+        if sys.stdout is not None:
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def _hex(data):
@@ -176,7 +183,15 @@ def z_main():
     _log("支持 DID: 0xF195(SW) / 0xF180(BL) / 0xF193(HW)")
     _log("")
 
-    buses = zcanpro.get_buses()
+    if zcanpro is None:
+        _log("错误: zcanpro 模块不可用")
+        return
+
+    try:
+        buses = zcanpro.get_buses()
+    except Exception as e:
+        _log("获取 CAN 通道失败: " + str(e))
+        return
     if not buses:
         _log("请先打开 CAN 通道 (250kbps, 扩展帧)")
         return
