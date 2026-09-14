@@ -8,12 +8,9 @@ ZCANPRO 脚本 — 读取 APP 侧版本号
 用法: ZCANPRO → 高级功能 → 扩展脚本 → 打开本文件
 """
 
-import sys
-import time
-
 try:
     import zcanpro
-except ImportError:
+except Exception:
     zcanpro = None
 
 # ======== UDS 常量 ========
@@ -46,12 +43,11 @@ def z_notify(type, obj):
 
 
 def _log(msg):
-    text = str(msg)
     if zcanpro is not None:
-        zcanpro.write_log(text)
-    else:
-        sys.stdout.write(text + "\n")
-        sys.stdout.flush()
+        try:
+            zcanpro.write_log(str(msg))
+        except Exception:
+            pass
 
 
 def _hex(data):
@@ -77,7 +73,7 @@ def uds_req(bus_id, sid, payload, wait_pending_s=0):
         "src_addr": UDS_REQ_ID, "dst_addr": UDS_RESP_ID,
         "suppress_response": 0, "sid": sid, "data": list(payload),
     }
-    t_end = time.time() + float(wait_pending_s)
+    t_end = __import__("time").time() + float(wait_pending_s)
     logged = False
     while True:
         if stopTask:
@@ -91,10 +87,10 @@ def uds_req(bus_id, sid, payload, wait_pending_s=0):
             _log("[Rx] %s" % _hex(data[:40]))
         if len(data) >= 3 and data[0] == SID_NRC:
             if data[2] == NRC_RCRRP:
-                if wait_pending_s <= 0 or time.time() >= t_end:
+                if wait_pending_s <= 0 or __import__("time").time() >= t_end:
                     raise RuntimeError("NRC 0x78 超时")
                 _log("NRC 0x78，等待中...")
-                time.sleep(1.0)
+                __import__("time").sleep(1.0)
                 continue
             raise RuntimeError("NRC 0x%02X" % data[2])
         if not resp or not resp.get("result"):
