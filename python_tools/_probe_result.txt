@@ -1,0 +1,4 @@
+resp = {'result': 0, 'result_msg': 'no response until timeout', 'data': []}
+data = 
+data_len = 0
+result = 0
