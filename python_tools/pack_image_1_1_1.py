@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from zcanpro_ext_ota_slotA import (  # noqa: E402
+from zcanpro_ext_ota_slotA_1_1_1 import (  # noqa: E402
     IMAGE_HEADER_SIZE,
     SLOT_A,
     SLOT_A_BASE,
