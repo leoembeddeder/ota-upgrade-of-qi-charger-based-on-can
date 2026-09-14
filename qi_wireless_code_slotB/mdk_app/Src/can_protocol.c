@@ -44,8 +44,8 @@
 /* ========================================================================== */
 
 static const char SW_VERSION_STR[]     = "1.1.2";
-static const char BOOTLOADER_VER_STR[] = "1.1.2";
-static const char HW_VERSION_STR[]     = "1.1.2";
+static const char BOOTLOADER_VER_STR[] = "1.0.0";
+static const char HW_VERSION_STR[]     = "1.1.5";
 
 /* same public key as Bootloader boot_verify.c */
 static const uint8_t g_app_ecdsa_pubkey[65] = {
