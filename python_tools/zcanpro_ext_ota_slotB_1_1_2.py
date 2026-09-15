@@ -5,7 +5,7 @@ ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA (Slot B)
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
 需要: Python 3.8 32 位（ZCANPRO 扩展脚本要求）
-固件: app bin/app_slot_b.bin（由 pack_image_1.1.2.py 生成）
+固件: app bin/app_slot_b.bin（由 pack_image_slotB_1_1_2.py 生成）
 """
 
 import os
@@ -532,7 +532,7 @@ def run_ota(bus_id):
             raise last_err
         _log("---- SecurityAccess ----")
         rx = uds_req(bus_id, SID_SA, [0x01])
-        if len(rx) < 6:
+        if len(rx) < 34:
             raise RuntimeError("seed 响应过短")
         seed = _to_bytes(rx[2:34])
         if seed == b"\x00" * 32:
