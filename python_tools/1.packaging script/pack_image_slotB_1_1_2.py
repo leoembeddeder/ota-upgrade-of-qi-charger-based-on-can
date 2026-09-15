@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """把 Keil 裸 APP .bin 打成 256 字节 XATO 头 + 固件，供产线烧录或 OTA。
 
-版本：QC_JYF_FW_1.1.1（写死在 image header 中）
-用途：打包 Slot A 固件
+版本：QC_JYF_FW_1.1.2（写死在 image header 中）
+用途：打包 Slot B 固件
 
 产线：输出文件从槽起始地址烧录（Slot A = 0x08007000）。
 OTA：输出到 python_tools/app bin/ 目录，供 zcanpro_ext_ota_auto.py 自动识别。
@@ -17,6 +17,9 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+PARENT = os.path.dirname(HERE)
+if PARENT not in sys.path:
+    sys.path.insert(0, PARENT)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
@@ -31,13 +34,13 @@ from zcanpro_ext_ota_slotA_1_1_1 import (  # noqa: E402
     validate_image,
 )
 
-REPO_ROOT = os.path.dirname(HERE)
-APP_BIN_DIR = os.path.join(HERE, "app bin")
+REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
+APP_BIN_DIR = os.path.join(PARENT, "app bin")
 DEFAULT_BIN_A = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project", "Objects", "qi_wireless.bin")
 DEFAULT_BIN_B = os.path.join(REPO_ROOT, "qi_wireless_code_slotB", "mdk_project", "Objects", "qi_wireless.bin")
 DEFAULT_KEY = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 
-IMAGE_VERSION = "QC_JYF_FW_1.1.1"
+IMAGE_VERSION = "QC_JYF_FW_1.1.2"
 
 
 def pack_one(bin_path, priv, version):

@@ -18,9 +18,9 @@ import os
 import struct
 import sys
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APP_BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app bin")
-BURN_BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "burn bin")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+APP_BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app bin")
+BURN_BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "burn bin")
 
 DEFAULT_BOOT = os.path.join(
     REPO_ROOT,
