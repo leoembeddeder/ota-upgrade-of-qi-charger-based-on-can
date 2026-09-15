@@ -1323,10 +1323,76 @@ static void handle_security_access(uint8_t *data, uint16_t len)
  */
 static void handle_routine_control(uint8_t *data, uint16_t len)
 {
-  (void)data;
-  (void)len;
-  /* All routines are handled by bootloader, not APP */
-  proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_SERVICE_NOT_SUPPORTED);
+  uint16_t routine_id;
+  uint8_t sub_func;
+  uint8_t active_slot, target_slot;
+  uint32_t base, sector_addr;
+
+  if (len < 4U)
+  {
+    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+
+  if (current_session != SESSION_PROGRAMMING)
+  {
+    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_CONDITIONS_NOT_CORRECT);
+    return;
+  }
+  if (!security_unlocked)
+  {
+    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_SECURITY_ACCESS_DENIED);
+    return;
+  }
+
+  sub_func = data[1];
+  routine_id = ((uint16_t)data[2] << 8) | (uint16_t)data[3];
+
+  if (routine_id == 0xFF00U && sub_func == 0x01U)
+  {
+    /* erase inactive slot */
+    /* determine active slot from Reset Handler address */
+    uint32_t reset_handler = *(volatile uint32_t *)0x04U;
+    active_slot = (reset_handler >= SLOT_A_BASE && reset_handler < (SLOT_A_BASE + SLOT_SIZE)) ? SLOT_A : SLOT_B;
+    target_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
+    base = (target_slot == SLOT_A) ? SLOT_A_BASE : SLOT_B_BASE;
+
+    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, NRC_RCRRP);
+
+    flash_unlock();
+    for (sector_addr = base; sector_addr < (base + SLOT_SIZE); sector_addr += OTA_FLASH_SECTOR_SIZE)
+    {
+      if (flash_sector_erase(sector_addr) != FLASH_OPERATE_DONE)
+      {
+        flash_lock();
+        proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
+        return;
+      }
+    }
+    flash_lock();
+
+    {
+      uint8_t resp[4];
+      resp[0] = UDS_SID_ROUTINE_CONTROL + UDS_POSITIVE_RESPONSE_OFFSET;
+      resp[1] = sub_func;
+      resp[2] = data[2];
+      resp[3] = data[3];
+      proto_send_response(resp, 4);
+    }
+  }
+  else if (routine_id == 0xFF00U && (sub_func == 0x00U || sub_func == 0x02U))
+  {
+    uint8_t resp[4];
+    resp[0] = UDS_SID_ROUTINE_CONTROL + UDS_POSITIVE_RESPONSE_OFFSET;
+    resp[1] = sub_func;
+    resp[2] = data[2];
+    resp[3] = data[3];
+    proto_send_response(resp, 4);
+  }
+  else
+  {
+    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_REQUEST_OUT_OF_RANGE);
+  }
 }
 
 /**
