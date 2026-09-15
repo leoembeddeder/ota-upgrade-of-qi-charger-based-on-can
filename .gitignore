@@ -70,3 +70,11 @@ dkms.conf
 
 # OTA auto-generated packed images
 python_tools/app bin/*.bin
+
+# Keil IDE project files (auto-generated, machine-specific)
+*.uvoptx
+*.uvguix.*
+
+# Keil build output directories
+*/Objects/
+*/Listings/
