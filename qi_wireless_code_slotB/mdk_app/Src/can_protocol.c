@@ -1353,14 +1353,14 @@ static void handle_routine_control(uint8_t *data, uint16_t len)
     /* erase inactive slot */
     /* determine active slot from Reset Handler address */
     uint32_t reset_handler = *(volatile uint32_t *)0x04U;
-    active_slot = (reset_handler >= SLOT_A_BASE && reset_handler < (SLOT_A_BASE + SLOT_SIZE)) ? SLOT_A : SLOT_B;
-    target_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
-    base = (target_slot == SLOT_A) ? SLOT_A_BASE : SLOT_B_BASE;
+    active_slot = (reset_handler >= OTA_APP_A_BASE_ADDR && reset_handler < (OTA_APP_A_BASE_ADDR + OTA_APP_A_SIZE)) ? OTA_SLOT_A : OTA_SLOT_B;
+    target_slot = (active_slot == OTA_SLOT_A) ? OTA_SLOT_B : OTA_SLOT_A;
+    base = (target_slot == OTA_SLOT_A) ? OTA_APP_A_BASE_ADDR : OTA_APP_B_BASE_ADDR;
 
-    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, NRC_RCRRP);
+    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_RESPONSE_PENDING);
 
     flash_unlock();
-    for (sector_addr = base; sector_addr < (base + SLOT_SIZE); sector_addr += OTA_FLASH_SECTOR_SIZE)
+    for (sector_addr = base; sector_addr < (base + OTA_APP_A_SIZE); sector_addr += OTA_FLASH_SECTOR_SIZE)
     {
       if (flash_sector_erase(sector_addr) != FLASH_OPERATE_DONE)
       {
