@@ -44,6 +44,12 @@ STATUS_POLL_INTERVAL = 1.0
 # 升级状态超时（秒）
 STATUS_TIMEOUT = 120
 
+# NRC 0x72 (general programming failure) 最大重试次数
+QI_IAP_MAX_RETRIES = 3
+
+# 包间延时（秒），给 Qi 芯片 flash write 留时间
+QI_IAP_PACKET_DELAY = 0.05
+
 # ======== UDS 常量 ========
 UDS_REQ_ID = 0x18DA0D03
 UDS_RESP_ID = 0x18DA030D
@@ -357,12 +363,30 @@ def qi_iap_abort(bus_id):
     _log("Qi IAP 已中止")
 
 
-def qi_iap_send_data(bus_id, addr, data):
-    """发送一包固件数据"""
+def qi_iap_send_data_with_ack(bus_id, addr, data):
+    """发送一包固件数据，带 NRC 0x72 重试。
+
+    MCU 在收到 DID 0x2131 写入后会转发 UART 帧给 Qi 芯片，
+    然后等待 Qi 芯片 ACK 才回 UDS 正响应。
+    若 Qi 芯片无应答或 NAK，MCU 回 NRC 0x72。
+    此函数捕获 NRC 0x72 并重试当前包。
+    """
     addr_hi = (addr >> 8) & 0xFF
     addr_lo = addr & 0xFF
     payload = [addr_hi, addr_lo] + list(data)
-    write_did(bus_id, DID_QI_IAP_DATA, payload)
+
+    for attempt in range(QI_IAP_MAX_RETRIES):
+        try:
+            write_did(bus_id, DID_QI_IAP_DATA, payload)
+            return  # success
+        except RuntimeError as e:
+            err_str = str(e)
+            if "NRC=0x72" in err_str:
+                _log("  NRC 0x72 (Qi ACK 失败)，重试 %d/%d" % (attempt + 1, QI_IAP_MAX_RETRIES))
+                time.sleep(QI_IAP_PACKET_DELAY)
+                continue
+            raise  # other error, propagate
+    raise RuntimeError("Qi IAP 数据包重试 %d 次仍失败 (addr=0x%04X)" % (QI_IAP_MAX_RETRIES, addr))
 
 
 def qi_iap_read_status(bus_id):
@@ -477,7 +501,7 @@ def run_qi_iap(bus_id):
         # 5. 启动 Qi IAP
         qi_iap_start(bus_id, fw_size)
 
-        # 6. 分包发送固件
+        # 6. 分包发送固件（带 ACK 重试 + 包间延时）
         _log("---- 发送固件数据 ----")
         addr = 0
         total_packets = (fw_size + QI_IAP_DATA_LEN - 1) // QI_IAP_DATA_LEN
@@ -487,11 +511,12 @@ def run_qi_iap(bus_id):
                 qi_iap_abort(bus_id)
                 raise RuntimeError("用户停止")
             chunk = fw_data[addr:addr + QI_IAP_DATA_LEN]
-            qi_iap_send_data(bus_id, addr, chunk)
+            qi_iap_send_data_with_ack(bus_id, addr, chunk)
             pkt_idx += 1
             addr += len(chunk)
             if pkt_idx % 10 == 0 or addr >= fw_size:
                 _log("  已发送 %d/%d 包 (%d/%d 字节)" % (pkt_idx, total_packets, addr, fw_size))
+            time.sleep(QI_IAP_PACKET_DELAY)
 
         _log("固件发送完成，共 %d 包" % pkt_idx)
 
