@@ -1394,6 +1394,18 @@ static void qi_iap_frame_cb(const qi_frame_t *frame)
       g_qi_iap_state = QI_IAP_SUCCESS;
       g_qi_iap_progress = 100U;
     }
+    else if (frame->data[1] == QI_IAP_ACK_OK)
+    {
+      /* Per-packet OK ACK from Qi chip.
+       * If MCU is in WAIT_ACK state (waiting to forward this ACK
+       * to host as UDS positive response), resume IAP_IN_PROGRESS.
+       * If already IN_PROGRESS (e.g. before first WAIT_ACK),
+       * this is a normal ACK — no state change needed. */
+      if (g_qi_iap_state == QI_IAP_WAIT_ACK)
+      {
+        g_qi_iap_state = QI_IAP_IN_PROGRESS;
+      }
+    }
     return;
   }
 
