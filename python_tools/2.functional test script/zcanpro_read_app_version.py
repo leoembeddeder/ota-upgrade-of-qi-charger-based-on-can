@@ -26,9 +26,9 @@ SID_NRC  = 0x7F
 SID_PR   = 0x40
 
 DID_LIST = [
-    (0xF195, "APP 软件版本"),
-    (0xF180, "Bootloader 版本"),
-    (0xF193, "硬件版本"),
+    (0xF195, "APP 软件版本", "QC_JYF_FW_1.1.1"),
+    (0xF180, "Bootloader 版本", "QC_JYF_BL_1.0.0"),
+    (0xF193, "硬件版本",     "QC_JYF_HW_1.1.5"),
 ]
 
 stopTask = False
@@ -344,21 +344,23 @@ def run(bus_id):
     _log("UDS 已释放，改原始扩展帧读 DID（CAN 视图应变为 18da0d03x）")
 
     results = []
-    for did, name in DID_LIST:
+    for did, name, expected in DID_LIST:
         try:
             ver = read_did_string(bus_id, did)
-            _log("DID 0x%04X [%s]: %s" % (did, name, ver))
-            results.append((name, ver, None))
+            match = "[OK]" if ver == expected else "[不匹配 期望:%s]" % expected
+            _log("DID 0x%04X [%s]: %s %s" % (did, name, ver, match))
+            results.append((name, ver, expected, None))
         except Exception as e:
             _log("DID 0x%04X [%s]: 读取失败 - %s" % (did, name, e))
-            results.append((name, None, str(e)))
+            results.append((name, None, expected, str(e)))
         time.sleep(0.05)
 
     _log("")
     _log("---- 汇总 ----")
-    for name, ver, err in results:
+    for name, ver, expected, err in results:
         if ver is not None:
-            _log("  %s = %s" % (name, ver))
+            match = "✓" if ver == expected else "✗ 期望:%s" % expected
+            _log("  %s = %s %s" % (name, ver, match))
         else:
             _log("  %s = [失败] %s" % (name, err))
 
@@ -367,6 +369,7 @@ def z_main():
     global stopTask
     stopTask = False
     _log("======== APP 版本读取工具 ========")
+    _log("预期版本: SW=QC_JYF_FW_1.1.1 / BL=QC_JYF_BL_1.0.0 / HW=QC_JYF_HW_1.1.5")
     _log("DID: 0xF195(SW) / 0xF180(BL) / 0xF193(HW)")
     _log("")
     buses = zcanpro.get_buses()
