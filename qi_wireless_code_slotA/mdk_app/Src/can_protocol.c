@@ -1459,21 +1459,28 @@ static void qi_iap_frame_cb(const qi_frame_t *frame)
       g_qi_charge_state = QI_CHARGE_FAULT;
     }
 
-    if (frame->data_len < 13U)
+    /* 统一帧布局（无论标准帧还是扩展帧）：
+     *   data[0]   = status byte 1
+     *   data[1]   = status byte 2
+     *   data[2-3] = firmware version LE  (与 DID 0x2133 一致)
+     *   data[4-5] = output power LE (mW)
+     * 扩展帧 (≥13B) 额外字段：
+     *   data[6]   = voltage, data[7] = current, data[8] = temp
+     *   data[9]   = FOD, data[10] = reserved, data[11] = fault
+     *   data[12]  = thermal derate
+     *
+     * NOTE: 旧版本标准帧/扩展帧的 version/power 偏移不一致，
+     *       此处统一为 data[2-3]=version, data[4-5]=power。
+     *       若 Qi 芯片规格书定义不同，请按实际修正。 */
+    /* 统一解析：data[2-3] = version LE, data[4-5] = power LE */
+    g_qi_fw_version = (uint16_t)frame->data[2]
+                    | ((uint16_t)frame->data[3] << 8);
+    g_qi_output_power_mw = (uint16_t)frame->data[4]
+                         | ((uint16_t)frame->data[5] << 8);
+
+    /* 扩展帧额外字段 */
+    if (frame->data_len >= 13U)
     {
-      /* 规范：data[2-3] 实时功率 LE，data[4-5] 版本号 LE */
-      g_qi_output_power_mw = (uint16_t)frame->data[2]
-                           | ((uint16_t)frame->data[3] << 8);
-      g_qi_fw_version = (uint16_t)frame->data[4]
-                      | ((uint16_t)frame->data[5] << 8);
-    }
-    else
-    {
-      /* 扩展帧：data[2-3] 版本，data[4-5] 功率（兼容已有 13B 布局） */
-      g_qi_fw_version = (uint16_t)frame->data[2]
-                      | ((uint16_t)frame->data[3] << 8);
-      g_qi_output_power_mw = (uint16_t)frame->data[4]
-                           | ((uint16_t)frame->data[5] << 8);
       g_qi_voltage_raw = frame->data[6];
       g_qi_current_raw = frame->data[7];
       g_qi_pcb_temp = frame->data[8];
@@ -1670,15 +1677,24 @@ void can_protocol_poll(void)
 
   now = timer_get_tick();
 
-  /* Qi IAP auto-complete: if all data sent and no ACK within timeout, assume success */
+  /* Qi IAP auto-complete: if all data sent and no ACK within timeout,
+   * assume success — but only if Qi chip has not reported FAILED.
+   * Poll UART once more to flush any pending FAILED ACK before
+   * overwriting state. This closes the race where can_protocol_poll()
+   * runs before qi_uart_poll() on the same loop iteration. */
   if ((g_qi_iap_state == QI_IAP_IN_PROGRESS) &&
       (g_qi_iap_total > 0U) &&
       (g_qi_iap_sent >= g_qi_iap_total) &&
       (g_qi_iap_last_tx_ms != 0U) &&
       ((now - g_qi_iap_last_tx_ms) >= QI_IAP_DONE_TIMEOUT_MS))
   {
-    g_qi_iap_state    = QI_IAP_SUCCESS;
-    g_qi_iap_progress = 100U;
+    /* flush any pending UART bytes so FAILED ACK is not missed */
+    qi_protocol_poll();
+    if (g_qi_iap_state == QI_IAP_IN_PROGRESS)
+    {
+      g_qi_iap_state    = QI_IAP_SUCCESS;
+      g_qi_iap_progress = 100U;
+    }
   }
 
   if (g_can_awake == 0U)
