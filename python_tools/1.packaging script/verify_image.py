@@ -43,7 +43,7 @@ EMBEDDED_PUBKEY = bytes([
     0x20, 0x70, 0x33, 0x26, 0xf0, 0x95, 0x41, 0x71,
 ])
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_KEY = os.path.join(REPO_ROOT, "docs", "keys", "public.pem")
 
 
