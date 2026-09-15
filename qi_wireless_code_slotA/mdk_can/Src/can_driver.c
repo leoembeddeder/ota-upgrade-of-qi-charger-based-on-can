@@ -42,8 +42,8 @@
  */
 #define CAN_BITTIME_DIV                 10U
 #define CAN_BITTIME_SJW                 4U
-#define CAN_BITTIME_BTS1                63U
-#define CAN_BITTIME_BTS2                 9U
+#define CAN_BITTIME_BTS1                54U
+#define CAN_BITTIME_BTS2                18U
 
 /* private variables ---------------------------------------------------------*/
 
