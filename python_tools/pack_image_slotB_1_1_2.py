@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """把 Keil 裸 APP .bin 打成 256 字节 XATO 头 + 固件，供产线烧录或 OTA。
 
-版本：1.1.2（写死在 image header 中）
+版本：QC_JYF_FW_1.1.2（写死在 image header 中）
 用途：打包 Slot B 固件
 
 产线：输出文件从槽起始地址烧录（Slot A = 0x08007000）。
@@ -37,7 +37,7 @@ DEFAULT_BIN_A = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project",
 DEFAULT_BIN_B = os.path.join(REPO_ROOT, "qi_wireless_code_slotB", "mdk_project", "Objects", "qi_wireless.bin")
 DEFAULT_KEY = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 
-IMAGE_VERSION = "1.1.2"
+IMAGE_VERSION = "QC_JYF_FW_1.1.2"
 
 
 def pack_one(bin_path, priv, version):

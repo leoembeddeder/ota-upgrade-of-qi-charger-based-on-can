@@ -39,9 +39,9 @@
 #include "sha256.h"
 #include <string.h>
 
-#define SW_VERSION  "1.0.0"
-#define BL_VERSION  "1.0.0"
-#define HW_VERSION  "1.0.0"
+#define SW_VERSION  "QC_JYF_FW_1.0.0"
+#define BL_VERSION  "QC_JYF_BL_1.0.0"
+#define HW_VERSION  "QC_JYF_HW_1.0.0"
 
 #define DEVICE_INFO_MAGIC        0x44455649U  /* "DEVI" */
 #define DEVICE_INFO_VERSION      2U
