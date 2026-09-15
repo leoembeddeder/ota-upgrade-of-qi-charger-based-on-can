@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate SecurityAccess (0x27) signature for a given seed.
 
-For manual testing: receive 4-byte seed from MCU, compute ECDSA P-256 signature,
+For manual testing: receive 32-byte seed from MCU, compute ECDSA P-256 signature,
 output the hex CAN frames ready for ZCANPRO / manual send.
 
 Usage:

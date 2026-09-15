@@ -439,7 +439,7 @@ def send_security_key(bus_id, sig):
         except UdsNrcError as e:
             if (e.nrc in (0x24, 0x13)) and (i > 0):
                 rx = uds_try(bus_id, SID_SA, [0x01])
-                if rx is not None and len(rx) >= 6 and list(rx[2:6]) == [0, 0, 0, 0]:
+                if rx is not None and len(rx) >= 34 and list(rx[2:34]) == [0] * 32:
                     _log("27 02 无应答后已解锁，继续")
                     return rx
             raise
@@ -448,8 +448,8 @@ def send_security_key(bus_id, sig):
             _log("27 02 第 %d/5 次: %s" % (i + 1, e))
             time.sleep(0.5)
             rx = uds_try(bus_id, SID_SA, [0x01])
-            if rx is not None and len(rx) >= 6 and list(rx[2:6]) == [0, 0, 0, 0]:
-                _log("27 01 seed=0，已解锁")
+            if rx is not None and len(rx) >= 34 and list(rx[2:34]) == [0] * 32:
+                _log("27 01 seed=0(32B)，已解锁")
                 return rx
     raise last
 
@@ -534,11 +534,11 @@ def run_ota(bus_id):
         rx = uds_req(bus_id, SID_SA, [0x01])
         if len(rx) < 6:
             raise RuntimeError("seed 响应过短")
-        seed = _to_bytes(rx[2:6])
-        if seed == b"\x00\x00\x00\x00":
-            _log("已解锁 (ISO 14229 seed=0)，跳过 SendKey")
+        seed = _to_bytes(rx[2:34])
+        if seed == b"\x00" * 32:
+            _log("已解锁 (ISO 14229 seed=0, 32B)，跳过 SendKey")
         else:
-            _log("seed " + _hex(rx[2:6]))
+            _log("seed " + _hex(rx[2:34]))
             sig = ecdsa_sign_msg(priv, seed)
             _log("SendKey 签名 %d 字节（27 03 分片 + 27 02 验签）" % len(sig))
             send_security_key(bus_id, sig)

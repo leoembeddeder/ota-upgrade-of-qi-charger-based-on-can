@@ -285,7 +285,7 @@ static uint32_t g_sit1145_keepalive_last_ms = 0;
 /** @brief  security access state */
 static uint8_t  g_security_unlocked = 0;
 static uint8_t  g_seed_generated = 0;
-static uint8_t  g_seed[4];
+static uint8_t  g_seed[32];
 static uint8_t  g_seed_sub = 0;
 static uint8_t  g_security_fail_count = 0;
 static uint32_t g_security_lockout_until_ms = 0;
@@ -349,7 +349,7 @@ static uint8_t verify_security_ecdsa_signature(void)
   }
 
   /* compute SHA-256 of the 4-byte seed */
-  sha256_hash(g_seed, 4U, seed_hash);
+  sha256_hash(g_seed, 32U, seed_hash);
 
   /* verify ECDSA P-256 signature */
   result = uECC_verify(public_key, seed_hash, g_sa_sig_buf);
@@ -840,24 +840,30 @@ static void uds_process_message(uint8_t *data, uint16_t len)
         }
 
         {
-          uint32_t seed_val = generate_random_seed();
-          g_seed[0] = (uint8_t)((seed_val >> 24) & 0xFFU);
-          g_seed[1] = (uint8_t)((seed_val >> 16) & 0xFFU);
-          g_seed[2] = (uint8_t)((seed_val >> 8) & 0xFFU);
-          g_seed[3] = (uint8_t)(seed_val & 0xFFU);
+          {
+            uint8_t idx;
+            for (idx = 0U; idx < 32U; idx += 4U)
+            {
+              uint32_t seed_val = generate_random_seed();
+              g_seed[idx]     = (uint8_t)((seed_val >> 24) & 0xFFU);
+              g_seed[idx + 1] = (uint8_t)((seed_val >> 16) & 0xFFU);
+              g_seed[idx + 2] = (uint8_t)((seed_val >> 8) & 0xFFU);
+              g_seed[idx + 3] = (uint8_t)(seed_val & 0xFFU);
+            }
+          }
         }
         g_seed_generated = 1;
         g_seed_sub = sub_func;
         g_sa_sig_bytes_received = 0;
         g_sa_sig_block_seq = 0;
 
-        resp[0] = service_id + UDS_POSITIVE_RESPONSE_OFFSET;
-        resp[1] = sub_func;
-        resp[2] = g_seed[0];
-        resp[3] = g_seed[1];
-        resp[4] = g_seed[2];
-        resp[5] = g_seed[3];
-        safe_mode_send_response(resp, 6);
+        {
+          uint8_t sa_resp[34];
+          sa_resp[0] = service_id + UDS_POSITIVE_RESPONSE_OFFSET;
+          sa_resp[1] = sub_func;
+          memcpy(&sa_resp[2], g_seed, 32U);
+          safe_mode_send_response(sa_resp, 34);
+        }
       }
       else if (sub_func == 0x03U)
       {

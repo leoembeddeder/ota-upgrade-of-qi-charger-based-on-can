@@ -490,9 +490,9 @@ def run_qi_iap(bus_id):
         # 4. 安全解锁
         _log("---- SecurityAccess ----")
         rx = uds_req(bus_id, SID_SA, [0x01])
-        seed = rx[2:6]
-        if seed == [0, 0, 0, 0]:
-            _log("已解锁 (seed=0)")
+        seed = rx[2:34]
+        if seed == [0] * 32:
+            _log("已解锁 (seed=0, 32B)")
         else:
             _log("seed " + _hex(seed))
             sig = ecdsa_sign_msg(priv, bytes(seed))

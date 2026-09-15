@@ -69,7 +69,7 @@ static uint8_t  current_session           = SESSION_DEFAULT;
 static uint8_t  security_unlocked         = 0;
 static uint32_t last_tester_present_tick  = 0;
 static uint8_t  g_seed_generated          = 0;
-static uint8_t  g_seed[4];
+static uint8_t  g_seed[32];
 static uint8_t  g_seed_sub                = 0;
 static uint8_t  g_security_fail_count     = 0;
 static uint32_t g_security_lockout_until_ms = 0;
@@ -1171,30 +1171,37 @@ static void handle_security_access(uint8_t *data, uint16_t len)
     }
     if (security_unlocked)
     {
-      resp[0] = UDS_SID_SECURITY_ACCESS + UDS_POSITIVE_RESPONSE_OFFSET;
-      resp[1] = 0x01U;
-      resp[2] = 0; resp[3] = 0; resp[4] = 0; resp[5] = 0;
-      proto_send_response(resp, 6);
+      {
+        uint8_t unlock_resp[34];
+        unlock_resp[0] = UDS_SID_SECURITY_ACCESS + UDS_POSITIVE_RESPONSE_OFFSET;
+        unlock_resp[1] = 0x01U;
+        memset(&unlock_resp[2], 0, 32U);
+        proto_send_response(unlock_resp, 34);
+      }
       return;
     }
     {
-      uint32_t seed_val = generate_random_seed();
-      g_seed[0] = (uint8_t)((seed_val >> 24) & 0xFFU);
-      g_seed[1] = (uint8_t)((seed_val >> 16) & 0xFFU);
-      g_seed[2] = (uint8_t)((seed_val >> 8) & 0xFFU);
-      g_seed[3] = (uint8_t)(seed_val & 0xFFU);
+      uint8_t idx;
+      for (idx = 0U; idx < 32U; idx += 4U)
+      {
+        uint32_t seed_val = generate_random_seed();
+        g_seed[idx]     = (uint8_t)((seed_val >> 24) & 0xFFU);
+        g_seed[idx + 1] = (uint8_t)((seed_val >> 16) & 0xFFU);
+        g_seed[idx + 2] = (uint8_t)((seed_val >> 8) & 0xFFU);
+        g_seed[idx + 3] = (uint8_t)(seed_val & 0xFFU);
+      }
     }
     g_seed_generated = 1;
     g_seed_sub = 0x01U;
     g_sa_sig_bytes_received = 0;
     g_sa_sig_block_seq = 0;
-    resp[0] = UDS_SID_SECURITY_ACCESS + UDS_POSITIVE_RESPONSE_OFFSET;
-    resp[1] = 0x01U;
-    resp[2] = g_seed[0];
-    resp[3] = g_seed[1];
-    resp[4] = g_seed[2];
-    resp[5] = g_seed[3];
-    proto_send_response(resp, 6);
+    {
+      uint8_t sa_resp[34];
+      sa_resp[0] = UDS_SID_SECURITY_ACCESS + UDS_POSITIVE_RESPONSE_OFFSET;
+      sa_resp[1] = 0x01U;
+      memcpy(&sa_resp[2], g_seed, 32U);
+      proto_send_response(sa_resp, 34);
+    }
   }
   else if (sub_func == 0x03U)
   {
@@ -1271,7 +1278,7 @@ static void handle_security_access(uint8_t *data, uint16_t len)
       return;
     }
     proto_send_nrc(UDS_SID_SECURITY_ACCESS, UDS_NRC_RESPONSE_PENDING);
-    sha256_hash(g_seed, 4U, hash);
+    sha256_hash(g_seed, 32U, hash);
     if (uECC_verify(g_app_ecdsa_pubkey, hash, g_sa_sig_buf) == 1)
     {
       security_unlocked = 1;
