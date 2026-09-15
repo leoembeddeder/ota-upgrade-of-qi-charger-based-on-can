@@ -174,6 +174,12 @@ int8_t qi_protocol_set_power(uint8_t power, uint8_t seq);
  */
 void qi_protocol_poll(void);
 
+/**
+ * @brief  丢弃 UART RX 残留并复位帧解析状态机
+ * @note   IAP 启动前调用，避免未轮询堆积的 0x01 上报把 IAP ACK 解乱
+ */
+void qi_protocol_rx_flush(void);
+
 #ifdef __cplusplus
 }
 #endif

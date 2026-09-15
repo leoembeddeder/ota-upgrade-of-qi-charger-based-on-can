@@ -423,3 +423,18 @@ void qi_protocol_poll(void)
     }
   }
 }
+
+void qi_protocol_rx_flush(void)
+{
+  uint8_t byte;
+
+  rx_reset();
+  while (qi_uart_rx_available() > 0U)
+  {
+    if (qi_uart_rx_read(&byte) != 0)
+    {
+      break;
+    }
+  }
+  rx_reset();
+}

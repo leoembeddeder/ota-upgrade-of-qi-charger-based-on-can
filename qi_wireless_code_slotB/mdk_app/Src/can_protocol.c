@@ -87,8 +87,10 @@ static uint8_t  g_sa_sig_block_seq        = 0;
 /* Qi IAP auto-complete timeout after last data packet sent */
 #define QI_IAP_DONE_TIMEOUT_MS  3000U
 
-/** @brief  Qi chip UART ACK timeout (ms) for each data packet */
-#define QI_IAP_ACK_TIMEOUT_MS   200U
+/** @brief  Qi chip UART ACK timeout (ms) for each data packet (flash write) */
+#define QI_IAP_ACK_TIMEOUT_MS      2000U
+/** @brief  Qi chip prepare/erase timeout (ms) for DID 0x2130 start */
+#define QI_IAP_PREPARE_TIMEOUT_MS  2500U
 
 static uint32_t g_qi_iap_last_tx_ms = 0U;
 
@@ -101,6 +103,8 @@ static uint16_t g_qi_fw_version   = 0U;     /*!< DID 0x2133 / 0x01 上报版本�
 /** @brief  deferred UDS response while waiting for Qi chip ACK */
 static uint32_t g_qi_iap_wait_start_ms = 0U; /*!< timestamp when WAIT_ACK entered */
 static uint8_t  g_qi_iap_pending_did[2] = {0U}; /*!< DID bytes for deferred response */
+static uint32_t g_qi_iap_ack_timeout_ms = QI_IAP_ACK_TIMEOUT_MS;
+static uint16_t g_qi_iap_pending_chunk = 0U; /*!< bytes to add to sent after ACK */
 
 /* ========================================================================== */
 /*  Qi charging state variables                                              */
@@ -653,7 +657,7 @@ static int8_t fill_did_payload(uint16_t did, uint8_t *out, uint8_t *olen)
       return 0;
     case DID_QI_IAP_STATUS:
       /* [0]state [1]progress [2-3]Qi版本 LE [4-5]已发 LE [6-7]总长 LE */
-      out[0] = g_qi_iap_state;
+      out[0] = (g_qi_iap_state == QI_IAP_WAIT_ACK) ? QI_IAP_IN_PROGRESS : g_qi_iap_state;
       out[1] = g_qi_iap_progress;
       out[2] = (uint8_t)(g_qi_fw_version & 0xFFU);
       out[3] = (uint8_t)((g_qi_fw_version >> 8) & 0xFFU);
@@ -994,14 +998,18 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
           }
           g_qi_iap_total    = ((uint16_t)data[4] << 8) | (uint16_t)data[5];
           g_qi_iap_sent     = 0U;
-          g_qi_iap_state    = QI_IAP_IN_PROGRESS;
           g_qi_iap_progress = 0U;
           g_qi_iap_last_tx_ms = 0U;
+          g_qi_iap_pending_chunk = 0U;
+          /* Discard leftover 0x01 reports so the prepare ACK can be parsed. */
+          qi_protocol_rx_flush();
           (void)qi_protocol_iap_prepare(g_qi_iap_total);
-          resp[0] = UDS_SID_WRITE_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
-          resp[1] = data[1];
-          resp[2] = data[2];
-          proto_send_response(resp, 3);
+          /* Wait for Qi prepare ACK (chip may erase flash) before 6E 21 30. */
+          g_qi_iap_state = QI_IAP_WAIT_ACK;
+          g_qi_iap_ack_timeout_ms = QI_IAP_PREPARE_TIMEOUT_MS;
+          g_qi_iap_wait_start_ms = timer_get_tick();
+          g_qi_iap_pending_did[0] = data[1];
+          g_qi_iap_pending_did[1] = data[2];
         }
         else if ((sub == 0x00U) || (sub == 0x02U))
         {
@@ -1010,6 +1018,7 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
           g_qi_iap_total = 0U;
           g_qi_iap_sent = 0U;
           g_qi_iap_last_tx_ms = 0U;
+          g_qi_iap_pending_chunk = 0U;
           g_qi_iap_pending_did[0] = 0U;
           g_qi_iap_pending_did[1] = 0U;
           resp[0] = UDS_SID_WRITE_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
@@ -1052,19 +1061,12 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
           chunk_len = QI_IAP_MAX_CHUNK;
         }
         (void)qi_protocol_iap_data(addr, &data[5], (uint8_t)chunk_len);
-        g_qi_iap_sent += (uint16_t)chunk_len;
+        g_qi_iap_pending_chunk = (uint16_t)chunk_len;
         g_qi_iap_last_tx_ms = timer_get_tick();
-        if (g_qi_iap_total > 0U)
-        {
-          g_qi_iap_progress = (uint8_t)((uint32_t)g_qi_iap_sent * 100U / g_qi_iap_total);
-          if (g_qi_iap_progress > 100U)
-          {
-            g_qi_iap_progress = 100U;
-          }
-        }
         /* 不立即回 UDS 响应——进入 WAIT_ACK 状态，
          * 在 qi_iap_ack_poll() 中等 Qi 芯片 ACK 后再回复 */
         g_qi_iap_state = QI_IAP_WAIT_ACK;
+        g_qi_iap_ack_timeout_ms = QI_IAP_ACK_TIMEOUT_MS;
         g_qi_iap_wait_start_ms = timer_get_tick();
         g_qi_iap_pending_did[0] = data[1];
         g_qi_iap_pending_did[1] = data[2];
@@ -1366,10 +1368,56 @@ static void handle_tester_present(uint8_t *data, uint16_t len)
 /*  Qi IAP frame callback                                                    */
 /* ========================================================================== */
 
-/** @brief  Qi IAP ACK status codes from Qi chip (data[0] of 0xCC response) */
+/** @brief  Qi IAP ACK status codes from Qi chip */
 #define QI_IAP_ACK_OK       0x00U
 #define QI_IAP_ACK_COMPLETE 0x02U
 #define QI_IAP_ACK_FAILED   0x03U
+
+/**
+ * @brief  apply a parsed Qi IAP ACK status to the state machine
+ */
+static void qi_iap_apply_ack_status(uint8_t status)
+{
+  if (status == QI_IAP_ACK_FAILED)
+  {
+    g_qi_iap_state = QI_IAP_FAILED;
+    g_qi_iap_pending_chunk = 0U;
+    return;
+  }
+
+  if (status == QI_IAP_ACK_COMPLETE)
+  {
+    if (g_qi_iap_pending_chunk > 0U)
+    {
+      g_qi_iap_sent += g_qi_iap_pending_chunk;
+      g_qi_iap_pending_chunk = 0U;
+    }
+    g_qi_iap_state = QI_IAP_SUCCESS;
+    g_qi_iap_progress = 100U;
+    return;
+  }
+
+  if (status == QI_IAP_ACK_OK)
+  {
+    if (g_qi_iap_state == QI_IAP_WAIT_ACK)
+    {
+      if (g_qi_iap_pending_chunk > 0U)
+      {
+        g_qi_iap_sent += g_qi_iap_pending_chunk;
+        g_qi_iap_pending_chunk = 0U;
+        if (g_qi_iap_total > 0U)
+        {
+          g_qi_iap_progress = (uint8_t)((uint32_t)g_qi_iap_sent * 100U / g_qi_iap_total);
+          if (g_qi_iap_progress > 100U)
+          {
+            g_qi_iap_progress = 100U;
+          }
+        }
+      }
+      g_qi_iap_state = QI_IAP_IN_PROGRESS;
+    }
+  }
+}
 
 /**
  * @brief  Qi frame callback: handle IAP ACK and status report (0x01)
@@ -1381,36 +1429,36 @@ static void qi_iap_frame_cb(const qi_frame_t *frame)
     return;
   }
 
-  /* ---- Qi IAP ACK (0xCC) ----
-   * ACK frame: data[0]=sub_cmd, data[1]=status, data[2]=reserved
-   *   sub_cmd: 0x01=prepare ACK, 0x02=data ACK
-   *   status:  0x00=OK */
+  /* ---- Qi IAP ACK ----
+   * 0xCC: data[0]=sub_cmd (0x01/0x02), data[1]=status; reserved optional
+   * 0x00: generic ACK, data[0]=status
+   * Some chips omit the reserved 0x00, so accept data_len >= 1. */
   if (frame->cmd == QI_CMD_IAP)
   {
-    if (frame->data_len < 3U)
+    uint8_t status;
+
+    if (frame->data_len < 1U)
     {
       return;
     }
-    /* check status byte (data[1]) */
-    if (frame->data[1] == QI_IAP_ACK_FAILED)
+    if ((frame->data_len >= 2U) &&
+        ((frame->data[0] == QI_IAP_PREPARE) || (frame->data[0] == QI_IAP_DATA)))
     {
-      g_qi_iap_state = QI_IAP_FAILED;
+      status = frame->data[1];
     }
-    else if (frame->data[1] == QI_IAP_ACK_COMPLETE)
+    else
     {
-      g_qi_iap_state = QI_IAP_SUCCESS;
-      g_qi_iap_progress = 100U;
+      status = frame->data[0];
     }
-    else if (frame->data[1] == QI_IAP_ACK_OK)
+    qi_iap_apply_ack_status(status);
+    return;
+  }
+
+  if ((frame->cmd == QI_CMD_ACK) && (g_qi_iap_state == QI_IAP_WAIT_ACK))
+  {
+    if (frame->data_len >= 1U)
     {
-      /* Per-packet OK ACK from Qi chip.
-       * If MCU is in WAIT_ACK state (waiting to forward this ACK
-       * to host as UDS positive response), resume IAP_IN_PROGRESS
-       * so qi_iap_ack_poll() will send the deferred UDS response. */
-      if (g_qi_iap_state == QI_IAP_WAIT_ACK)
-      {
-        g_qi_iap_state = QI_IAP_IN_PROGRESS;
-      }
+      qi_iap_apply_ack_status(frame->data[0]);
     }
     return;
   }
@@ -1721,9 +1769,9 @@ static void qi_iap_ack_poll(void)
   now = timer_get_tick();
 
   /* check if callback already received an ACK or FAILED */
-  if (g_qi_iap_state == QI_IAP_IN_PROGRESS)
+  if ((g_qi_iap_state == QI_IAP_IN_PROGRESS) || (g_qi_iap_state == QI_IAP_SUCCESS))
   {
-    /* ACK received (callback set IN_PROGRESS from WAIT_ACK)
+    /* ACK received (callback left WAIT_ACK)
      * Send deferred positive response */
     uint8_t resp[3];
     resp[0] = UDS_SID_WRITE_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
@@ -1741,9 +1789,10 @@ static void qi_iap_ack_poll(void)
   }
 
   /* timeout: no response from Qi chip */
-  if ((now - g_qi_iap_wait_start_ms) >= QI_IAP_ACK_TIMEOUT_MS)
+  if ((now - g_qi_iap_wait_start_ms) >= g_qi_iap_ack_timeout_ms)
   {
     g_qi_iap_state = QI_IAP_IN_PROGRESS;
+    g_qi_iap_pending_chunk = 0U;
     proto_send_nrc(UDS_SID_WRITE_DATA_BY_ID, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
   }
 }
@@ -1752,6 +1801,14 @@ void can_protocol_poll(void)
 {
   uint32_t now;
   static uint32_t sit_last;
+
+  /* Drain Qi UART so 0x01 reports don't overflow the 64B RX buffer.
+   * Skip while WAIT_ACK: qi_iap_ack_poll() owns the parser then, otherwise
+   * the ACK would be consumed here and the deferred UDS response never sent. */
+  if (g_qi_iap_state != QI_IAP_WAIT_ACK)
+  {
+    qi_protocol_poll();
+  }
 
   if (g_lp_need_online != 0U)
   {

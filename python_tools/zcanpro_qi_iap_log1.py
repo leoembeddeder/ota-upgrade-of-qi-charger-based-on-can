@@ -45,10 +45,13 @@ STATUS_POLL_INTERVAL = 1.0
 STATUS_TIMEOUT = 120
 
 # NRC 0x72 (general programming failure) 最大重试次数
-QI_IAP_MAX_RETRIES = 3
+QI_IAP_MAX_RETRIES = 8
 
 # 包间延时（秒），给 Qi 芯片 flash write 留时间
-QI_IAP_PACKET_DELAY = 0.05
+QI_IAP_PACKET_DELAY = 0.2
+
+# 启动 IAP 后等待 Qi 芯片进 IAP / 擦 Flash（秒）
+QI_IAP_START_DELAY = 0.5
 
 # ======== UDS 常量 ========
 UDS_REQ_ID = 0x18DA0D03
@@ -269,7 +272,7 @@ def load_ec_private_key(path):
 
 def uds_init():
     zcanpro.uds_init({
-        "response_timeout_ms": 3000,
+        "response_timeout_ms": 8000,
         "use_canfd": 0,
         "canfd_brs": 0,
         "trans_ver": 0,
@@ -348,12 +351,31 @@ def write_did(bus_id, did, data):
 # ======== Qi IAP 流程 ========
 
 def qi_iap_start(bus_id, fw_size):
-    """启动 Qi IAP：通知 MCU 开始升级，传固件大小"""
+    """启动 Qi IAP：通知 MCU 开始升级，传固件大小。
+
+    MCU 会等 Qi 芯片 prepare ACK（擦 Flash 可能超过 2 秒）才回 6E 21 30。
+    若 Qi ACK 失败则 NRC 0x72，此处重试启动。
+    """
     _log("---- 启动 Qi IAP (固件大小 %d 字节) ----" % fw_size)
     size_hi = (fw_size >> 8) & 0xFF
     size_lo = fw_size & 0xFF
-    write_did(bus_id, DID_QI_IAP_CONTROL, [0x01, size_hi, size_lo])
-    _log("Qi IAP 启动成功")
+    last_err = None
+    for attempt in range(QI_IAP_MAX_RETRIES):
+        try:
+            write_did(bus_id, DID_QI_IAP_CONTROL, [0x01, size_hi, size_lo])
+            _log("Qi IAP 启动成功，等待芯片进入 IAP %.1fs" % QI_IAP_START_DELAY)
+            time.sleep(QI_IAP_START_DELAY)
+            return
+        except RuntimeError as e:
+            last_err = e
+            if "NRC=0x72" in str(e):
+                _log("  启动 NRC 0x72 (Qi prepare ACK 失败)，重试 %d/%d" % (
+                    attempt + 1, QI_IAP_MAX_RETRIES))
+                time.sleep(QI_IAP_START_DELAY)
+                continue
+            raise
+    raise RuntimeError("Qi IAP 启动重试 %d 次仍失败: %s" % (
+        QI_IAP_MAX_RETRIES, last_err))
 
 
 def qi_iap_abort(bus_id):
