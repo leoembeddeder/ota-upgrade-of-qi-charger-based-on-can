@@ -82,9 +82,14 @@ static uint8_t  g_sa_sig_block_seq        = 0;
 #define QI_IAP_IN_PROGRESS  0x01U
 #define QI_IAP_SUCCESS      0x02U
 #define QI_IAP_FAILED       0x03U
+#define QI_IAP_WAIT_ACK     0x04U   /*!< waiting for Qi chip UART ACK */
 
 /* Qi IAP auto-complete timeout after last data packet sent */
 #define QI_IAP_DONE_TIMEOUT_MS  3000U
+
+/** @brief  Qi chip UART ACK timeout (ms) for each data packet */
+#define QI_IAP_ACK_TIMEOUT_MS   200U
+
 static uint32_t g_qi_iap_last_tx_ms = 0U;
 
 static uint8_t  g_qi_iap_state    = QI_IAP_IDLE;
@@ -92,6 +97,10 @@ static uint8_t  g_qi_iap_progress = 0U;
 static uint16_t g_qi_iap_total    = 0U;
 static uint16_t g_qi_iap_sent     = 0U;
 static uint16_t g_qi_fw_version   = 0U;     /*!< DID 0x2133 / 0x01 上报版本号 */
+
+/** @brief  deferred UDS response while waiting for Qi chip ACK */
+static uint32_t g_qi_iap_wait_start_ms = 0U; /*!< timestamp when WAIT_ACK entered */
+static uint8_t  g_qi_iap_pending_did[2] = {0U}; /*!< DID bytes for deferred response */
 
 /* ========================================================================== */
 /*  Qi charging state variables                                              */
@@ -1001,6 +1010,8 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
           g_qi_iap_total = 0U;
           g_qi_iap_sent = 0U;
           g_qi_iap_last_tx_ms = 0U;
+          g_qi_iap_pending_did[0] = 0U;
+          g_qi_iap_pending_did[1] = 0U;
           resp[0] = UDS_SID_WRITE_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
           resp[1] = data[1];
           resp[2] = data[2];
@@ -1016,7 +1027,11 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
       case DID_QI_IAP_DATA:
       {
         /* data[3..4]=地址 16-bit BE，data[5..]=固件（最多 22B）
-         * UART：0xCC 0x02 + addr + data */
+         * UART：0xCC 0x02 + addr + data
+         *
+         * ACK 链路：发 UART 帧 → 等 Qi 芯片 ACK → 才回 UDS 正响应。
+         * 非阻塞：设 WAIT_ACK 状态，UDS 响应在 qi_iap_ack_poll() 中延迟发送。
+         * Host 侧收到 NRC 0x72 时重试当前包。 */
         uint16_t addr;
         uint16_t chunk_len;
 
@@ -1047,10 +1062,12 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
             g_qi_iap_progress = 100U;
           }
         }
-        resp[0] = UDS_SID_WRITE_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
-        resp[1] = data[1];
-        resp[2] = data[2];
-        proto_send_response(resp, 3);
+        /* 不立即回 UDS 响应——进入 WAIT_ACK 状态，
+         * 在 qi_iap_ack_poll() 中等 Qi 芯片 ACK 后再回复 */
+        g_qi_iap_state = QI_IAP_WAIT_ACK;
+        g_qi_iap_wait_start_ms = timer_get_tick();
+        g_qi_iap_pending_did[0] = data[1];
+        g_qi_iap_pending_did[1] = data[2];
         break;
       }
 
@@ -1664,6 +1681,54 @@ void can_protocol_init(void)
   }
 }
 
+/**
+ * @brief  Qi IAP ACK poll: non-blocking check for Qi chip UART ACK
+ * @note   Called from can_protocol_poll() when state == WAIT_ACK.
+ *         On ACK: sends deferred UDS positive response, resumes IAP_IN_PROGRESS.
+ *         On NAK: sets IAP_FAILED, sends NRC 0x72 to host.
+ *         On timeout: sets IAP_FAILED, sends NRC 0x72 to host.
+ */
+static void qi_iap_ack_poll(void)
+{
+  uint32_t now;
+
+  if (g_qi_iap_state != QI_IAP_WAIT_ACK)
+  {
+    return;
+  }
+
+  /* flush any pending UART bytes from Qi chip */
+  qi_protocol_poll();
+
+  now = timer_get_tick();
+
+  /* check if callback already received an ACK or FAILED */
+  if (g_qi_iap_state == QI_IAP_IN_PROGRESS)
+  {
+    /* ACK received (callback set IN_PROGRESS from WAIT_ACK)
+     * Send deferred positive response */
+    uint8_t resp[3];
+    resp[0] = UDS_SID_WRITE_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
+    resp[1] = g_qi_iap_pending_did[0];
+    resp[2] = g_qi_iap_pending_did[1];
+    proto_send_response(resp, 3);
+    return;
+  }
+  if (g_qi_iap_state == QI_IAP_FAILED)
+  {
+    /* NAK from Qi chip */
+    proto_send_nrc(UDS_SID_WRITE_DATA_BY_ID, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
+    return;
+  }
+
+  /* timeout: no response from Qi chip */
+  if ((now - g_qi_iap_wait_start_ms) >= QI_IAP_ACK_TIMEOUT_MS)
+  {
+    g_qi_iap_state = QI_IAP_FAILED;
+    proto_send_nrc(UDS_SID_WRITE_DATA_BY_ID, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
+  }
+}
+
 void can_protocol_poll(void)
 {
   uint32_t now;
@@ -1676,6 +1741,9 @@ void can_protocol_poll(void)
   }
 
   now = timer_get_tick();
+
+  /* Qi IAP ACK poll: non-blocking check for Qi chip UART ACK */
+  qi_iap_ack_poll();
 
   /* Qi IAP auto-complete: if all data sent and no ACK within timeout,
    * assume success — but only if Qi chip has not reported FAILED.
