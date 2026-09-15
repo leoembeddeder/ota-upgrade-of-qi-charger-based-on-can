@@ -1703,8 +1703,8 @@ void can_protocol_init(void)
  * @brief  Qi IAP ACK poll: non-blocking check for Qi chip UART ACK
  * @note   Called from can_protocol_poll() when state == WAIT_ACK.
  *         On ACK: sends deferred UDS positive response, resumes IAP_IN_PROGRESS.
- *         On NAK: sets IAP_FAILED, sends NRC 0x72 to host.
- *         On timeout: sets IAP_FAILED, sends NRC 0x72 to host.
+ *         On NAK: sends NRC 0x72, resumes IAP_IN_PROGRESS (allow host retry).
+ *         On timeout: sends NRC 0x72, resumes IAP_IN_PROGRESS (allow host retry).
  */
 static void qi_iap_ack_poll(void)
 {
@@ -1734,7 +1734,8 @@ static void qi_iap_ack_poll(void)
   }
   if (g_qi_iap_state == QI_IAP_FAILED)
   {
-    /* NAK from Qi chip */
+    /* NAK from Qi chip — allow host retry */
+    g_qi_iap_state = QI_IAP_IN_PROGRESS;
     proto_send_nrc(UDS_SID_WRITE_DATA_BY_ID, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
     return;
   }
@@ -1742,7 +1743,7 @@ static void qi_iap_ack_poll(void)
   /* timeout: no response from Qi chip */
   if ((now - g_qi_iap_wait_start_ms) >= QI_IAP_ACK_TIMEOUT_MS)
   {
-    g_qi_iap_state = QI_IAP_FAILED;
+    g_qi_iap_state = QI_IAP_IN_PROGRESS;
     proto_send_nrc(UDS_SID_WRITE_DATA_BY_ID, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
   }
 }
