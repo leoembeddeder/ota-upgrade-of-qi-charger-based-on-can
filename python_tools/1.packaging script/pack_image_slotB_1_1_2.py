@@ -108,5 +108,17 @@ def main(argv=None):
         return ret
 
 
+
+
+def z_main():
+    """ZCANPRO 扩展脚本入口。"""
+    try:
+        ret = main()
+        if ret != 0:
+            print("打包失败 (exit=%d)" % ret)
+    except Exception as e:
+        print("打包异常: %s" % e)
+
+
 if __name__ == "__main__":
     sys.exit(main())
