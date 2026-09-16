@@ -189,6 +189,8 @@ extern "C" {
 
 #define ROUTINE_ERASE_MEMORY        0xFF00U   /*!< erase inactive slot (APP download) */
 
+extern const uint8_t g_app_ecdsa_pubkey[65];
+
 void can_proto_send_response(uint8_t *data, uint16_t len);
 void can_proto_send_nrc(uint8_t service_id, uint8_t nrc);
 void can_proto_begin_long_op(uint8_t service_id);

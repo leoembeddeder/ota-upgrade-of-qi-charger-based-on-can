@@ -142,7 +142,7 @@ static uint8_t program_flush(void)
   return 0U;
 }
 
-extern const uint8_t g_app_ecdsa_pubkey[65];
+static uint8_t s_di_pubkey[DEVICE_INFO_PUBKEY_LEN];
 
 static const uint8_t *image_pubkey(void)
 {
@@ -152,7 +152,8 @@ static const uint8_t *image_pubkey(void)
   {
     if ((di.pubkey_valid == 0x01U) && (di.ecdsa_pubkey[0] == 0x04U))
     {
-      return di.ecdsa_pubkey;
+      memcpy(s_di_pubkey, di.ecdsa_pubkey, DEVICE_INFO_PUBKEY_LEN);
+      return s_di_pubkey;
     }
   }
   if (g_app_ecdsa_pubkey[0] == 0x04U)
