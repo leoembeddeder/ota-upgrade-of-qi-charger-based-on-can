@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA (自动识别 A/B 槽，自动探测 APP/Boot)
+ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA
 
-入口 ENTRY_MODE=auto：0x34 NRC 0x11 视为 APP，先 10 02→27→11 01 进 Boot；
-否则视为已在 Boot，直接下载。指定入口请用 from_app / from_boot 副本。
+在 APP 内擦写非活跃槽（31/34/36/37），11 01 后由 Boot 切槽。
+固件只编 Slot A（IROM1=0x08004100）；写入 B 时脚本自动重定位并重签。
 
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
 需要: Python 3.8 32 位（ZCANPRO 扩展脚本要求）
-固件: 将 A/B 槽的 bin 放到 app bin/ 目录，脚本自动识别
+固件: app bin/app_slot_a.bin，或 Slot A 的 qi_wireless.bin（现场打包）
 """
 
 import os
@@ -25,14 +25,11 @@ except ImportError:
     zcanpro = None
 
 # ======== 用户配置 ========
-# 自动识别 A/B 槽：读取固件 Reset Handler 地址，自动选择对应槽。
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(_TOOLS_DIR)
 FIRMWARE_DIR = os.path.join(_TOOLS_DIR, "app bin")
-# 自动识别模式下只认已打包的 bin（app_slot_a.bin / app_slot_b.bin）
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
-# auto=探测 APP/Boot；app=必须从 APP 11 01 进 Boot；boot=已在 Safe Mode，直接下载
-ENTRY_MODE = "auto"
+KEIL_BIN_A = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project", "Objects", "qi_wireless.bin")
 
 def _scan_firmware():
     """扫描 app bin/ 目录，返回 {SLOT_A: path, SLOT_B: path} 字典。"""
@@ -63,25 +60,22 @@ def _scan_firmware():
     return result
 
 
-def _auto_select_firmware(bus_id):
-    """读 MCU 当前活跃槽(DID 0x2113)，选对面槽的 bin。"""
-    slots = _scan_firmware()
-    if not slots:
-        raise RuntimeError("app bin/ 中没有匹配 Slot A/B 的固件")
-    active = read_did_u8(bus_id, 0x2113)
-    _log("MCU 当前活跃槽: Slot %s" % slot_name(active))
-    target = SLOT_B if active == SLOT_A else SLOT_A
-    if target in slots:
-        path = slots[target]
-    elif SLOT_A in slots:
-        path = slots[SLOT_A]
-    elif SLOT_B in slots:
-        path = slots[SLOT_B]
-    else:
-        raise RuntimeError("app bin/ 中没有 Slot A/B 固件")
-    _log("自动选择: %s → 写入非活跃 Slot %s（不足则重定位）" % (
-        os.path.basename(path), slot_name(target)))
-    return path
+def _pick_firmware():
+    """优先 app_slot_a.bin，其次 Slot A Keil 裸 bin，再扫 app bin/ 里任意 XATO。"""
+    ordered = [os.path.join(FIRMWARE_DIR, "app_slot_a.bin"), KEIL_BIN_A]
+    slots = {}
+    try:
+        slots = _scan_firmware()
+    except RuntimeError:
+        slots = {}
+    for p in slots.values():
+        if p not in ordered:
+            ordered.append(p)
+    for path in ordered:
+        if os.path.isfile(path):
+            _log("固件 " + path)
+            return path
+    raise RuntimeError("找不到固件。请编 Slot A 或运行 pack_image_slotA_1_1_1.py")
 
 FIRMWARE_PATH = ""
 DOWNLOAD_ADDR = 0x08004000
@@ -628,17 +622,12 @@ def run_ota(bus_id):
     priv = load_ec_private_key(PRIVATE_KEY_PATH)
     uds_init()
     try:
-        FIRMWARE_PATH = _auto_select_firmware(bus_id)
-        if not os.path.isfile(FIRMWARE_PATH):
-            raise RuntimeError("找不到固件: " + FIRMWARE_PATH)
+        FIRMWARE_PATH = _pick_firmware()
         image = pack_image_if_needed(FIRMWARE_PATH, priv)
         linked = validate_image(image)
-        mode = ENTRY_MODE
-        if mode == "boot":
-            raise RuntimeError("Boot 不再下载。空片用 merge_prod_bin；现场升级用 from_app 脚本")
-        if mode == "auto":
-            if not probe_in_app(bus_id):
-                raise RuntimeError("当前不在 APP。空片用 merge_prod_bin；有 APP 用 from_app")
+        if not probe_in_app(bus_id):
+            raise RuntimeError("当前不在 APP。空片请 merge_prod_bin.py 烧录后再升级")
+        _log("镜像链接 Slot %s；将写入非活跃槽（必要时重定位）" % slot_name(linked))
         _log("在 APP 内升级（31/34/36/37），完成后 11 01 由 Boot 切槽")
         _log("---- Programming ----")
         last_err = None
@@ -733,8 +722,7 @@ def run_ota(bus_id):
 def z_main():
     global stopTask
     stopTask = False
-    _log("======== Qi CAN-UDS OTA auto (入口=%s) ========" % ENTRY_MODE)
-    _log("固件 " + FIRMWARE_PATH)
+    _log("======== Qi CAN-UDS OTA (APP 写对面槽) ========")
     buses = zcanpro.get_buses()
     _log("总线 " + str(buses))
     if not buses:
