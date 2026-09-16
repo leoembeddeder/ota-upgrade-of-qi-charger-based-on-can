@@ -71,8 +71,8 @@ CCU (0x03)  ──── CAN 总线 ────  MCU (0x0D)  ──── UART 
 
 ```
 APB1 = 180 MHz → CAN 时钟 18 MHz (DIV=10)
-SJW=4, BTS1=63, BTS2=9
-标称 250 kbps，采样点 87.5%
+SJW=4, BTS1=54, BTS2=18
+标称 250 kbps，采样点 75%
 ```
 
 **SIT1145 低功耗**：Standby 时 CAN 收发器处于低功耗监听，任意 250kbps 扩展帧即可唤醒。APP 启动后恢复 Normal 模式。
@@ -763,7 +763,7 @@ Bootloader: DOWNLOADING → Safe Mode
   → 2E 2010 01 选 APP 固件类型
   → 31 01 FF00 擦非活跃槽        ← 不擦直接 34 会 NRC 0x24
   → 34 申请下载
-  → 36 按块写镜像（必须是 pack_image.py 打的包）
+  → 36 按块写镜像（必须是 pack_image_slotA_1_1_1.py / pack_image_slotB_1_1_2.py 打的包）
   → 37 结束传输并验签
   → 11 01 复位进试用
 ```
