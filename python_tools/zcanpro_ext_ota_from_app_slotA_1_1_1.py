@@ -569,12 +569,19 @@ def run_ota(bus_id):
             raise last_err
         _log("---- SecurityAccess ----")
         rx = uds_req(bus_id, SID_SA, [0x01])
-        if len(rx) < 34:
+        if len(rx) < 6:
             raise RuntimeError("seed 响应过短")
-        seed = _to_bytes(rx[2:34])
-        if seed == b"\x00" * 32:
-            _log("已解锁 (ISO 14229 seed=0, 32B)，跳过 SendKey")
+        if len(rx) >= 34:
+            seed = _to_bytes(rx[2:34])
+            unlocked = (seed == b"\x00" * 32)
         else:
+            seed = _to_bytes(rx[2:6])
+            unlocked = (seed == b"\x00\x00\x00\x00")
+        if unlocked:
+            _log("已解锁 (ISO 14229 seed=0)，跳过 SendKey")
+        else:
+            if len(rx) < 34:
+                raise RuntimeError("seed 须 32 字节, 实际 %d" % (len(rx) - 2))
             _log("seed " + _hex(rx[2:34]))
             sig = ecdsa_sign_msg(priv, seed)
             _log("SendKey 签名 %d 字节（27 03 分片 + 27 02 验签）" % len(sig))
@@ -582,7 +589,7 @@ def run_ota(bus_id):
         _log("---- DID 0x2010 APP ----")
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
         _log("---- 擦除 ----")
-        uds_req(bus_id, SID_RC, [0x01, 0xFF, 0x00])
+        uds_req(bus_id, SID_RC, [0x01, 0xFF, 0x00], wait_pending_s=45)
         dest = read_did_u8(bus_id, 0x2114)
         _log("擦除目标 Slot %s (DID 0x2114=%d)" % (slot_name(dest), dest))
         if dest not in (SLOT_A, SLOT_B):
@@ -618,7 +625,7 @@ def run_ota(bus_id):
         last_err = None
         for attempt in range(1, 6):
             try:
-                uds_req(bus_id, SID_RTE, [])
+                uds_req(bus_id, SID_RTE, [], wait_pending_s=45)
                 last_err = None
                 break
             except Exception as e:

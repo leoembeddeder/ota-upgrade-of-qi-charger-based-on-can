@@ -578,17 +578,17 @@ def run_ota(bus_id):
     global FIRMWARE_PATH
     if not (1 <= TRANSFER_BLOCK_DATA <= MAX_TD_DATA):
         raise RuntimeError("TRANSFER_BLOCK_DATA 须为 1..%d" % MAX_TD_DATA)
-    FIRMWARE_PATH = _auto_select_firmware(bus_id)
-    if not os.path.isfile(FIRMWARE_PATH):
-        raise RuntimeError("找不到固件: " + FIRMWARE_PATH)
     if not os.path.isfile(PRIVATE_KEY_PATH):
         raise RuntimeError("找不到私钥: " + PRIVATE_KEY_PATH)
     _log("私钥 " + PRIVATE_KEY_PATH)
     priv = load_ec_private_key(PRIVATE_KEY_PATH)
-    image = pack_image_if_needed(FIRMWARE_PATH, priv)
-    linked = validate_image(image)
     uds_init()
     try:
+        FIRMWARE_PATH = _auto_select_firmware(bus_id)
+        if not os.path.isfile(FIRMWARE_PATH):
+            raise RuntimeError("找不到固件: " + FIRMWARE_PATH)
+        image = pack_image_if_needed(FIRMWARE_PATH, priv)
+        linked = validate_image(image)
         mode = ENTRY_MODE
         if mode == "app":
             enter_boot_from_app(bus_id, priv)
@@ -617,18 +617,25 @@ def run_ota(bus_id):
         rx = uds_req(bus_id, SID_SA, [0x01])
         if len(rx) < 6:
             raise RuntimeError("seed 响应过短")
-        seed = _to_bytes(rx[2:6])
-        if seed == b"\x00\x00\x00\x00":
+        if len(rx) >= 34:
+            seed = _to_bytes(rx[2:34])
+            unlocked = (seed == b"\x00" * 32)
+        else:
+            seed = _to_bytes(rx[2:6])
+            unlocked = (seed == b"\x00\x00\x00\x00")
+        if unlocked:
             _log("已解锁 (ISO 14229 seed=0)，跳过 SendKey")
         else:
-            _log("seed " + _hex(rx[2:6]))
+            if len(rx) < 34:
+                raise RuntimeError("seed 须 32 字节, 实际 %d" % (len(rx) - 2))
+            _log("seed " + _hex(rx[2:34]))
             sig = ecdsa_sign_msg(priv, seed)
             _log("SendKey 签名 %d 字节（27 03 分片 + 27 02 验签）" % len(sig))
             send_security_key(bus_id, sig)
         _log("---- DID 0x2010 APP ----")
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
         _log("---- 擦除 ----")
-        uds_req(bus_id, SID_RC, [0x01, 0xFF, 0x00])
+        uds_req(bus_id, SID_RC, [0x01, 0xFF, 0x00], wait_pending_s=45)
         dest = read_did_u8(bus_id, 0x2114)
         _log("擦除目标 Slot %s (DID 0x2114=%d)" % (slot_name(dest), dest))
         if dest not in (SLOT_A, SLOT_B):
@@ -664,7 +671,7 @@ def run_ota(bus_id):
         last_err = None
         for attempt in range(1, 6):
             try:
-                uds_req(bus_id, SID_RTE, [])
+                uds_req(bus_id, SID_RTE, [], wait_pending_s=45)
                 last_err = None
                 break
             except Exception as e:
