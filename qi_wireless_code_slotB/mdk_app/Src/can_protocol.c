@@ -37,6 +37,7 @@
 #include "sha256.h"
 #include "uECC.h"
 #include "sit1145.h"
+#include "at32f422_426_can.h"
 #include <string.h>
 
 /* ========================================================================== */
@@ -383,6 +384,88 @@ static void proto_send_nrc(uint8_t service_id, uint8_t nrc)
   proto_send_response(resp, 3);
 }
 
+/** @brief  AT32F426 Flash sector is 1KB (must match bootloader FLASH_SECTOR_SIZE) */
+#define APP_FLASH_SECTOR_SIZE  0x400U
+
+static uint8_t  g_long_op_sid;
+static uint32_t g_long_op_last_78_ms;
+
+/**
+ * @brief  recover CAN after Flash stall (IRQ may have missed bus-off)
+ */
+static void proto_can_busoff_recover(void)
+{
+  uint32_t start;
+  uint8_t n;
+
+  for (n = 0U; n < 3U; n++)
+  {
+    if (can_busoff_get(CAN1) == RESET)
+    {
+      return;
+    }
+    can_busoff_reset(CAN1);
+    start = timer_get_tick();
+    while ((timer_get_tick() - start) < 10U)
+    {
+      if (can_busoff_get(CAN1) == RESET)
+      {
+        return;
+      }
+    }
+  }
+  can_driver_init();
+}
+
+/**
+ * @brief  NRC 0x78 as a raw ISO-TP SF (do not use isotp_tx_send; it can block 1s)
+ */
+static void proto_send_pending(uint8_t service_id)
+{
+  uint8_t sf[8];
+  sf[0] = 0x03U;
+  sf[1] = UDS_NEGATIVE_RESPONSE;
+  sf[2] = service_id;
+  sf[3] = UDS_NRC_RESPONSE_PENDING;
+  sf[4] = 0xCCU;
+  sf[5] = 0xCCU;
+  sf[6] = 0xCCU;
+  sf[7] = 0xCCU;
+  (void)can_driver_send(CAN_PROTO_UDS_RESPONSE, sf, 8);
+}
+
+static void proto_long_op_pump(void)
+{
+  uint32_t now = timer_get_tick();
+
+  (void)sit1145_normal_mode_set();
+  if ((now - g_long_op_last_78_ms) >= 2000U)
+  {
+    g_long_op_last_78_ms = now;
+    proto_can_busoff_recover();
+    (void)sit1145_normal_mode_set();
+    proto_send_pending(g_long_op_sid);
+    (void)can_driver_wait_tx_idle(10U);
+  }
+}
+
+static void proto_begin_long_op(uint8_t service_id)
+{
+  g_long_op_sid = service_id;
+  proto_can_busoff_recover();
+  (void)sit1145_normal_mode_set();
+  proto_send_pending(service_id);
+  (void)can_driver_wait_tx_idle(50U);
+  g_long_op_last_78_ms = timer_get_tick();
+}
+
+static void proto_end_long_op(void)
+{
+  proto_can_busoff_recover();
+  (void)sit1145_normal_mode_set();
+  (void)can_driver_wait_tx_idle(50U);
+}
+
 /**
  * @brief  reset session to default and clear security state
  * @note   called on session timeout or switch to default session
@@ -726,21 +809,18 @@ static void handle_diag_session_ctrl(uint8_t *data, uint16_t len)
   /* send positive response unless suppressed */
   if (!suppress)
   {
-    uint8_t n = 2U;
+    uint16_t p2star_units;
     resp[0] = UDS_SID_DIAG_SESSION_CTRL + UDS_POSITIVE_RESPONSE_OFFSET;
     resp[1] = session_type;
-    /* 从 Standby WUP 醒来时附带 4 字节，UDS 窗口也能看到（否则只有 50 01） */
-    if (g_lp_woke_from_standby != 0U)
-    {
-      resp[2] = (uint8_t)((g_lp_ever_standby != 0U) |
-                          ((g_lp_woke_from_standby != 0U) << 1) |
-                          ((g_lp_last_wake_src & 0x0FU) << 4));
-      resp[3] = g_lp_wup_count;
-      resp[4] = (uint8_t)(g_lp_last_standby_sec & 0xFFU);
-      resp[5] = (uint8_t)((g_lp_last_standby_sec >> 8) & 0xFFU);
-      n = 6U;
-    }
-    proto_send_response(resp, n);
+    /* ISO 14229 sessionParameterRecord: P2 (1ms), P2* (10ms). Do not piggyback
+     * LP wakeup flags here — CCU treats bytes 2..5 as timing and P2*=0
+     * makes 7F xx 78 expire in ~5s with no retry. */
+    resp[2] = (uint8_t)((UDS_P2_TIMEOUT_MS >> 8) & 0xFFU);
+    resp[3] = (uint8_t)(UDS_P2_TIMEOUT_MS & 0xFFU);
+    p2star_units = (uint16_t)(UDS_P2_STAR_TIMEOUT_MS / 10U);
+    resp[4] = (uint8_t)((p2star_units >> 8) & 0xFFU);
+    resp[5] = (uint8_t)(p2star_units & 0xFFU);
+    proto_send_response(resp, 6U);
     if (session_type == SESSION_DEFAULT)
     {
       (void)can_driver_wait_tx_idle(20U);
@@ -1279,13 +1359,14 @@ static void handle_security_access(uint8_t *data, uint16_t len)
       proto_send_nrc(UDS_SID_SECURITY_ACCESS, UDS_NRC_INCORRECT_MESSAGE_LENGTH);
       return;
     }
-    proto_send_nrc(UDS_SID_SECURITY_ACCESS, UDS_NRC_RESPONSE_PENDING);
+    proto_begin_long_op(UDS_SID_SECURITY_ACCESS);
     sha256_hash(g_seed, 32U, hash);
     if (uECC_verify(g_app_ecdsa_pubkey, hash, g_sa_sig_buf) == 1)
     {
       security_unlocked = 1;
       g_security_fail_count = 0;
       g_seed_generated = 0;
+      proto_end_long_op();
       resp[0] = UDS_SID_SECURITY_ACCESS + UDS_POSITIVE_RESPONSE_OFFSET;
       resp[1] = 0x02U;
       proto_send_response(resp, 2);
@@ -1296,6 +1377,7 @@ static void handle_security_access(uint8_t *data, uint16_t len)
       g_security_fail_count++;
       g_seed_generated = 0;
       g_sa_sig_bytes_received = 0;
+      proto_end_long_op();
       if (g_security_fail_count >= SECURITY_MAX_FAILURES)
       {
         g_security_lockout_until_ms = timer_get_tick() + SECURITY_LOCKOUT_MS;
@@ -1315,11 +1397,12 @@ static void handle_security_access(uint8_t *data, uint16_t len)
 
 /**
  * @brief  RoutineControl (0x31)
- * @note   APP side only reports NRC 0x11 for all routines
- *         (erase and other routines are handled by bootloader)
- * @param  data: UDS payload
- * @param  len:  payload length
- * @retval none
+ * @note   0xFF00 erases the inactive slot. Slot is taken from SCB->VTOR
+ *         (ota_running_slot), never from *(uint32_t*)0x04 — that reads the
+ *         Bootloader vector and would erase the running APP.
+ *         0x34/0x36 still belong in Bootloader; CCU should 11 01 after SA
+ *         for a full download. 0x31 is kept so a CCU that erases in APP
+ *         does not hang the bus.
  */
 static void handle_routine_control(uint8_t *data, uint16_t len)
 {
@@ -1350,35 +1433,36 @@ static void handle_routine_control(uint8_t *data, uint16_t len)
 
   if (routine_id == 0xFF00U && sub_func == 0x01U)
   {
-    /* erase inactive slot */
-    /* determine active slot from Reset Handler address */
-    uint32_t reset_handler = *(volatile uint32_t *)0x04U;
-    active_slot = (reset_handler >= OTA_APP_A_BASE_ADDR && reset_handler < (OTA_APP_A_BASE_ADDR + OTA_APP_A_SIZE)) ? OTA_SLOT_A : OTA_SLOT_B;
+    uint8_t resp[4];
+
+    active_slot = ota_running_slot();
     target_slot = (active_slot == OTA_SLOT_A) ? OTA_SLOT_B : OTA_SLOT_A;
     base = (target_slot == OTA_SLOT_A) ? OTA_APP_A_BASE_ADDR : OTA_APP_B_BASE_ADDR;
 
-    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_RESPONSE_PENDING);
+    proto_begin_long_op(UDS_SID_ROUTINE_CONTROL);
 
     flash_unlock();
-    for (sector_addr = base; sector_addr < (base + OTA_APP_A_SIZE); sector_addr += OTA_FLASH_SECTOR_SIZE)
+    for (sector_addr = base; sector_addr < (base + OTA_APP_A_SIZE);
+         sector_addr += APP_FLASH_SECTOR_SIZE)
     {
       if (flash_sector_erase(sector_addr) != FLASH_OPERATE_DONE)
       {
         flash_lock();
+        proto_end_long_op();
         proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
         return;
       }
+      proto_long_op_pump();
     }
     flash_lock();
+    proto_end_long_op();
 
-    {
-      uint8_t resp[4];
-      resp[0] = UDS_SID_ROUTINE_CONTROL + UDS_POSITIVE_RESPONSE_OFFSET;
-      resp[1] = sub_func;
-      resp[2] = data[2];
-      resp[3] = data[3];
-      proto_send_response(resp, 4);
-    }
+    resp[0] = UDS_SID_ROUTINE_CONTROL + UDS_POSITIVE_RESPONSE_OFFSET;
+    resp[1] = sub_func;
+    resp[2] = data[2];
+    resp[3] = data[3];
+    proto_send_response(resp, 4);
+    (void)can_driver_wait_tx_idle(50U);
   }
   else if (routine_id == 0xFF00U && (sub_func == 0x00U || sub_func == 0x02U))
   {

@@ -276,6 +276,13 @@ static int8_t isotp_wait_cts(uint8_t *out_bs, uint8_t *out_stmin)
     {
       continue;
     }
+    /* Ignore non-UDS IDs (lifecycle, own TX echo). A raw SF PCI 0x02
+     * otherwise becomes UDS SID 0x02 → spurious 7F 02 11. */
+    if ((id != CAN_ID_UDS_REQUEST) &&
+        ((id & 0x1FFFFF00U) != 0x18DB3300U))
+    {
+      continue;
+    }
     if ((n == 0U) || ((data[0] & ISOTP_PCI_TYPE_MASK) != ISOTP_PCI_TYPE_FC))
     {
       isotp_stash_frame(data, n);
