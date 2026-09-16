@@ -504,11 +504,18 @@ def run_ota(bus_id):
     uds_init()
     try:
         if RESET_APP_TO_BOOT:
-            _log("---- APP 进 Boot ----")
+            _log("---- APP 进 Boot (10 02 → 27 → 11 01) ----")
             try:
                 uds_req(bus_id, SID_DSC, [0x02])
+                rx = uds_req(bus_id, SID_SA, [0x01])
+                if len(rx) >= 34:
+                    seed = _to_bytes(rx[2:34])
+                    if seed == b"\x00" * 32:
+                        _log("APP 已解锁 (seed=0)")
+                    else:
+                        send_security_key(bus_id, ecdsa_sign_msg(priv, seed))
             except Exception as e:
-                _log("APP 10 02 失败，仍继续: " + str(e))
+                _log("APP 10 02/27 失败，仍尝试 11 01: " + str(e))
             time.sleep(0.05)
             uds_ecu_reset(bus_id)
             t0 = time.time()

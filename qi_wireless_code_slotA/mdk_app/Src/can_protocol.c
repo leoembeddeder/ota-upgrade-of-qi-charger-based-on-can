@@ -384,11 +384,7 @@ static void proto_send_nrc(uint8_t service_id, uint8_t nrc)
   proto_send_response(resp, 3);
 }
 
-/** @brief  AT32F426 Flash sector is 1KB (must match bootloader FLASH_SECTOR_SIZE) */
-#define APP_FLASH_SECTOR_SIZE  0x400U
-
 static uint8_t  g_long_op_sid;
-static uint32_t g_long_op_last_78_ms;
 
 /**
  * @brief  recover CAN after Flash stall (IRQ may have missed bus-off)
@@ -434,21 +430,6 @@ static void proto_send_pending(uint8_t service_id)
   (void)can_driver_send(CAN_PROTO_UDS_RESPONSE, sf, 8);
 }
 
-static void proto_long_op_pump(void)
-{
-  uint32_t now = timer_get_tick();
-
-  (void)sit1145_normal_mode_set();
-  if ((now - g_long_op_last_78_ms) >= 2000U)
-  {
-    g_long_op_last_78_ms = now;
-    proto_can_busoff_recover();
-    (void)sit1145_normal_mode_set();
-    proto_send_pending(g_long_op_sid);
-    (void)can_driver_wait_tx_idle(10U);
-  }
-}
-
 static void proto_begin_long_op(uint8_t service_id)
 {
   g_long_op_sid = service_id;
@@ -456,7 +437,6 @@ static void proto_begin_long_op(uint8_t service_id)
   (void)sit1145_normal_mode_set();
   proto_send_pending(service_id);
   (void)can_driver_wait_tx_idle(50U);
-  g_long_op_last_78_ms = timer_get_tick();
 }
 
 static void proto_end_long_op(void)
@@ -857,11 +837,17 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
     return;
   }
 
-  /* programming session + hardReset: enter bootloader Safe Mode download */
+  /* Programming + unlocked + hardReset → Bootloader Safe Mode.
+   * Default-session 11 01 is a normal reset (no OTA flag). */
   enter_ota = (current_session == SESSION_PROGRAMMING) ? 1U : 0U;
 
   if (enter_ota)
   {
+    if (!security_unlocked)
+    {
+      proto_send_nrc(UDS_SID_ECU_RESET, UDS_NRC_SECURITY_ACCESS_DENIED);
+      return;
+    }
     if (ota_trigger_prepare() != 0)
     {
       proto_send_nrc(UDS_SID_ECU_RESET, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
@@ -1397,86 +1383,14 @@ static void handle_security_access(uint8_t *data, uint16_t len)
 
 /**
  * @brief  RoutineControl (0x31)
- * @note   0xFF00 erases the inactive slot. Slot is taken from SCB->VTOR
- *         (ota_running_slot), never from *(uint32_t*)0x04 — that reads the
- *         Bootloader vector and would erase the running APP.
- *         0x34/0x36 still belong in Bootloader; CCU should 11 01 after SA
- *         for a full download. 0x31 is kept so a CCU that erases in APP
- *         does not hang the bus.
+ * @note   APP does not erase or program slots. Host must 10 02 + 27 + 11 01
+ *         into Bootloader Safe Mode; 0x31/0x34/0x36 live there only.
  */
 static void handle_routine_control(uint8_t *data, uint16_t len)
 {
-  uint16_t routine_id;
-  uint8_t sub_func;
-  uint8_t active_slot, target_slot;
-  uint32_t base, sector_addr;
-
-  if (len < 4U)
-  {
-    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_INCORRECT_MESSAGE_LENGTH);
-    return;
-  }
-
-  if (current_session != SESSION_PROGRAMMING)
-  {
-    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_CONDITIONS_NOT_CORRECT);
-    return;
-  }
-  if (!security_unlocked)
-  {
-    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_SECURITY_ACCESS_DENIED);
-    return;
-  }
-
-  sub_func = data[1];
-  routine_id = ((uint16_t)data[2] << 8) | (uint16_t)data[3];
-
-  if (routine_id == 0xFF00U && sub_func == 0x01U)
-  {
-    uint8_t resp[4];
-
-    active_slot = ota_running_slot();
-    target_slot = (active_slot == OTA_SLOT_A) ? OTA_SLOT_B : OTA_SLOT_A;
-    base = (target_slot == OTA_SLOT_A) ? OTA_APP_A_BASE_ADDR : OTA_APP_B_BASE_ADDR;
-
-    proto_begin_long_op(UDS_SID_ROUTINE_CONTROL);
-
-    flash_unlock();
-    for (sector_addr = base; sector_addr < (base + OTA_APP_A_SIZE);
-         sector_addr += APP_FLASH_SECTOR_SIZE)
-    {
-      if (flash_sector_erase(sector_addr) != FLASH_OPERATE_DONE)
-      {
-        flash_lock();
-        proto_end_long_op();
-        proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
-        return;
-      }
-      proto_long_op_pump();
-    }
-    flash_lock();
-    proto_end_long_op();
-
-    resp[0] = UDS_SID_ROUTINE_CONTROL + UDS_POSITIVE_RESPONSE_OFFSET;
-    resp[1] = sub_func;
-    resp[2] = data[2];
-    resp[3] = data[3];
-    proto_send_response(resp, 4);
-    (void)can_driver_wait_tx_idle(50U);
-  }
-  else if (routine_id == 0xFF00U && (sub_func == 0x00U || sub_func == 0x02U))
-  {
-    uint8_t resp[4];
-    resp[0] = UDS_SID_ROUTINE_CONTROL + UDS_POSITIVE_RESPONSE_OFFSET;
-    resp[1] = sub_func;
-    resp[2] = data[2];
-    resp[3] = data[3];
-    proto_send_response(resp, 4);
-  }
-  else
-  {
-    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_REQUEST_OUT_OF_RANGE);
-  }
+  (void)data;
+  (void)len;
+  proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_SERVICE_NOT_SUPPORTED);
 }
 
 /**
