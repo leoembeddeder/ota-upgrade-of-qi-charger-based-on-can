@@ -60,6 +60,7 @@ dkms.conf
 *.pyc
 
 # Keil build artifacts
+*.Bak
 *.axf
 *.htm
 *.build_log.htm
