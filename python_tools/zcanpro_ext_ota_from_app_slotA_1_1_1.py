@@ -25,7 +25,7 @@ except ImportError:
     zcanpro = None
 
 # ======== 用户配置 ========
-# Slot A：Keil Target IROM1 = 0x08007100；Slot B：IROM1 = 0x08011900。不用 scatter。
+# Slot A：Keil Target IROM1 = 0x08004100；Slot B：IROM1 = 0x08010100。不用 scatter。
 # MCU 写入非活跃槽；脚本擦除后读 DID 0x2114，链接地址不符则中止。
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(_TOOLS_DIR)
@@ -33,7 +33,7 @@ FIRMWARE_PATH = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project",
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 # auto=探测 APP/Boot；app=必须从 APP 11 01 进 Boot；boot=已在 Safe Mode，直接下载
 ENTRY_MODE = "app"
-DOWNLOAD_ADDR = 0x08007000
+DOWNLOAD_ADDR = 0x08004000
 TRANSFER_BLOCK_DATA = 128
 
 UDS_REQ_ID = 0x18DA0D03
@@ -47,9 +47,9 @@ SA_SIG_CHUNK = 4  # 27 03 单帧：SID+03+seq+4B = 7，避开 ISO-TP 多帧
 IMAGE_MAGIC = 0x4F544158
 IMAGE_HEADER_SIZE = 256
 SLOT_A, SLOT_B = 0, 1
-SLOT_A_BASE = 0x08007000
-SLOT_B_BASE = 0x08011800
-SLOT_SIZE = 0xA800
+SLOT_A_BASE = 0x08004000
+SLOT_B_BASE = 0x08010000
+SLOT_SIZE = 0xC000
 MAX_TD_DATA = 254
 
 # secp256r1 / prime256v1. n 必须与 bootloader uECC.c 的 N[] 一致。
@@ -314,7 +314,7 @@ def validate_image(image):
     linked = image_target_slot(image)
     if linked is None:
         reset = struct.unpack_from("<I", image, IMAGE_HEADER_SIZE + 4)[0]
-        raise RuntimeError("Reset Handler 0x%08X 不在 Slot A/B 内，请改 Target IROM1（A=0x08007100 / B=0x08011900）" % reset)
+        raise RuntimeError("Reset Handler 0x%08X 不在 Slot A/B 内，请改 Target IROM1（A=0x08004100 / B=0x08010100）" % reset)
     _log("镜像链接 Slot %s, 总长 %d" % (slot_name(linked), len(image)))
     return linked
 
@@ -544,15 +544,12 @@ def run_ota(bus_id):
     uds_init()
     try:
         mode = ENTRY_MODE
-        if mode == "app":
-            enter_boot_from_app(bus_id, priv)
-        elif mode == "boot":
-            _log("入口=Boot，跳过 APP 11 01，直接下载")
-        else:
-            if probe_in_app(bus_id):
-                enter_boot_from_app(bus_id, priv)
-            else:
-                _log("入口=Boot（自动探测），直接下载")
+        if mode == "boot":
+            raise RuntimeError("Boot 不再下载。空片用 merge_prod_bin；现场升级用 from_app 脚本")
+        if mode == "auto":
+            if not probe_in_app(bus_id):
+                raise RuntimeError("当前不在 APP。空片用 merge_prod_bin；有 APP 用 from_app")
+        _log("在 APP 内升级（31/34/36/37），完成后 11 01 由 Boot 切槽")
         _log("---- Programming ----")
         last_err = None
         for attempt in range(1, 9):

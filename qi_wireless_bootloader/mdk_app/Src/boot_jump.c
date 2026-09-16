@@ -28,7 +28,6 @@
 #include "boot_metadata.h"
 #include "core_cm4.h"
 #include "at32f422_426_conf.h"
-#include "sit1145.h"
 
 /**
  * @brief  Jump-to-APP method selection

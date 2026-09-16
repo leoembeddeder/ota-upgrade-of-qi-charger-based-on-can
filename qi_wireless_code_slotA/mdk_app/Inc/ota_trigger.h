@@ -37,13 +37,13 @@ extern "C" {
 /* exported constants --------------------------------------------------------*/
 
 /** @brief  Flash layout constants (must match bootloader / docs Flash layout) */
-#define OTA_APP_A_BASE_ADDR     0x08007000U   /*!< application A start address */
-#define OTA_APP_A_SIZE          0xA800U       /*!< application A size: 42KB */
-#define OTA_APP_B_BASE_ADDR     0x08011800U   /*!< application B start address */
-#define OTA_APP_B_SIZE          0xA800U       /*!< application B size: 42KB */
+#define OTA_APP_A_BASE_ADDR     0x08004000U   /*!< application A start address */
+#define OTA_APP_A_SIZE          0xC000U       /*!< application A size: 48KB */
+#define OTA_APP_B_BASE_ADDR     0x08010000U   /*!< application B start address */
+#define OTA_APP_B_SIZE          0xC000U       /*!< application B size: 48KB */
 #define OTA_META_PRIMARY_ADDR   0x0801C000U   /*!< primary metadata (2KB sector) */
 #define OTA_META_BACKUP_ADDR    0x0801C800U   /*!< backup metadata (next 2KB sector) */
-#define OTA_META_PAGE_SIZE      0x800U        /*!< metadata erase size: 1 sector */
+#define OTA_META_PAGE_SIZE      0x400U        /*!< metadata erase size: 1 sector */
 #define OTA_IMAGE_HEADER_SIZE   256U          /*!< image header size in bytes */
 
 /** @brief  OTA metadata magic and version */
@@ -66,7 +66,7 @@ extern "C" {
 #define TRIAL_STATE_CONFIRMED   3U
 
 /** @brief  Flash sector size for AT32F426 */
-#define OTA_FLASH_SECTOR_SIZE   0x800U        /*!< 2KB per sector */
+#define OTA_FLASH_SECTOR_SIZE   0x400U        /*!< 1KB per sector */
 
 /** @brief  image header magic "XATO" (must match bootloader IMAGE_MAGIC) */
 #define OTA_IMAGE_MAGIC         0x4F544158U

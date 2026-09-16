@@ -4,7 +4,7 @@
 版本：QC_JYF_FW_1.1.2（写死在 image header 中）
 用途：打包 Slot B 固件
 
-产线：输出文件从槽起始地址烧录（Slot A = 0x08007000）。
+产线：输出文件从槽起始地址烧录（Slot A = 0x08004000）。
 OTA：输出到 python_tools/app bin/ 目录，供 zcanpro_ext_ota_auto.py 自动识别。
 
 依赖：标准库 + 同目录 zcanpro_ext_ota_slotA.py（不需要 ZCANPRO / cryptography）。

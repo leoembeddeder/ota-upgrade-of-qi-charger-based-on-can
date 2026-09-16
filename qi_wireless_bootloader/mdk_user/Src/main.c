@@ -66,12 +66,8 @@ int main(void)
   /* step 4: detect and record boot reason */
   g_meta.last_boot_reason = detect_boot_reason();
 
-  /* stay in safe mode until 0x37 completes (or host aborts to default) */
-  if (g_meta.ota_state == OTA_STATE_DOWNLOADING)
-  {
-    enter_safe_mode();
-    /* does not return */
-  }
+  /* Download is APP-only. Boot only selects a slot and jumps.
+   * ota_state=DOWNLOADING is ignored (legacy metadata). */
 
   /* step 5: process trial boot state machine */
   process_trial_state(&g_meta);

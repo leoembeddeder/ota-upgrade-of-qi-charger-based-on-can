@@ -23,9 +23,9 @@ IMAGE_MAGIC = 0x4F544158  # "XATO"
 IMAGE_HEADER_SIZE = 256
 
 # Flash layout (must match boot_metadata.h)
-APP_A_BASE_ADDR = 0x08007000
-APP_B_BASE_ADDR = 0x08011800
-APP_SLOT_SIZE    = 0xA800  # 42KB per slot
+APP_A_BASE_ADDR = 0x08004000
+APP_B_BASE_ADDR = 0x08010000
+APP_SLOT_SIZE    = 0xC000  # 48KB per slot
 
 # ECDSA public key magic marker (matches boot_verify.h ECDSA_PUBKEY_MAGIC)
 ECDSA_PUBKEY_MAGIC = 0x4B594550  # "KEYP"

@@ -2,8 +2,8 @@
 """Merge bootloader.bin + app_slot_a.ota.bin into a single production bin.
 
 The merged image is laid out to match the AT32F426 Flash layout:
-  0x08000000  Bootloader  (28KB = 0x7000)
-  0x08007000  Slot A      (app_slot_a.ota.bin, includes 256B XATO header)
+  0x08000000  Bootloader  (16KB = 0x4000)
+  0x08004000  Slot A      (app_slot_a.ota.bin, includes 256B XATO header)
 
 Usage:
     python merge_prod_bin.py                          # use defaults
@@ -30,10 +30,10 @@ DEFAULT_APP = os.path.join(APP_BIN_DIR, "app_slot_a.bin")
 DEFAULT_OUT = os.path.join(BURN_BIN_DIR, "prod_image.bin")
 
 BOOT_BASE = 0x08000000
-BOOT_SIZE = 0x7000  # 28 KB reserved for bootloader
-SLOT_A_SIZE = 0xA800  # 42 KB
-SLOT_A_OFFSET = BOOT_SIZE  # Slot A starts at 0x7000 within merged image
-APP_BASE = BOOT_BASE + SLOT_A_OFFSET  # 0x08007000
+BOOT_SIZE = 0x4000  # 16 KB reserved for bootloader
+SLOT_A_SIZE = 0xC000  # 48 KB
+SLOT_A_OFFSET = BOOT_SIZE  # Slot A starts at 0x4000 within merged image
+APP_BASE = BOOT_BASE + SLOT_A_OFFSET  # 0x08004000
 
 
 def bin_to_ihex(data, base_addr):

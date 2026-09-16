@@ -27,6 +27,7 @@
 #include "can_protocol.h"
 #include "can_driver.h"
 #include "ota_trigger.h"
+#include "ota_download.h"
 #include "isotp.h"
 #include "timer_drv.h"
 #include "lifecycle.h"
@@ -49,7 +50,7 @@ static const char BOOTLOADER_VER_STR[] = "QC_JYF_BL_1.0.0";
 static const char HW_VERSION_STR[]     = "QC_JYF_HW_1.1.5";
 
 /* same public key as Bootloader boot_verify.c */
-static const uint8_t g_app_ecdsa_pubkey[65] = {
+const uint8_t g_app_ecdsa_pubkey[65] = {
   0x04,
   0x79, 0x0d, 0x96, 0xca, 0x91, 0x2d, 0x90, 0xdb,
   0x73, 0xdf, 0x21, 0xb0, 0x6e, 0xe7, 0xce, 0x19,
@@ -446,6 +447,41 @@ static void proto_end_long_op(void)
   (void)can_driver_wait_tx_idle(50U);
 }
 
+void can_proto_send_response(uint8_t *data, uint16_t len)
+{
+  proto_send_response(data, len);
+}
+
+void can_proto_send_nrc(uint8_t service_id, uint8_t nrc)
+{
+  proto_send_nrc(service_id, nrc);
+}
+
+void can_proto_begin_long_op(uint8_t service_id)
+{
+  proto_begin_long_op(service_id);
+}
+
+void can_proto_end_long_op(void)
+{
+  proto_end_long_op();
+}
+
+void can_proto_send_pending(uint8_t service_id)
+{
+  proto_send_pending(service_id);
+}
+
+uint8_t can_proto_security_unlocked(void)
+{
+  return security_unlocked;
+}
+
+uint8_t can_proto_in_programming(void)
+{
+  return (current_session == SESSION_PROGRAMMING) ? 1U : 0U;
+}
+
 /**
  * @brief  reset session to default and clear security state
  * @note   called on session timeout or switch to default session
@@ -456,6 +492,7 @@ static void session_reset_to_default(void)
   current_session   = SESSION_DEFAULT;
   security_unlocked = 0;
   g_seed_generated  = 0;
+  ota_dl_abort();
 }
 
 /**
@@ -605,7 +642,14 @@ static int8_t fill_did_payload(uint16_t did, uint8_t *out, uint8_t *olen)
     case DID_PENDING_SLOT:
     {
       ota_metadata_t meta;
-      out[0] = (ota_metadata_read(&meta) == 0) ? meta.pending_slot : 0xFEU;
+      if (ota_dl_erased() != 0U)
+      {
+        out[0] = ota_dl_target_slot();
+      }
+      else
+      {
+        out[0] = (ota_metadata_read(&meta) == 0) ? meta.pending_slot : 0xFEU;
+      }
       *olen = 1U;
       return 0;
     }
@@ -820,7 +864,6 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
   uint8_t resp[8];
   uint8_t sub_func;
   uint8_t suppress;
-  uint8_t enter_ota;
 
   if (len < 2U)
   {
@@ -837,23 +880,8 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
     return;
   }
 
-  /* Programming + unlocked + hardReset → Bootloader Safe Mode.
-   * Default-session 11 01 is a normal reset (no OTA flag). */
-  enter_ota = (current_session == SESSION_PROGRAMMING) ? 1U : 0U;
-
-  if (enter_ota)
-  {
-    if (!security_unlocked)
-    {
-      proto_send_nrc(UDS_SID_ECU_RESET, UDS_NRC_SECURITY_ACCESS_DENIED);
-      return;
-    }
-    if (ota_trigger_prepare() != 0)
-    {
-      proto_send_nrc(UDS_SID_ECU_RESET, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
-      return;
-    }
-  }
+  /* After 0x37, metadata is already trial PENDING. 11 01 only resets;
+   * Bootloader jumps the new slot. */
 
   if (!suppress)
   {
@@ -1388,9 +1416,7 @@ static void handle_security_access(uint8_t *data, uint16_t len)
  */
 static void handle_routine_control(uint8_t *data, uint16_t len)
 {
-  (void)data;
-  (void)len;
-  proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_SERVICE_NOT_SUPPORTED);
+  ota_dl_handle_erase(data, len);
 }
 
 /**
@@ -1699,10 +1725,18 @@ static void uds_process_message(uint8_t *data, uint16_t len)
       break;
 
     case UDS_SID_REQUEST_DOWNLOAD:
+      ota_dl_handle_request_download(data, len);
+      break;
+
     case UDS_SID_TRANSFER_DATA:
+      ota_dl_handle_transfer_data(data, len);
+      break;
+
     case UDS_SID_TRANSFER_EXIT:
+      ota_dl_handle_transfer_exit(data, len);
+      break;
+
     case UDS_SID_TRANSFER_SIGNATURE:
-      /* download path is Bootloader Safe Mode only; host must 0x10 0x02 + 0x11 */
       proto_send_nrc(service_id, UDS_NRC_SERVICE_NOT_SUPPORTED);
       break;
 
@@ -1884,6 +1918,7 @@ void can_protocol_poll(void)
 
   /* Qi IAP ACK poll: non-blocking check for Qi chip UART ACK */
   qi_iap_ack_poll();
+  ota_dl_poll();
 
   /* Qi IAP auto-complete: if all data sent and no ACK within timeout,
    * assume success — but only if Qi chip has not reported FAILED.

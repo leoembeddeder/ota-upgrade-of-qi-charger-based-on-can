@@ -33,7 +33,7 @@
 
 /** @brief  ECDSA P-256 public key (uncompressed SEC1: 04 || x || y)
  *          Stored in a dedicated .rodata section.  The linker will place this
- *          in the bootloader flash region (0x08000000..0x08006FFF, 28KB).
+ *          in the bootloader flash region (0x08000000..0x08003FFF, 16KB).
  *          A magic marker is appended after the key for corruption detection.
  *          Generated via: openssl ecparam -genkey -name prime256v1
  *          Private key stored at: docs/keys/private.pem (for host-side signing)

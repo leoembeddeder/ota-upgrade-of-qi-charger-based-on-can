@@ -85,6 +85,7 @@ extern "C" {
 #define UDS_NRC_REQUEST_SEQUENCE_ERROR      0x24U  /*!< request sequence error */
 #define UDS_NRC_UPLOAD_DOWNLOAD_NOT_ACCEPTED 0x70U /*!< upload/download not accepted */
 #define UDS_NRC_TRANSFER_DATA_SUSPENDED     0x71U  /*!< transfer data suspended */
+#define UDS_NRC_TRANSFER_DATA_ABORTED       0x71U  /*!< transferDataAborted */
 #define UDS_NRC_GENERAL_PROGRAMMING_FAILURE  0x72U /*!< general programming failure */
 #define UDS_NRC_WRONG_BLOCK_SEQUENCE        0x73U  /*!< wrong block sequence counter */
 #define UDS_NRC_RESPONSE_PENDING            0x78U  /*!< request correctly received, response pending */
@@ -186,7 +187,15 @@ extern "C" {
 /*  RoutineControl routine IDs                                               */
 /* ========================================================================== */
 
-#define ROUTINE_ERASE_MEMORY        0xFF00U   /*!< erase memory routine (bootloader only) */
+#define ROUTINE_ERASE_MEMORY        0xFF00U   /*!< erase inactive slot (APP download) */
+
+void can_proto_send_response(uint8_t *data, uint16_t len);
+void can_proto_send_nrc(uint8_t service_id, uint8_t nrc);
+void can_proto_begin_long_op(uint8_t service_id);
+void can_proto_end_long_op(void);
+void can_proto_send_pending(uint8_t service_id);
+uint8_t can_proto_security_unlocked(void);
+uint8_t can_proto_in_programming(void);
 
 /* ========================================================================== */
 /*  Exported functions                                                       */

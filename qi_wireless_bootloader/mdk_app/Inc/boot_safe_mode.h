@@ -12,8 +12,7 @@
 
 /**
  * @brief  enter safe mode: initialize CAN and wait for OTA download
- * @note   entered when ota_state is DOWNLOADING, no bootable slot, or
- *         both slots fail verify. CAN UDS event loop; does not return.
+ * @note   entered when no bootable slot remains. Does not return.
  * @param  none
  * @retval none (does not return)
  */
