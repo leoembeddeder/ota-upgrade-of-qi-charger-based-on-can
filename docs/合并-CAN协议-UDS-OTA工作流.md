@@ -476,7 +476,7 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
       │ Bootloader 28 KB   │  │ APP 42 KB/槽     │
       │ 0x08000000         │  │ 槽基址+256 入口  │
       │ 引导 / 验签 / 跳转 │  │ 充电业务 + 触发  │
-      │ Safe Mode UDS 下载 │  │ Trial 确认/超时  │
+      │ APP 内下载(擦写)   │  │ Trial 确认/超时  │
       └─────────┬──────────┘  └────────┬─────────┘
                 │   共享 metadata / XATO 头
                 ▼
@@ -485,9 +485,9 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 
 | 工程 | 目录 | 职责 |
 |------|------|------|
-| Bootloader | `qi_wireless_bootloader/` | 上电引导、槽选择、镜像校验、跳转；Safe Mode 完成全部下载 UDS |
+| Bootloader | `qi_wireless_bootloader/` | 上电引导、槽选择、镜像校验、跳转（无 UDS，Safe Mode = 挂起） |
 | APP Slot A | `qi_wireless_code_slotA/` | 充电业务、生命周期广播、UDS 查询；只负责把 MCU 送进 Boot |
-| APP Slot B | `qi_wireless_code_slotB/` | 同 Slot A，IROM1 Start = `0x08011900` |
+| APP Slot B | `qi_wireless_code_slotB/` | 同 Slot A，IROM1 Start = `0x08010100` |
 
 **产线只烧 Bootloader + Slot A**。Slot B 出厂为空，第一次现场 OTA 写入。
 
@@ -511,8 +511,8 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 | 区域 | 起始 | 大小 | 说明 |
 |------|------|------|------|
 | Bootloader | `0x08000000` | 28 KB | 引导 + Safe Mode |
-| Slot A | `0x08007000` | 42 KB | 头 256B + 代码，入口 `0x08007100` |
-| Slot B | `0x08011800` | 42 KB | 同上，入口 `0x08011900` |
+| Slot A | `0x08004000` | 48 KB | 头 256B + 代码，入口 `0x08004100` |
+| Slot B | `0x08010000` | 48 KB | 同上，入口 `0x08010100` |
 | Metadata 主 | `0x0801C000` | 2 KB | `ota_metadata_t` 272B |
 | Metadata 备 | `0x0801C800` | 2 KB | 先写备、再写主 |
 | Device Info | `0x0801D000` | 4 KB | SN、ECDSA 公钥，OTA 擦写跳过 |
@@ -536,7 +536,7 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 
 ```
 槽基址 + 0x000  magic / image_length / crc32 / signature[64] / version[16] / timestamp
-槽基址 + 0x100  应用镜像（向量表 + 代码），长度 ≤ 0xA700
+槽基址 + 0x100  应用镜像（向量表 + 代码），长度 ≤ 0xBF00
 ```
 
 CRC32 和 ECDSA 只覆盖头后面的固件（不含头本身）。跳转地址 = 槽基址 + 256。
@@ -763,7 +763,7 @@ Bootloader: DOWNLOADING → Safe Mode
   → 2E 2010 01 选 APP 固件类型
   → 31 01 FF00 擦非活跃槽        ← 不擦直接 34 会 NRC 0x24
   → 34 申请下载
-  → 36 按块写镜像（必须是 pack_image_slotA_1_1_1.py / pack_image_slotB_1_1_2.py 打的包）
+  → 36 按块写镜像（必须是 pack_image_slotA_1_1_1.py 打的包）
   → 37 结束传输并验签
   → 11 01 复位进试用
 ```
@@ -858,9 +858,9 @@ blockSeq 从 0x01 起，FF 下一帧是 0x01（跳过 0x00）。
 
 ```c
 /* Flash */
-BOOT_BASE_ADDR      0x08000000    BOOT_SIZE 0x7000
-APP_A_BASE_ADDR     0x08007000    APP_A_SIZE 0xA800    入口 0x08007100
-APP_B_BASE_ADDR     0x08011800    APP_B_SIZE 0xA800    入口 0x08011900
+BOOT_BASE_ADDR      0x08000000    BOOT_SIZE 0x4000
+APP_A_BASE_ADDR     0x08004000    APP_A_SIZE 0xC000    入口 0x08004100
+APP_B_BASE_ADDR     0x08010000    APP_B_SIZE 0xC000    入口 0x08010100
 IMAGE_HEADER_SIZE   256
 FLASH_SECTOR_SIZE   0x400         /* AT32F426 Flash 页大小: 1 KB */
 META_PRIMARY_ADDR   0x0801C000    META_BACKUP_ADDR 0x0801C800
@@ -886,8 +886,8 @@ Keil Target（不用 scatter）：
 
 | | Slot A | Slot B |
 |--|--------|--------|
-| IROM1 Start | `0x08007100` | `0x08011900` |
-| IROM1 Size | `0xA700` | `0xA700` |
+| IROM1 Start | `0x08004100` | `0x08010100` |
+| IROM1 Size | `0xBF00` | `0xBF00` |
 | IRAM1 | `0x20000000` / `0x5000` | 同左 |
 
 ## 24. 中断与时基
