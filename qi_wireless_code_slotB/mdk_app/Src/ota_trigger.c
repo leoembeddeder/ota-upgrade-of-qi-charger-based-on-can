@@ -213,10 +213,12 @@ int8_t ota_metadata_save(const ota_metadata_t *meta)
 
 uint32_t ota_running_slot_base(void)
 {
-  uint32_t vtor = SCB->VTOR;
+  uint32_t pc;
 
-  /* VTOR is the code entry (header+256), not the slot header. */
-  if (vtor >= (OTA_APP_B_BASE_ADDR + OTA_IMAGE_HEADER_SIZE))
+  /* Do not use SCB->VTOR: it may still be the link address of a
+   * Slot-A-built image running from Slot B. PC is always in this image. */
+  __asm volatile ("mov %0, pc" : "=r"(pc));
+  if (pc >= OTA_APP_B_BASE_ADDR)
   {
     return OTA_APP_B_BASE_ADDR;
   }

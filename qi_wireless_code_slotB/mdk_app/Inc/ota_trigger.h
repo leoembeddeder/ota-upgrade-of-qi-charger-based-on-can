@@ -170,7 +170,7 @@ void ota_trial_poll(void);
 uint32_t ota_crc32(const void *data, uint32_t length);
 
 /**
- * @brief  slot this APP image is running from (0=A, 1=B), derived from VTOR
+ * @brief  slot this APP image is running from (0=A, 1=B), derived from PC
  */
 uint8_t ota_running_slot(void);
 

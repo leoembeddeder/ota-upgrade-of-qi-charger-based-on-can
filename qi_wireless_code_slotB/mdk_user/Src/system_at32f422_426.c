@@ -33,13 +33,10 @@
 
 #include "at32f422_426.h"
 
-extern uint32_t __Vectors;
-
 /** @addtogroup AT32F422_426_system_private_defines
   * @{
   */
-/* APP is linked at Slot A 0x08007100 or Slot B 0x08011900. Do not use
- * FLASH_BASE (0x08000000) — that is the Bootloader table. */
+/* VTOR is set from PC so a Slot-A-linked image can run in Slot B. */
 /**
   * @}
   */
@@ -102,8 +99,20 @@ void SystemInit (void)
   /* accessing ertc periph with apb3 bus */
   CRM->piclks_bit.ertc_pclksel = 1;
 
-  /* must be the APP table (IROM start), not Boot at FLASH_BASE */
-  SCB->VTOR = (uint32_t)&__Vectors;
+  /* VTOR = this image's actual load address, not the link-time &__Vectors.
+   * A Slot-A-linked binary running from Slot B must not point VTOR at A. */
+  {
+    uint32_t pc;
+    __asm volatile ("mov %0, pc" : "=r"(pc));
+    if (pc >= 0x08010000U)
+    {
+      SCB->VTOR = 0x08010100U;
+    }
+    else
+    {
+      SCB->VTOR = 0x08004100U;
+    }
+  }
 }
 
 /**

@@ -35,15 +35,23 @@
 #include "qi_uart.h"
 #include "board_gpio.h"
 
-extern uint32_t __Vectors;
-
 /* private define ------------------------------------------------------------*/
 
 int main(void)
 {
-  /* SystemInit() forced VTOR to FLASH_BASE (Boot). Restore APP table
-   * before any interrupt is enabled. */
-  SCB->VTOR = (uint32_t)&__Vectors;
+  /* VTOR = actual load address (PC), not link-time &__Vectors. */
+  {
+    uint32_t pc;
+    __asm volatile ("mov %0, pc" : "=r"(pc));
+    if (pc >= 0x08010000U)
+    {
+      SCB->VTOR = 0x08010100U;
+    }
+    else
+    {
+      SCB->VTOR = 0x08004100U;
+    }
+  }
 
   /* configure system clock to 180MHz */
   system_clock_config();

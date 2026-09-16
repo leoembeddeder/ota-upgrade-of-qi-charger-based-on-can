@@ -318,6 +318,43 @@ def validate_image(image):
     _log("镜像链接 Slot %s, 总长 %d" % (slot_name(linked), len(image)))
     return linked
 
+def relocate_image_to_slot(image, dest, priv):
+    """Move a Slot-A-linked (or B-linked) image onto dest and re-sign.
+
+    1.0 on A upgrading to 1.2 (also built as A) writes inactive B: every
+    Flash pointer in the payload is shifted by (B-A) and CRC/ECDSA redone.
+    """
+    linked = image_target_slot(image)
+    if linked is None:
+        raise RuntimeError("无法识别镜像链接槽")
+    if dest == linked:
+        _log("镜像已按 Slot %s 链接，无需重定位" % slot_name(dest))
+        return image
+    delta = (slot_base(dest) - slot_base(linked)) & 0xFFFFFFFF
+    lo = slot_base(linked)
+    hi = lo + SLOT_SIZE
+    payload = bytearray(image[IMAGE_HEADER_SIZE:])
+    n = 0
+    i = 0
+    while i + 4 <= len(payload):
+        w = struct.unpack_from("<I", payload, i)[0]
+        raw = w & 0xFFFFFFFE
+        if lo <= raw < hi:
+            struct.pack_into("<I", payload, i, ((raw + delta) & 0xFFFFFFFE) | (w & 1))
+            n += 1
+        i += 4
+    payload = bytes(payload)
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    sig = ecdsa_sign_msg(priv, payload)
+    ver = image[76:92]
+    ts = image[92:96]
+    header = struct.pack("<III", IMAGE_MAGIC, len(payload), crc) + sig + ver + ts
+    header += b"\x00" * (IMAGE_HEADER_SIZE - len(header))
+    _log("镜像 Slot %s → Slot %s，重定位 %d 处地址 crc=0x%08X" % (
+        slot_name(linked), slot_name(dest), n, crc))
+    return header + payload
+
+
 
 def pack_image_if_needed(fw_path, priv, version="1.1.1"):
     data = open(fw_path, "rb").read()
@@ -591,12 +628,7 @@ def run_ota(bus_id):
         _log("擦除目标 Slot %s (DID 0x2114=%d)" % (slot_name(dest), dest))
         if dest not in (SLOT_A, SLOT_B):
             raise RuntimeError("DID 0x2114 槽号无效: %d" % dest)
-        if dest != linked:
-            raise RuntimeError(
-                "MCU 写入 Slot %s，但镜像按 Slot %s 链接。请把 Target IROM1 Start 改为 0x%08X 后重编"
-                % (slot_name(dest), slot_name(linked),
-                   SLOT_A_BASE + IMAGE_HEADER_SIZE if dest == SLOT_A else SLOT_B_BASE + IMAGE_HEADER_SIZE)
-            )
+        image = relocate_image_to_slot(image, dest, priv)
         size = len(image)
         addr_val = slot_base(dest)
         if DOWNLOAD_ADDR != addr_val:
