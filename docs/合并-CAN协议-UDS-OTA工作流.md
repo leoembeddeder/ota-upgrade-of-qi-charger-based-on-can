@@ -473,7 +473,7 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
                 ┌──────────────────────▲──────────────────────┐
                 │                      │                      │
       ┌─────────┴──────────┐  ┌────────┴─────────┐
-      │ Bootloader 28 KB   │  │ APP 42 KB/槽     │
+      │ Bootloader 16 KB   │  │ APP 48 KB/槽     │
       │ 0x08000000         │  │ 槽基址+256 入口  │
       │ 引导 / 验签 / 跳转 │  │ 充电业务 + 触发  │
       │ APP 内下载(擦写)   │  │ Trial 确认/超时  │
@@ -510,7 +510,7 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 
 | 区域 | 起始 | 大小 | 说明 |
 |------|------|------|------|
-| Bootloader | `0x08000000` | 28 KB | 引导 + Safe Mode |
+| Bootloader | `0x08000000` | 16 KB | 引导 + Safe Mode |
 | Slot A | `0x08004000` | 48 KB | 头 256B + 代码，入口 `0x08004100` |
 | Slot B | `0x08010000` | 48 KB | 同上，入口 `0x08010100` |
 | Metadata 主 | `0x0801C000` | 2 KB | `ota_metadata_t` 272B |
