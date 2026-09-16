@@ -47,9 +47,9 @@
 
 | 工程 | 目录 | 职责 |
 |------|------|------|
-| Bootloader | `qi_wireless_bootloader/` | 上电引导、镜像验签、双槽选择、Safe Mode UDS 下载、Trial Boot 管理 |
-| APP Slot A | `qi_wireless_code_slotA/` | Qi 充电业务、CAN 生命周期广播、OTA 触发 (进入 Boot) |
-| APP Slot B | `qi_wireless_code_slotB/` | 同 Slot A，IROM 基址不同 (0x08011900)，用于 A/B 交替升级 |
+| Bootloader | `qi_wireless_bootloader/` | 上电引导、镜像验签、双槽选择、Trial Boot 管理（无UDS，Safe Mode仅挂起） |
+| APP Slot A | `qi_wireless_code_slotA/` | Qi 充电业务、CAN 生命周期广播、OTA 下载（APP内完成）+ 充电控制 |
+| APP Slot B | `qi_wireless_code_slotB/` | 同 Slot A，IROM 基址不同 (0x08010100)，用于 A/B 交替升级 |
 | 工具集 | `python_tools/` | 镜像打包、签名、合并、验证、一键 OTA、功能测试脚本 |
 
 ---
@@ -118,7 +118,7 @@
 │                    Qi 无线充电模块                            │
 │                                                             │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │              Bootloader (28KB @ 0x08000000)            │  │
+│  │              Bootloader (16KB @ 0x08000000)            │  │
 │  │                                                       │  │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐  │  │
 │  │  │boot_jump │ │boot_safe │ │boot_trial│ │boot_meta│  │  │
@@ -136,7 +136,7 @@
 │  └───────────────────────────────────────────────────────┘  │
 │                           │ 跳转                             │
 │  ┌────────────────────────▼──────────────────────────────┐  │
-│  │           Application (42KB/Slot @ +0x100)             │  │
+│  │           Application (48KB/Slot @ +0x100)             │  │
 │  │                                                       │  │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐  │  │
 │  │  │can_proto │ │ qi_uart  │ │board_gpio│ │lifecycle│  │  │
@@ -235,7 +235,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 │   │   ├── Inc/
 │   │   │   ├── boot_jump.h                 ← 跳转控制
 │   │   │   ├── boot_metadata.h             ← Metadata 读写
-│   │   │   ├── boot_safe_mode.h            ← Safe Mode UDS 下载
+│   │   │   ├── boot_safe_mode.h            ← Safe Mode 挂起
 │   │   │   ├── boot_trial.h                ← Trial Boot 管理
 │   │   │   ├── boot_verify.h               ← CRC/ECDSA 校验
 │   │   │   ├── isotp.h                     ← ISO-TP 传输层
@@ -248,7 +248,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 │       ├── cmsis/                          ← ARM CMSIS 核心文件
 │       └── drivers/                        ← AT32 SPL 外设驱动库
 │
-├── qi_wireless_code_slotA/                 ← APP 工程 (Slot A, IROM=0x08007100)
+├── qi_wireless_code_slotA/                 ← APP 工程 (Slot A, IROM=0x08004100)
 │   ├── mdk_project/
 │   ├── mdk_user/
 │   │   ├── Inc/
@@ -271,13 +271,12 @@ ota-upgrade-of-qi-charger-based-on-can/
 │       │   └── ...
 │       └── Src/                            ← 对应 .c 实现
 │
-├── qi_wireless_code_slotB/                 ← APP 工程 (Slot B, IROM=0x08011900)
+├── qi_wireless_code_slotB/                 ← APP 工程 (Slot B, IROM=0x08010100)
 │   └── (结构同 Slot A)
 │
 ├── python_tools/                           ← Python 工具集
 │   ├── 1.packaging script/                 ← 打包签名子目录
-│   │   ├── pack_image_slotA_1_1_1.py       ← Slot A v1.1.1 镜像打包 (XATO 头 + CRC32 + ECDSA)
-│   │   ├── pack_image_slotB_1_1_2.py       ← Slot B v1.1.2 镜像打包
+│   │   ├── pack_image_slotA_1_1_1.py       ← 镜像打包 (XATO 头 + CRC32 + ECDSA)
 │   │   ├── merge_prod_bin.py               ← Boot + APP 合并产线镜像
 │   │   ├── verify_image.py                 ← 镜像完整性 + 签名校验
 │   │   └── sign_seed.py                    ← SecurityAccess seed 签名 (ECDSA P-256)
@@ -291,15 +290,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 │   ├── iap bin/                            ← Qi 芯片 IAP 固件
 │   │   ├── log1.BIN
 │   │   └── log2.BIN
-│   ├── zcanpro_ext_ota_auto.py             ← 一键 OTA (自动探测入口模式)
-│   ├── zcanpro_ext_ota_from_app_auto.py    ← OTA: 从 APP 进 Boot (自动选择 Slot)
-│   ├── zcanpro_ext_ota_from_app_slotA_1_1_1.py  ← OTA: 从 APP 进 Boot, 写 Slot A v1.1.1
-│   ├── zcanpro_ext_ota_from_app_slotB_1_1_2.py  ← OTA: 从 APP 进 Boot, 写 Slot B v1.1.2
-│   ├── zcanpro_ext_ota_from_boot_auto.py   ← OTA: 已在 Boot Safe Mode (自动选择 Slot)
-│   ├── zcanpro_ext_ota_from_boot_slotA_1_1_1.py ← OTA: 已在 Boot, 写 Slot A v1.1.1
-│   ├── zcanpro_ext_ota_from_boot_slotB_1_1_2.py ← OTA: 已在 Boot, 写 Slot B v1.1.2
-│   ├── zcanpro_ext_ota_slotA_1_1_1.py      ← OTA: 兼容旧版一键脚本, 写 Slot A v1.1.1
-│   ├── zcanpro_ext_ota_slotB_1_1_2.py      ← OTA: 兼容旧版一键脚本, 写 Slot B v1.1.2
+│   ├── zcanpro_ext_ota_auto.py             ← 一键 OTA（APP内擦非活跃槽+下载+重定位+重签）
 │   ├── zcanpro_qi_iap_log1.py             ← Qi 芯片 IAP 刷写 (log1)
 │   ├── zcanpro_qi_iap_log2.py             ← Qi 芯片 IAP 刷写 (log2)
 │   └── 脚本使用说明.md
@@ -328,22 +319,22 @@ ota-upgrade-of-qi-charger-based-on-can/
 
 ## 5. Flash 空间布局
 
-> **MCU**: AT32F426 — 128KB Flash, 2KB Sector
+> **MCU**: AT32F426 — 128KB Flash, 1KB Sector
 
 ```
 地址             大小      区域                    说明
 ──────────────────────────────────────────────────────────────────
 0x08000000 ┌─────────────────────────────┐
-           │     Bootloader (28KB)       │  引导 + Safe Mode + 验签
-           │     0x7000 bytes            │
-0x08007000 ├─────────────────────────────┤
+           │     Bootloader (16KB)       │  选槽 + 验签 + 跳转（无 UDS）
+           │     0x4000 bytes            │
+0x08004000 ├─────────────────────────────┤
            │  Slot A: XATO Header (256B) │  magic / length / CRC32
-0x08007100 │  Slot A: APP Code (41.75KB) │  ← Keil IROM 入口
-           │  0xA700 bytes               │
-0x08011800 ├─────────────────────────────┤
+0x08004100 │  Slot A: APP Code (47.75KB) │  ← Keil IROM 入口
+           │  0xBF00 bytes               │
+0x08010000 ├─────────────────────────────┤
            │  Slot B: XATO Header (256B) │  同 Slot A 结构
-0x08011900 │  Slot B: APP Code (41.75KB) │  ← OTA 写入目标
-           │  0xA700 bytes               │
+0x08010100 │  Slot B: APP Code (47.75KB) │  ← OTA 写入目标（自动重定位）
+           │  0xBF00 bytes               │
 0x0801C000 ├─────────────────────────────┤
            │  Metadata Primary (2KB)     │  ota_metadata_t (272B)
 0x0801C800 ├─────────────────────────────┤
@@ -365,7 +356,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 | 0x0A | slot_a_valid | Slot A 镜像有效标志 |
 | 0x0B | slot_b_valid | Slot B 镜像有效标志 |
 | 0x14 | trial_state | 0=IDLE, 1=PENDING, 2=ACTIVE, 3=CONFIRMED |
-| 0x21 | ota_state | 0=IDLE, 1=DOWNLOADING (触发 Safe Mode) |
+| 0x21 | ota_state | 0=IDLE, 1=DOWNLOADING (旧值，Boot 已忽略) |
 | 0x10C | crc32 | 上述字段 CRC32 校验 |
 
 ### XATO 镜像头 (256 字节)
@@ -409,18 +400,19 @@ ota-upgrade-of-qi-charger-based-on-can/
 
 | SID | 名称 | Bootloader | APP |
 |-----|------|:----------:|:---:|
-| 0x10 | DiagnosticSessionControl | ✅ | ✅ |
-| 0x11 | ECUReset | ✅ | ✅ |
-| 0x22 | ReadDataByIdentifier | ✅ | ✅ |
-| 0x27 | SecurityAccess (ECDSA P-256) | ✅ | ✅ |
-| 0x2E | WriteDataByIdentifier | ✅ | ✅ |
-| 0x31 | RoutineControl (擦槽) | ✅ | ❌ (NRC 0x11) |
-| 0x34 | RequestDownload | ✅ | ❌ (NRC 0x11) |
-| 0x36 | TransferData | ✅ | ❌ |
-| 0x37 | RequestTransferExit | ✅ | ❌ |
-| 0x3E | TesterPresent | ✅ | ✅ |
+| 0x10 | DiagnosticSessionControl | — | ✅ |
+| 0x11 | ECUReset | — | ✅ |
+| 0x22 | ReadDataByIdentifier | — | ✅ |
+| 0x27 | SecurityAccess (ECDSA P-256) | — | ✅ |
+| 0x2E | WriteDataByIdentifier | — | ✅ |
+| 0x31 | RoutineControl (擦槽) | — | ✅ |
+| 0x34 | RequestDownload | — | ✅ |
+| 0x36 | TransferData | — | ✅ |
+| 0x37 | RequestTransferExit | — | ✅ |
+| 0x3E | TesterPresent | — | ✅ |
 
-> APP 不实现 0x34/0x36/0x37，下载只在 Bootloader Safe Mode 下进行。
+> Bootloader 无 UDS 服务（仅选槽+验签+跳转），所有 UDS 服务均在 APP 侧。
+> 下载（0x31/0x34/0x36/0x37）通过 `ota_download.c` 实现，擦写非活跃槽。
 
 ---
 
@@ -429,9 +421,9 @@ ota-upgrade-of-qi-charger-based-on-can/
 ### 7.1 端到端 OTA 时序
 
 ```
-  CCU (主机)                          Qi 模块 (Bootloader)
+  CCU (主机)                          Qi 模块 (APP)
      │                                      │
-     │  ── 10 02 (Programming Session) ──►  │
+     │  ── 10 02 (Programming Session) ──►  │  APP 运行中处理
      │  ◄── 50 02 ──────────────────────────│
      │                                      │
      │  ── 27 01 (RequestSeed) ──────────►  │
@@ -467,43 +459,29 @@ ota-upgrade-of-qi-charger-based-on-can/
      │         MCU 复位 → Trial Boot        │
 ```
 
-### 7.2 APP 触发 OTA
+### 7.2 APP 直接下载 OTA
 
 ```
-APP 收到 OTA 指令 (CAN / 霍尔 / 内部条件)
+APP 运行中直接处理 UDS 下载（全程在 APP 内完成，不进 Boot）
     │
-    ├─ 写 metadata: ota_state = DOWNLOADING
-    ├─ NVIC_SystemReset()
+    ├─ 10 02 → 27 解锁
+    ├─ 31 01 FF00 擦非活跃槽
+    ├─ 34/36/37 下载镜像到非活跃槽（自动重定位）
+    ├─ commit_trial() 写 metadata: pending_slot + trial_state=PENDING
+    ├─ 11 01 复位
     │
-    └─ Bootloader 检测到 ota_state == DOWNLOADING
-       └─ enter_safe_mode() → 开放 UDS 下载
+    └─ Bootloader: select_boot_slot → 验签(ECDSA+CRC32) → jump
+       └─ 新 APP: ota_trial_poll() 10s 确认 → active
 ```
 
-### 7.3 脚本三种入口模式 (ENTRY_MODE)
+> 旧模式（写 metadata=DOWNLOADING → 复位 → Boot Safe Mode 下载）已废弃。
+> 空片 / 双槽无效时 Boot 挂起(`enter_safe_mode` = `while(1)`)，靠产线 `merge_prod_bin.py` 救砖。
 
-OTA 脚本支持三种启动模式，通过 `ENTRY_MODE` 变量控制：
+### 7.3 OTA 脚本
 
-| 模式 | 脚本 | 行为 |
-|------|------|------|
-| `auto` (默认) | `zcanpro_ext_ota_auto.py` | 探测 0x34（RequestDownload）。若收到 NRC 0x11（ServiceNotSupported），视为当前在 APP → 自动执行 `10 02 → 27 01/03/02 → 11 01` 进入 Boot Safe Mode。若 0x34 直接响应 74，则已在 Boot，跳过切换。 |
-| `app` | `zcanpro_ext_ota_from_app_*.py` | 强制从 APP 进入 Boot：`10 02 → 27 01/03/02 → 11 01 → 等待 Boot Safe Mode` |
-| `boot` | `zcanpro_ext_ota_from_boot_*.py` | 已在 Boot Safe Mode，直接开始下载：`10 02 → 27 01/03/02 → 34/36/37` |
+唯一 OTA 脚本 `zcanpro_ext_ota_auto.py`，在 APP 内完成全部擦写（31/34/36/37），`11 01` 后由 Boot 切槽。固件只编 Slot A（IROM1=0x08004100）；写入 B 槽时脚本自动将镜像重定位到 Slot B 基址并重新签名。
 
-```
-                          ┌─────────────────┐
-                          │ ENTRY_MODE 判断  │
-                          └────────┬────────┘
-                                   │
-                  ┌────────────────┼────────────────┐
-                  │                │                │
-              auto/app            boot            (无)
-                  │                │                │
-          ┌───────▼──────┐  ┌─────▼──────┐   ┌────▼──────┐
-          │ 发 0x34 探测  │  │ 已在 Boot  │   │ 默认 auto │
-          │ NRC 0x11?    │  │ 直接下载   │   │          │
-          │ 是→APP→切Boot│  │            │   │          │
-          └──────────────┘  └────────────┘   └──────────┘
-```
+
 
 ### 7.4 OTA 关键机制
 
@@ -521,7 +499,7 @@ OTA 下载完成后写入 metadata `trial_state = PENDING`，MCU 复位后 Bootl
 
 **镜像验签**
 
-`37 TransferExit` 时 Bootloader 执行 ECDSA P-256 签名验证（64 字节 R‖S P1363 格式）+ CRC32 校验。MCU 侧 ECDSA 验签需数秒，期间回 `7F 37 78`（ResponsePending）。
+APP 在 `37 TransferExit` 后执行 ECDSA P-256 签名验证（64 字节 R‖S P1363 格式）+ CRC32 校验（`ota_download.c` 的 `verify_slot_image`），确认后才写 metadata PENDING。Boot 在 `try_boot_slot` 时再次验签，失败则回滚。
 
 **防回滚**
 
@@ -540,7 +518,7 @@ Bootloader 在 `select_boot_slot()` 时校验 XATO 头中的版本号字段，�
   ├─ boot_metadata_init()           ← 读主区 → 备份 → 默认值
   ├─ detect_boot_reason()           ← 上电/软复位/WDG/OTA/回滚
   │
-  ├─ ota_state == DOWNLOADING? ──是──▶ enter_safe_mode() (不返回)
+  ├─ ota_state=DOWNLOADING 忽略（旧 metadata，下载已在 APP 侧）
   │
   ├─ process_trial_state()          ← PENDING→ACTIVE, 超限回滚
   ├─ select_boot_slot()             ← PENDING/ACTIVE→trial_slot, 否则→active_slot
@@ -551,7 +529,7 @@ Bootloader 在 `select_boot_slot()` 时校验 XATO 头中的版本号字段，�
   │           ├─ 旧槽成功 → 写回滚 metadata → jump
   │           └─ 双槽失败 → enter_safe_mode()
   │
-  └─ enter_safe_mode()              ← Safe Mode: 完整 UDS 下载循环
+  └─ enter_safe_mode()              ← 挂起（空片/双槽无效，靠产线镜像救砖）
 ```
 
 ---
@@ -564,25 +542,18 @@ Bootloader 在 `select_boot_slot()` 时校验 XATO 头中的版本号字段，�
 
 | 脚本 | 功能 | 依赖 |
 |------|------|------|
-| `pack_image_slotA_1_1_1.py` | 裸 bin → XATO 头 .ota.bin (Slot A v1.1.1, CRC32 + ECDSA P-256) | 标准库 |
-| `pack_image_slotB_1_1_2.py` | 裸 bin → XATO 头 .ota.bin (Slot B v1.1.2, CRC32 + ECDSA P-256) | 标准库 |
+| `pack_image_slotA_1_1_1.py` | 裸 bin → XATO 头 .ota.bin (CRC32 + ECDSA P-256) | 标准库 |
 | `merge_prod_bin.py` | Bootloader + Slot A 合并为单文件产线镜像 | 标准库 |
 | `verify_image.py` | 校验 XATO 镜像完整性 + 签名 | 标准库 |
 | `sign_seed.py` | SecurityAccess seed 签名生成 (ECDSA P-256) + CAN 帧输出 | `cryptography` |
 
 ### 9.2 OTA 脚本
 
-位于 `python_tools/` 根目录。根据入口模式和目标 Slot 选择对应脚本：
+位于 `python_tools/` 根目录。唯一 OTA 脚本，在 APP 内完成全部擦写：
 
 | 脚本 | 说明 |
 |------|------|
-| `zcanpro_ext_ota_auto.py` | 一键 OTA (自动探测 APP/Boot 入口) |
-| `zcanpro_ext_ota_from_app_auto.py` | 从 APP 进 Boot → 下载 (自动选 Slot) |
-| `zcanpro_ext_ota_from_app_slotA_1_1_1.py` | 从 APP 进 Boot → 写 Slot A v1.1.1 |
-| `zcanpro_ext_ota_from_app_slotB_1_1_2.py` | 从 APP 进 Boot → 写 Slot B v1.1.2 |
-| `zcanpro_ext_ota_from_boot_auto.py` | 已在 Boot Safe Mode → 下载 (自动选 Slot) |
-| `zcanpro_ext_ota_from_boot_slotA_1_1_1.py` | 已在 Boot → 写 Slot A v1.1.1 |
-| `zcanpro_ext_ota_from_boot_slotB_1_1_2.py` | 已在 Boot → 写 Slot B v1.1.2 |
+| `zcanpro_ext_ota_auto.py` | 一键 OTA（APP 内擦非活跃槽 + 下载 + 重定位 + 重签） |
 
 ### 9.3 Qi 芯片 IAP 脚本
 
@@ -645,13 +616,13 @@ python python_tools/zcanpro_ext_ota_auto.py
 ### 10.2 Bootloader 编译
 
 1. 打开 `qi_wireless_bootloader/mdk_project/qi_wireless.uvprojx`
-2. Target → IROM1: `0x08000000` / `0x7000`
+2. Target → IROM1: `0x08000000` / `0x4000`
 3. Build → 输出 `qi_wireless.bin`
 
 ### 10.3 APP 编译 (Slot A)
 
 1. 打开 `qi_wireless_code_slotA/mdk_project/qi_wireless.uvprojx`
-2. Target → IROM1: `0x08007100` / `0xA700`
+2. Target → IROM1: `0x08004100` / `0xBF00`
 3. Linker → 勾选 "Use Memory Layout from Target Dialog"
 4. Build → 输出 `qi_wireless.bin` (裸 bin，不含 XATO 头)
 
@@ -700,7 +671,7 @@ python merge_prod_bin.py
 
 **Bootloader**
 
-- Safe Mode 全量 UDS 服务: 0x10 (会话控制) / 0x11 (复位) / 0x22 (读DID) / 0x27 (安全访问) / 0x31 (例程控制) / 0x34 (请求下载) / 0x36 (数据传输) / 0x37 (传输退出) / 0x3E (保活)
+- 选槽 + 镜像验签 (ECDSA P-256, uECC 库) + 跳转（无 UDS 服务，Safe Mode = 挂起）
 - ECDSA P-256 签名验签 (uECC 库)
 - Trial Boot 试运行管理 (PENDING → ACTIVE → CONFIRMED, 10s 窗口)
 - Metadata 双备份掉电保护
@@ -709,7 +680,7 @@ python merge_prod_bin.py
 
 **APP 侧**
 
-- UDS 诊断服务 + OTA 触发 (写 DOWNLOADING 标记 → 复位进 Boot)
+- OTA 下载（APP内完成0x31/0x34/0x36/0x37，擦写非活跃槽 → commit metadata PENDING → 复位 → Boot切槽）
 - DID 读写 (版本/SN/配置等)
 - 生命周期 CAN 状态广播
 - Qi 芯片 IAP 支持 (DID 0x2130~0x2133, UART 0xCC 协议)
@@ -718,11 +689,11 @@ python merge_prod_bin.py
 
 **Python 工具链**
 
-- 镜像打包: `pack_image_slotA_1_1_1.py` / `pack_image_slotB_1_1_2.py`
+- 镜像打包: `pack_image_slotA_1_1_1.py`
 - 镜像合并: `merge_prod_bin.py`
 - 镜像校验: `verify_image.py`
 - 签名工具: `sign_seed.py`
-- 一键 OTA: `zcanpro_ext_ota_auto.py` + from_app/from_boot 变体
+- 一键 OTA: `zcanpro_ext_ota_auto.py`
 - Qi IAP: `zcanpro_qi_iap_log1.py` / `log2.py`
 - 功能测试脚本 (版本读取/SN写入/启停充电等)
 - **端到端 MCU OTA 已验证通过**
