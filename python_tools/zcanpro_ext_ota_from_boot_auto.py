@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA (自动识别 A/B 槽，自动探测 APP/Boot)
+ZCANPRO 扩展脚本 — 从 Boot 升级 (自动识别 A/B 槽)
 
-入口 ENTRY_MODE=auto：0x34 NRC 0x11 视为 APP，先 10 02→27→11 01 进 Boot；
-否则视为已在 Boot，直接下载。指定入口请用 from_app / from_boot 副本。
+强制入口 Boot：跳过 APP 的 11 01，直接 10 02 → 27 → 31 → 34/36。
+MCU 必须已在 Boot Safe Mode（空片、下载中、或刚 11 01 进来）。
+若正在跑 APP，请用 from_app 脚本。
 
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
@@ -32,7 +33,7 @@ FIRMWARE_DIR = os.path.join(_TOOLS_DIR, "app bin")
 # 自动识别模式下只认已打包的 bin（app_slot_a.bin / app_slot_b.bin）
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 # auto=探测 APP/Boot；app=必须从 APP 11 01 进 Boot；boot=已在 Safe Mode，直接下载
-ENTRY_MODE = "auto"
+ENTRY_MODE = "boot"
 
 def _scan_firmware():
     """扫描 app bin/ 目录，返回 {SLOT_A: path, SLOT_B: path} 字典。"""

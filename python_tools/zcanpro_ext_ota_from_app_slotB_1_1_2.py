@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA (自动识别 A/B 槽，自动探测 APP/Boot)
+ZCANPRO 扩展脚本 — 从 APP 升级 Slot B
 
-入口 ENTRY_MODE=auto：0x34 NRC 0x11 视为 APP，先 10 02→27→11 01 进 Boot；
-否则视为已在 Boot，直接下载。指定入口请用 from_app / from_boot 副本。
+强制入口 APP：10 02 → 27 → 11 01 进 Boot，再写入 Slot B。
+MCU 必须正在跑 APP（通常是 Slot A）。若已在 Boot，请用 from_boot 脚本。
 
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
 需要: Python 3.8 32 位（ZCANPRO 扩展脚本要求）
-固件: 将 A/B 槽的 bin 放到 app bin/ 目录，脚本自动识别
+固件: app bin/app_slot_b.bin（由 pack_image_slotB_1_1_2.py 生成）
 """
 
 import os
@@ -25,58 +25,14 @@ except ImportError:
     zcanpro = None
 
 # ======== 用户配置 ========
-# 自动识别 A/B 槽：读取固件 Reset Handler 地址，自动选择对应槽。
+# Slot A：Keil Target IROM1 = 0x08007100；Slot B：IROM1 = 0x08011900。不用 scatter。
+# MCU 写入非活跃槽；脚本擦除后读 DID 0x2114，链接地址不符则中止。
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(_TOOLS_DIR)
-FIRMWARE_DIR = os.path.join(_TOOLS_DIR, "app bin")
-# 自动识别模式下只认已打包的 bin（app_slot_a.bin / app_slot_b.bin）
+FIRMWARE_PATH = os.path.join(REPO_ROOT, "qi_wireless_code_slotB", "mdk_project", "Objects", "qi_wireless.bin")
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 # auto=探测 APP/Boot；app=必须从 APP 11 01 进 Boot；boot=已在 Safe Mode，直接下载
-ENTRY_MODE = "auto"
-
-def _scan_firmware():
-    """扫描 app bin/ 目录，返回 {SLOT_A: path, SLOT_B: path} 字典。"""
-    result = {}
-    if not os.path.isdir(FIRMWARE_DIR):
-        raise RuntimeError("找不到固件目录: " + FIRMWARE_DIR)
-    for name in sorted(os.listdir(FIRMWARE_DIR)):
-        if not name.endswith(".bin"):
-            continue
-        path = os.path.join(FIRMWARE_DIR, name)
-        data = open(path, "rb").read()
-        if len(data) < IMAGE_HEADER_SIZE + 8:
-            continue
-        if struct.unpack_from("<I", data, 0)[0] == IMAGE_MAGIC:
-            reset = struct.unpack_from("<I", data, IMAGE_HEADER_SIZE + 4)[0] & 0xFFFFFFFE
-        else:
-            reset = struct.unpack_from("<I", data, 4)[0] & 0xFFFFFFFE
-        a0 = SLOT_A_BASE + IMAGE_HEADER_SIZE
-        a1 = SLOT_A_BASE + SLOT_SIZE
-        b0 = SLOT_B_BASE + IMAGE_HEADER_SIZE
-        b1 = SLOT_B_BASE + SLOT_SIZE
-        if a0 <= reset < a1:
-            _log("扫描: %s → Slot A (Reset=0x%08X)" % (name, reset))
-            result[SLOT_A] = path
-        elif b0 <= reset < b1:
-            _log("扫描: %s → Slot B (Reset=0x%08X)" % (name, reset))
-            result[SLOT_B] = path
-    return result
-
-
-def _auto_select_firmware(bus_id):
-    """读 MCU 当前活跃槽(DID 0x2113)，选对面槽的 bin。"""
-    slots = _scan_firmware()
-    if not slots:
-        raise RuntimeError("app bin/ 中没有匹配 Slot A/B 的固件")
-    active = read_did_u8(bus_id, 0x2113)
-    _log("MCU 当前活跃槽: Slot %s" % slot_name(active))
-    target = SLOT_B if active == SLOT_A else SLOT_A
-    if target not in slots:
-        raise RuntimeError("app bin/ 中缺少 Slot %s 的固件" % slot_name(target))
-    _log("自动选择: %s → 升级 Slot %s" % (os.path.basename(slots[target]), slot_name(target)))
-    return slots[target]
-
-FIRMWARE_PATH = ""
+ENTRY_MODE = "app"
 DOWNLOAD_ADDR = 0x08007000
 TRANSFER_BLOCK_DATA = 128
 
@@ -363,7 +319,7 @@ def validate_image(image):
     return linked
 
 
-def pack_image_if_needed(fw_path, priv, version="1.0.0"):
+def pack_image_if_needed(fw_path, priv, version="1.1.2"):
     data = open(fw_path, "rb").read()
     if len(data) >= IMAGE_HEADER_SIZE and struct.unpack_from("<I", data, 0)[0] == IMAGE_MAGIC:
         _log("固件已带 XATO 头, 总长 %d" % len(data))
@@ -487,7 +443,7 @@ def send_security_key(bus_id, sig):
         except UdsNrcError as e:
             if (e.nrc in (0x24, 0x13)) and (i > 0):
                 rx = uds_try(bus_id, SID_SA, [0x01])
-                if rx is not None and len(rx) >= 6 and list(rx[2:6]) == [0, 0, 0, 0]:
+                if rx is not None and len(rx) >= 34 and list(rx[2:34]) == [0] * 32:
                     _log("27 02 无应答后已解锁，继续")
                     return rx
             raise
@@ -496,8 +452,8 @@ def send_security_key(bus_id, sig):
             _log("27 02 第 %d/5 次: %s" % (i + 1, e))
             time.sleep(0.5)
             rx = uds_try(bus_id, SID_SA, [0x01])
-            if rx is not None and len(rx) >= 6 and list(rx[2:6]) == [0, 0, 0, 0]:
-                _log("27 01 seed=0，已解锁")
+            if rx is not None and len(rx) >= 34 and list(rx[2:34]) == [0] * 32:
+                _log("27 01 seed=0(32B)，已解锁")
                 return rx
     raise last
 
@@ -575,10 +531,8 @@ def enter_boot_from_app(bus_id, priv):
 
 
 def run_ota(bus_id):
-    global FIRMWARE_PATH
     if not (1 <= TRANSFER_BLOCK_DATA <= MAX_TD_DATA):
         raise RuntimeError("TRANSFER_BLOCK_DATA 须为 1..%d" % MAX_TD_DATA)
-    FIRMWARE_PATH = _auto_select_firmware(bus_id)
     if not os.path.isfile(FIRMWARE_PATH):
         raise RuntimeError("找不到固件: " + FIRMWARE_PATH)
     if not os.path.isfile(PRIVATE_KEY_PATH):
@@ -615,13 +569,13 @@ def run_ota(bus_id):
             raise last_err
         _log("---- SecurityAccess ----")
         rx = uds_req(bus_id, SID_SA, [0x01])
-        if len(rx) < 6:
+        if len(rx) < 34:
             raise RuntimeError("seed 响应过短")
-        seed = _to_bytes(rx[2:6])
-        if seed == b"\x00\x00\x00\x00":
-            _log("已解锁 (ISO 14229 seed=0)，跳过 SendKey")
+        seed = _to_bytes(rx[2:34])
+        if seed == b"\x00" * 32:
+            _log("已解锁 (ISO 14229 seed=0, 32B)，跳过 SendKey")
         else:
-            _log("seed " + _hex(rx[2:6]))
+            _log("seed " + _hex(rx[2:34]))
             sig = ecdsa_sign_msg(priv, seed)
             _log("SendKey 签名 %d 字节（27 03 分片 + 27 02 验签）" % len(sig))
             send_security_key(bus_id, sig)
@@ -690,7 +644,7 @@ def run_ota(bus_id):
 def z_main():
     global stopTask
     stopTask = False
-    _log("======== Qi CAN-UDS OTA auto (入口=%s) ========" % ENTRY_MODE)
+    _log("======== Qi CAN-UDS OTA Slot B (入口=%s) ========" % ENTRY_MODE)
     _log("固件 " + FIRMWARE_PATH)
     buses = zcanpro.get_buses()
     _log("总线 " + str(buses))

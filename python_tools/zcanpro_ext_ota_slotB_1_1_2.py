@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA (Slot B)
+ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA (Slot B，自动探测 APP/Boot)
+
+入口 ENTRY_MODE=auto：0x34 NRC 0x11 视为 APP，先 10 02→27→11 01 进 Boot；
+否则视为已在 Boot，直接下载。指定入口请用 from_app / from_boot 副本。
 
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
@@ -28,7 +31,8 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(_TOOLS_DIR)
 FIRMWARE_PATH = os.path.join(REPO_ROOT, "qi_wireless_code_slotB", "mdk_project", "Objects", "qi_wireless.bin")
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
-RESET_APP_TO_BOOT = True
+# auto=探测 APP/Boot；app=必须从 APP 11 01 进 Boot；boot=已在 Safe Mode，直接下载
+ENTRY_MODE = "auto"
 DOWNLOAD_ADDR = 0x08007000
 TRANSFER_BLOCK_DATA = 128
 
@@ -490,6 +494,42 @@ def confirm_app_after_reset(bus_id):
     raise RuntimeError("复位后 0x34 未回 NRC 0x11，仍在 Bootloader")
 
 
+def probe_in_app(bus_id):
+    """APP 对 0x34 回 NRC 0x11；Boot 为 0x22/0x24/0x33 等。"""
+    try:
+        uds_req(bus_id, SID_RD, [0x00])
+        _log("探测 0x34 正响应，视为已在 Boot")
+        return False
+    except UdsNrcError as e:
+        if e.nrc == NRC_SNS:
+            _log("探测 0x34 NRC 0x11，当前在 APP")
+            return True
+        _log("探测 0x34 NRC 0x%02X，视为已在 Boot" % e.nrc)
+        return False
+
+
+def enter_boot_from_app(bus_id, priv):
+    _log("---- APP 进 Boot (10 02 → 27 → 11 01) ----")
+    try:
+        uds_req(bus_id, SID_DSC, [0x02])
+        rx = uds_req(bus_id, SID_SA, [0x01])
+        if len(rx) >= 34:
+            seed = _to_bytes(rx[2:34])
+            if seed == b"\x00" * 32:
+                _log("APP 已解锁 (seed=0)")
+            else:
+                send_security_key(bus_id, ecdsa_sign_msg(priv, seed))
+    except Exception as e:
+        _log("APP 10 02/27 失败，仍尝试 11 01: " + str(e))
+    time.sleep(0.05)
+    uds_ecu_reset(bus_id)
+    t0 = time.time()
+    while time.time() - t0 < 1.0:
+        if stopTask:
+            raise RuntimeError("用户停止脚本")
+        time.sleep(0.05)
+
+
 def run_ota(bus_id):
     if not (1 <= TRANSFER_BLOCK_DATA <= MAX_TD_DATA):
         raise RuntimeError("TRANSFER_BLOCK_DATA 须为 1..%d" % MAX_TD_DATA)
@@ -503,26 +543,16 @@ def run_ota(bus_id):
     linked = validate_image(image)
     uds_init()
     try:
-        if RESET_APP_TO_BOOT:
-            _log("---- APP 进 Boot (10 02 → 27 → 11 01) ----")
-            try:
-                uds_req(bus_id, SID_DSC, [0x02])
-                rx = uds_req(bus_id, SID_SA, [0x01])
-                if len(rx) >= 34:
-                    seed = _to_bytes(rx[2:34])
-                    if seed == b"\x00" * 32:
-                        _log("APP 已解锁 (seed=0)")
-                    else:
-                        send_security_key(bus_id, ecdsa_sign_msg(priv, seed))
-            except Exception as e:
-                _log("APP 10 02/27 失败，仍尝试 11 01: " + str(e))
-            time.sleep(0.05)
-            uds_ecu_reset(bus_id)
-            t0 = time.time()
-            while time.time() - t0 < 1.0:
-                if stopTask:
-                    raise RuntimeError("用户停止脚本")
-                time.sleep(0.05)
+        mode = ENTRY_MODE
+        if mode == "app":
+            enter_boot_from_app(bus_id, priv)
+        elif mode == "boot":
+            _log("入口=Boot，跳过 APP 11 01，直接下载")
+        else:
+            if probe_in_app(bus_id):
+                enter_boot_from_app(bus_id, priv)
+            else:
+                _log("入口=Boot（自动探测），直接下载")
         _log("---- Programming ----")
         last_err = None
         for attempt in range(1, 9):
@@ -614,7 +644,7 @@ def run_ota(bus_id):
 def z_main():
     global stopTask
     stopTask = False
-    _log("======== Qi CAN-UDS OTA (v1.1.2) ========")
+    _log("======== Qi CAN-UDS OTA Slot B (入口=%s) ========" % ENTRY_MODE)
     _log("固件 " + FIRMWARE_PATH)
     buses = zcanpro.get_buses()
     _log("总线 " + str(buses))
