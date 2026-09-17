@@ -85,6 +85,7 @@ UDS_REQ_ID = 0x18DA0D03
 UDS_RESP_ID = 0x18DA030D
 SID_DSC, SID_ER, SID_RDBI, SID_SA = 0x10, 0x11, 0x22, 0x27
 SID_WDBI, SID_RC, SID_RD, SID_TD, SID_RTE = 0x2E, 0x31, 0x34, 0x36, 0x37
+SID_TP = 0x3E
 SID_NRC, SID_PR = 0x7F, 0x40
 NRC_RCRRP = 0x78
 SA_SIG_CHUNK = 4  # 27 03 单帧：SID+03+seq+4B = 7，避开 ISO-TP 多帧
@@ -574,20 +575,36 @@ def confirm_app_after_reset(bus_id):
         raise RuntimeError("复位后无 UDS 应答，仍在 Bootloader: " + str(e))
 
 
-def probe_in_app(bus_id):
+def wake_bus(bus_id):
+    """SIT1145 空闲 180s 进 Standby：首帧只当 WUP，MCU 收不到，
+    靠主机无 ACK 重发才能被唤醒后的 MCU 接收。
+    探测无应答时先发几帧 TesterPresent(suppress) 打破静默。"""
+    for _ in range(3):
+        uds_try(bus_id, SID_TP, [0x80], suppress=1)
+        time.sleep(0.2)
+
+
+def probe_in_app(bus_id, retries=3):
     """Boot 无 UDS，不应答任何请求；APP 实现 0x34 但需 Programming 会话，
     默认会话下回 NRC 0x22（conditionsNotCorrect）。
-    故：任一 NRC = 在 APP；无应答 = 不在 APP（Boot 或空片）。"""
-    try:
-        uds_req(bus_id, SID_RD, [0x00])
-        _log("探测 0x34 正响应，当前在 APP")
-        return True
-    except UdsNrcError as e:
-        _log("探测 0x34 NRC 0x%02X，当前在 APP" % e.nrc)
-        return True
-    except RuntimeError as e:
-        _log("探测 0x34 无应答，不在 APP: " + str(e))
-        return False
+    故：任一 NRC = 在 APP；无应答 = 不在 APP（Boot 或空片）。
+    Standby 唤醒需时间，无应答时发唤醒帧后重试。"""
+    for attempt in range(1, retries + 1):
+        try:
+            uds_req(bus_id, SID_RD, [0x00])
+            _log("探测 0x34 正响应，当前在 APP")
+            return True
+        except UdsNrcError as e:
+            _log("探测 0x34 NRC 0x%02X，当前在 APP" % e.nrc)
+            return True
+        except RuntimeError as e:
+            if attempt < retries:
+                _log("探测 0x34 无应答（第 %d/%d 次），发唤醒帧重试: %s"
+                     % (attempt, retries, e))
+                wake_bus(bus_id)
+            else:
+                _log("探测 0x34 无应答，不在 APP: " + str(e))
+    return False
 
 
 def run_ota(bus_id):
@@ -604,7 +621,9 @@ def run_ota(bus_id):
         image = pack_image_if_needed(FIRMWARE_PATH, priv)
         linked = validate_image(image)
         if not probe_in_app(bus_id):
-            raise RuntimeError("当前不在 APP。空片请 merge_prod_bin.py 烧录后再升级")
+            raise RuntimeError("当前不在 APP。可能原因：1) 设备低功耗 Standby（空闲 180s 自动进入，"
+                               "已自动发唤醒帧重试仍无应答）→ 断电重启后立即重试；"
+                               "2) 空片/双槽无效 → merge_prod_bin.py 烧录后再升级")
         _log("镜像链接 Slot %s；将写入非活跃槽（必要时重定位）" % slot_name(linked))
         _log("在 APP 内升级（31/34/36/37），完成后 11 01 由 Boot 切槽")
         _log("---- Programming ----")
