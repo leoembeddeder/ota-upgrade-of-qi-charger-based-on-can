@@ -592,6 +592,105 @@ def _listen_lifecycle(bus_id, listen_s=1.0):
     return found
 
 
+ERASE_REQ = [0x01, 0xFF, 0x00]
+ERASE_WAIT_PENDING_S = 90
+ERASE_ENHANCED_CFG_S = 120  # _uds_init_cfg() enhanced_timeout_ms=120000（配置值）
+
+
+def _sniff_erase_late_response(bus_id, sniff_s=3.0):
+    """0x31 擦除 uds_request 失败后的原始通道取证。
+
+    本机 ZCANPRO 库内部消化 0x78（脚本在 uds_request 路径下看不到泵帧），
+    且实测失败耗时 55s 既不等于配置的 enhanced_timeout 120s 也不等于
+    response_timeout 3s，库内部另有 RCRRP/无响应预算，语义不可从 WSL 取证。
+    失败后释放 UDS 通道 raw 收帧，抓迟到的最终响应：
+      ("positive", 0)  → MCU 擦除实际完成，0x71 迟到被库放弃
+      ("nrc", code)    → MCU 回了最终 NRC（设备存活，固件拒绝）
+      None             → 全静默（MCU 挂死或 CAN TX 黑洞）
+    顺带统计嗅探窗口内的 7F 31 78 泵帧数，日志可区分「MCU 一直在泵 78
+    但库提前放弃」与「MCU 一个帧都没发出」。finally 恢复 UDS 通道。"""
+    pend = 0
+    result = None
+    try:
+        zcanpro.uds_deinit()
+    except Exception as e:
+        _log("UDS 通道释放失败（继续嗅探）: " + str(e))
+    try:
+        t_end = time.time() + float(sniff_s)
+        while time.time() < t_end:
+            if stopTask:
+                raise RuntimeError("用户停止脚本")
+            for cid, dat in _recv_frames(bus_id):
+                if (cid != UDS_RESP_ID) or (len(dat) < 2):
+                    continue
+                if dat[0] == SID_NRC and len(dat) >= 4 and dat[2] == SID_RC:
+                    if dat[3] == NRC_RCRRP:
+                        pend += 1
+                        continue
+                    _log("原始通道捕获擦除最终 NRC: " + _hex(dat[:4]))
+                    result = ("nrc", dat[3])
+                elif dat[0] == 0x71 and len(dat) >= 3 and dat[1] == 0x01:
+                    _log("原始通道捕获擦除迟到正响应: " + _hex(dat[:8]))
+                    result = ("positive", 0)
+            time.sleep(0.02)
+    finally:
+        uds_init()
+    _log("擦除失败取证：嗅探 %.1fs，捕获 0x78 泵帧 %d 个，最终响应 %s"
+         % (sniff_s, pend, ("有" if result else "无")))
+    return result
+
+
+def _erase_with_retry(bus_id):
+    """0x31 擦除带韧性：失败后取证 + 自动重试一次 + 耗时定性报错。
+
+    固件侧擦除幂等且有活跃槽防护（g_base==ota_running_slot_base() 回 NRC 22），
+    重试安全：MCU 若只是慢/瞬时 bus-off，二次 31 01 FF 00 可直接成功；
+    MCU 若已实际擦完（0x71 迟到被库放弃），取证命中正响应则跳过重试续跑。"""
+    t0 = time.time()
+    try:
+        uds_req(bus_id, SID_RC, ERASE_REQ, wait_pending_s=ERASE_WAIT_PENDING_S)
+        return
+    except UdsNrcError as e:
+        _log("0x31 擦除耗时 %.1fs，MCU 回 NRC 0x%02X（设备存活，固件拒绝，重试无意义）"
+             % (time.time() - t0, e.nrc))
+        raise
+    except RuntimeError as e:
+        elapsed = time.time() - t0
+        _log("0x31 擦除第 1 次失败：耗时 %.1fs「%s」（wait_pending 上限 %ds，"
+             "库 enhanced_timeout 配置 %ds；0x78 被库内部消化，脚本侧全程不可见）"
+             % (elapsed, e, ERASE_WAIT_PENDING_S, ERASE_ENHANCED_CFG_S))
+        sniff = _sniff_erase_late_response(bus_id)
+        if sniff and sniff[0] == "positive":
+            _log("MCU 擦除实际已完成（0x71 迟到被库放弃），跳过重试直接续跑")
+            return
+        if sniff and sniff[0] == "nrc":
+            raise RuntimeError("0x31 擦除被 MCU 拒绝：NRC 0x%02X（第 1 次耗时 %.1fs，"
+                               "原始通道捕获最终 NRC，设备存活）"
+                               % (sniff[1], elapsed))
+        _log("原始通道无最终响应，自动重试一次 31 01 FF 00（固件擦除幂等+活跃槽防护，安全）")
+        t1 = time.time()
+        try:
+            uds_req(bus_id, SID_RC, ERASE_REQ, wait_pending_s=ERASE_WAIT_PENDING_S)
+            _log("0x31 擦除第 2 次成功（耗时 %.1fs）" % (time.time() - t1))
+            return
+        except Exception as e2:
+            elapsed2 = time.time() - t1
+            total = time.time() - t0
+            probe = uds_try(bus_id, SID_RDBI, [0x21, 0x13])
+            if probe:
+                alive = "应答正常（%s），设备存活" % _hex(probe[:8])
+            else:
+                alive = "无应答（MCU 疑似挂死或 CAN TX 黑洞）"
+            raise RuntimeError(
+                "0x31 擦除两次失败：第1次 %.1fs「%s」，第2次 %.1fs「%s」，总计 %.1fs；"
+                "wait_pending 上限 %ds，库 enhanced_timeout 配置 %ds"
+                "（库内部消化 0x78 且另有上限，实测 55s 量级）。失败后 22 2113 探测：%s。"
+                "两次耗时都贴近库内部上限→MCU 擦除慢于库预算；"
+                "第2次远小于上限且探测无应答→MCU 擦除路径挂死/TX 黑洞，需固件修复后重编译烧录。"
+                % (elapsed, e, elapsed2, e2, total,
+                   ERASE_WAIT_PENDING_S, ERASE_ENHANCED_CFG_S, alive))
+
+
 def confirm_app_after_reset(bus_id):
     """复位后等待 APP 起来。Boot 验签 ECDSA 需数秒，回退路径更久。
 
@@ -877,7 +976,7 @@ def run_ota(bus_id):
         _log("---- DID 0x2010 APP ----")
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
         _log("---- 擦除 ----")
-        uds_req(bus_id, SID_RC, [0x01, 0xFF, 0x00], wait_pending_s=90)
+        _erase_with_retry(bus_id)
         dest = read_did_u8(bus_id, 0x2114)
         _log("擦除目标 Slot %s (DID 0x2114=%d)" % (slot_name(dest), dest))
         if dest not in (SLOT_A, SLOT_B):

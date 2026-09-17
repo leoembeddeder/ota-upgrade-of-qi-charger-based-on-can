@@ -347,6 +347,10 @@ void ota_dl_handle_erase(uint8_t *data, uint16_t len)
     can_proto_pump_long_op();
   }
 
+  /* 循环结束后先泵一帧 0x78 再进 metadata 双副本擦写：尾部这段没有任何
+   * 帧发出，若恰逢 bus-off 恢复或擦写偏慢，主机易在此判超时。 */
+  can_proto_pump_long_op();
+
   if (ota_metadata_read(&meta) == 0)
   {
     if (g_slot == OTA_SLOT_A)

@@ -435,7 +435,10 @@ static void proto_can_busoff_recover(void)
   uint32_t start;
   uint8_t n;
 
-  for (n = 0U; n < 3U; n++)
+  /* 250kbps 下 bus-off 恢复需 128×11 个隐性位（≈5.6ms 总线时间）；
+   * 单 Bank Flash 擦除 stall 后控制器状态复位更慢，原 3×10ms 窗口
+   * 系统性不足，导致每次都掉进下面的兜底分支。5×20ms 覆盖最坏情况。 */
+  for (n = 0U; n < 5U; n++)
   {
     if (can_busoff_get(CAN1) == RESET)
     {
@@ -443,7 +446,7 @@ static void proto_can_busoff_recover(void)
     }
     can_busoff_reset(CAN1);
     start = timer_get_tick();
-    while ((timer_get_tick() - start) < 10U)
+    while ((timer_get_tick() - start) < 20U)
     {
       if (can_busoff_get(CAN1) == RESET)
       {
@@ -451,7 +454,15 @@ static void proto_can_busoff_recover(void)
       }
     }
   }
-  can_driver_init();
+  /* 恢复失败时禁止走 can_driver_init()：那是上电初始化路径，会清掉
+   * rx_callback/busoff_recovery_cb 并把 CAN 停在 software reset 等待
+   * can_driver_online()——0x31 擦槽循环中一旦触发，本函数后续泵出的
+   * 0x78 与尾部 0x71 正响应全部黑洞；返回主循环后 RX 回调已丢，
+   * 设备 UDS 永久失聪，只有断电才能恢复（06:52 擦除 55s 全静默根因）。
+   * offline→online 只复位 CAN 外设+清 pending+重挂 RX/ERR 中断，
+   * rx_callback/busoff_recovery_cb 保持不变，长操作路径可自愈。 */
+  can_driver_offline();
+  can_driver_online();
 }
 
 /**
