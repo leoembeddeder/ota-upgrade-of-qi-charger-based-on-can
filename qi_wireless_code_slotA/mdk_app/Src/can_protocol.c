@@ -1977,12 +1977,25 @@ void can_protocol_poll(void)
     return;
   }
 
+  /* Flash erase (trial confirm / NVM) stalls this single-bank MCU; CAN error
+   * IRQ is missed and the controller sits in bus-off while g_can_awake=1.
+   * Host then sees 0x34 timeout and no 57 4B ident (we never re-enter Normal). */
+  if (can_busoff_get(CAN1) != RESET)
+  {
+    proto_can_busoff_recover();
+    (void)sit1145_normal_mode_set();
+  }
+
   isotp_poll();
 
   if ((now - sit_last) >= 500U)
   {
     sit_last = now;
     (void)sit1145_normal_mode_set();
+    if (can_busoff_get(CAN1) != RESET)
+    {
+      proto_can_busoff_recover();
+    }
   }
 
 #if (CAN_LP_IDLE_TIMEOUT_MS > 0U)

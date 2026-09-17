@@ -25,6 +25,8 @@
 
 /* includes ------------------------------------------------------------------*/
 #include "ota_trigger.h"
+#include "at32f422_426_can.h"
+#include "sit1145.h"
 #include "timer_drv.h"
 #include "at32f422_426_conf.h"
 #include <string.h>
@@ -294,7 +296,18 @@ static int8_t ota_confirm_trial(void)
   meta.trial_retry_count = 0;
   meta.ota_state    = OTA_STATE_IDLE;
 
-  return ota_metadata_save(&meta);
+  if (ota_metadata_save(&meta) != 0)
+  {
+    return -1;
+  }
+  /* Same-bank Flash erase stalls CAN; error IRQ is lost. Kick bus-off so
+   * a second OTA without power cycle can still talk. */
+  if (can_busoff_get(CAN1) != RESET)
+  {
+    can_busoff_reset(CAN1);
+  }
+  (void)sit1145_normal_mode_set();
+  return 0;
 }
 
 void ota_trial_init(void)

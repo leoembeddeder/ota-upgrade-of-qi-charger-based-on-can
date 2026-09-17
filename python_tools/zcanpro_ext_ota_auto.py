@@ -684,25 +684,26 @@ def wake_bus(bus_id, listen_s=2.0):
 
 
 def probe_in_app(bus_id, retries=PROBE_ROUNDS):
-    """Boot 无 UDS，不应答任何请求；APP 实现全部 UDS（含 0x34）。
-    故：有应答（正响应或任意 NRC）= 在 APP；
-    无应答 ≠ 不在 APP——必须先排除 SIT1145 Standby（空闲 180s 进入，
-    首帧被当 WUP 消耗），wake_bus 确认唤醒后再重试，最多 retries 轮。"""
+    """Boot 无 UDS。APP 在线则 22 2113 有应答（正响应或 NRC）。
+
+    不要用 0x34 探测：APP 已实现下载，默认会话回 0x22；且 Standby 下首帧
+    只当 WUP，3s 超时后 ident 早已发出，再去听 0x18FF260D 会漏。
+    无应答时连发 3E 80 再立刻重试 2113（MCU 此时应已 Normal）。"""
     for attempt in range(1, retries + 1):
         try:
-            uds_req(bus_id, SID_RD, [0x00])
-            _log("探测 0x34 正响应，当前在 APP")
+            rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
+            _log("探测 22 2113 成功 slot=%s，当前在 APP" % _hex((rx or [])[3:4]))
             return True
-        except UdsNrcError as e:  # NRC 异常继承 RuntimeError，必须先于其捕获
-            _log("探测 0x34 NRC 0x%02X，当前在 APP（APP 应答的任意 NRC 均算）" % e.nrc)
+        except UdsNrcError as e:
+            _log("探测 22 2113 NRC 0x%02X，当前在 APP" % e.nrc)
             return True
         except RuntimeError as e:
-            _log("探测 0x34 无应答（第 %d/%d 轮）: %s" % (attempt, retries, e))
+            _log("探测 22 2113 无应答（第 %d/%d 轮）: %s" % (attempt, retries, e))
             if attempt < retries:
-                if wake_bus(bus_id):
-                    _log("唤醒标识帧确认收敛，重试探测")
-                else:
-                    _log("未见唤醒标识帧，仍重试探测")
+                for _ in range(3):
+                    uds_try(bus_id, SID_TP, [0x80], suppress=1)
+                    time.sleep(0.15)
+                time.sleep(0.4)
     return False
 
 
@@ -720,9 +721,10 @@ def run_ota(bus_id):
         image = pack_image_if_needed(FIRMWARE_PATH, priv)
         linked = validate_image(image)
         if not probe_in_app(bus_id):
-            raise RuntimeError("唤醒帧已重试 %d 轮仍无应答，判定不在 APP。排查："
-                               "1) 断电重启后立即重试（Standby 唤醒可能未收敛）；"
-                               "2) 空片/双槽无效 → merge_prod_bin.py 烧录后再升级" % PROBE_ROUNDS)
+            raise RuntimeError("UDS 无应答（已重试 %d 轮）。"
+                               "跳转后试运行确认会擦 metadata，CAN 可能 bus-off；"
+                               "请烧录含 bus-off 恢复的 APP 后再连升。"
+                               "空片用 merge_prod_bin.py。" % PROBE_ROUNDS)
         _log("镜像链接 Slot %s；将写入非活跃槽（必要时重定位）" % slot_name(linked))
         _log("在 APP 内升级（31/34/36/37），完成后 11 01 由 Boot 切槽")
         _log("---- Programming ----")
