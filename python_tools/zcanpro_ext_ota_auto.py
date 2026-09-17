@@ -518,20 +518,28 @@ def read_did_u8(bus_id, did):
     return rx[3]
 
 
-def send_security_key(bus_id, sig):
-    """Send 64-byte P1363 signature.
-
-    Prefer 27 02 + 64B in one ISO-TP message (APP copies data[2..65]).
-    Some builds reject 27 03 with NRC 0x12; 27 03 is only a fallback.
-    """
+def send_security_key(bus_id, sig, seed=None, priv=None):
+    """27 02 + 64-byte key. On 0x24 re-request seed and retry once.
+    27 03 only if 27 02 returns 0x12/0x13 (old APP without one-shot key)."""
     sig = _to_bytes(sig)
     if len(sig) != 64:
         raise RuntimeError("ECDSA 签名须 64 字节, 实际 %d" % len(sig))
+    time.sleep(0.08)
     try:
         _log("SendKey 27 02 + 64 字节")
         return uds_req(bus_id, SID_SA, [0x02] + _to_list(sig), wait_pending_s=45)
     except UdsNrcError as e:
-        if e.nrc not in (0x12, 0x13, 0x24):
+        if e.nrc == 0x24 and seed is not None and priv is not None:
+            _log("27 02 NRC 0x24，重新 27 01 再送 27 02")
+            time.sleep(0.1)
+            rx = uds_req(bus_id, SID_SA, [0x01])
+            if len(rx) >= 34:
+                seed2 = _to_bytes(rx[2:34])
+                if seed2 != b"\x00" * 32:
+                    sig = ecdsa_sign_msg(priv, seed2)
+            time.sleep(0.08)
+            return uds_req(bus_id, SID_SA, [0x02] + _to_list(sig), wait_pending_s=45)
+        if e.nrc not in (0x12, 0x13):
             raise
         _log("27 02 整包 NRC 0x%02X，改 27 03 分片" % e.nrc)
     seq = 1
@@ -543,28 +551,7 @@ def send_security_key(bus_id, sig):
         seq += 1
     _log("27 03 已送 64 字节 / %d 帧" % (seq - 1))
     time.sleep(0.15)
-    last = None
-    for i in range(5):
-        if stopTask:
-            raise RuntimeError("用户停止脚本")
-        try:
-            return uds_req(bus_id, SID_SA, [0x02], wait_pending_s=45)
-        except UdsNrcError as e:
-            if (e.nrc in (0x24, 0x13)) and (i > 0):
-                rx = uds_try(bus_id, SID_SA, [0x01])
-                if rx is not None and len(rx) >= 6 and list(rx[2:6]) == [0, 0, 0, 0]:
-                    _log("27 02 无应答后已解锁，继续")
-                    return rx
-            raise
-        except Exception as e:
-            last = e
-            _log("27 02 第 %d/5 次: %s" % (i + 1, e))
-            time.sleep(0.5)
-            rx = uds_try(bus_id, SID_SA, [0x01])
-            if rx is not None and len(rx) >= 6 and list(rx[2:6]) == [0, 0, 0, 0]:
-                _log("27 01 seed=0，已解锁")
-                return rx
-    raise last
+    return uds_req(bus_id, SID_SA, [0x02], wait_pending_s=45)
 
 
 def confirm_app_after_reset(bus_id):
@@ -793,7 +780,7 @@ def run_ota(bus_id):
             _log("seed " + _hex(rx[2:34]))
             sig = ecdsa_sign_msg(priv, seed)
             _log("SendKey 签名 %d 字节" % len(sig))
-            send_security_key(bus_id, sig)
+            send_security_key(bus_id, sig, seed=seed, priv=priv)
         _log("---- DID 0x2010 APP ----")
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
         _log("---- 擦除 ----")

@@ -529,6 +529,7 @@ static void session_reset_to_default(void)
   current_session   = SESSION_DEFAULT;
   security_unlocked = 0;
   g_seed_generated  = 0;
+  g_seed_sub        = 0;
   g_tx_pend_len     = 0U;
   ota_dl_abort();
 }
@@ -1390,12 +1391,13 @@ static void handle_security_access(uint8_t *data, uint16_t len)
   {
     uint8_t hash[32];
 
-    if (!g_seed_generated || (g_seed_sub != 0x01U))
+    if (!g_seed_generated)
     {
       proto_send_nrc(UDS_SID_SECURITY_ACCESS, UDS_NRC_REQUEST_SEQUENCE_ERROR);
       return;
     }
-    /* 0x03 already filled the buffer: ignore padded 27 02 (ZCANPRO fill 0xCC). */
+    /* 27 02 + 64B key in one ISO-TP message, or 27 03 chunks already in buf.
+     * Do not clear seed on short 27 02 — host may retry 27 03 / 27 02. */
     if ((g_sa_sig_bytes_received != 64U) && (len >= 66U))
     {
       uint16_t k;
@@ -1407,7 +1409,6 @@ static void handle_security_access(uint8_t *data, uint16_t len)
     }
     if (g_sa_sig_bytes_received != 64U)
     {
-      g_seed_generated = 0;
       proto_send_nrc(UDS_SID_SECURITY_ACCESS, UDS_NRC_INCORRECT_MESSAGE_LENGTH);
       return;
     }
