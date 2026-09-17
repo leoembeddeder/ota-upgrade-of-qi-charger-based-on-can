@@ -189,7 +189,7 @@ python merge_prod_bin.py
 
 | 组件 | 版本号 | 版本字符串位置 |
 |------|--------|----------------|
-| APP 固件 | **QC_JYF_FW_1.1.3** | `can_protocol.c` → `SW_VERSION_STR` |
+| APP 固件 | **QC_JYF_FW_1.1.1** | `can_protocol.c` → `SW_VERSION_STR` |
 | Bootloader | QC_JYF_BL_1.0.0 | `can_protocol.c` → `BOOTLOADER_VER_STR` |
 | 硬件版本 | QC_JYF_HW_1.1.5 | `can_protocol.c` → `HW_VERSION_STR` |
 
@@ -199,7 +199,8 @@ python merge_prod_bin.py
 
 | 日期 | 变更内容 |
 |------|----------|
-| 2026-09-17 | 删除冗余 `qi_wireless_code_slotB/` 源码工程（固件位置无关，一份 bin 可跑 A/B 槽），版本号统一为 QC_JYF_FW_1.1.3；仓库治理：新增 `.gitattributes` 换行符规范化、移除误跟踪构建产物 |
+| 2026-09-17 | 删除冗余 `qi_wireless_code_slotB/` 源码工程（固件位置无关，一份 bin 可跑 A/B 槽）；仓库治理：新增 `.gitattributes` 换行符规范化、移除误跟踪构建产物 |
+| 2026-09-17 | APP 版本号回正为 QC_JYF_FW_1.1.1（与打包脚本 `IMAGE_VERSION` 一致） |
 | 2026-09-17 | 全部文档对齐 OTA 架构反转（Boot 16KB / Slot 48KB / 地址上移） |
 | 2026-09-16 | **OTA 架构反转**：下载迁入 APP（0x31/0x34/0x36/0x37 在 APP 内擦写非活跃槽），Boot 16KB 只负责选槽 + 验签 + 跳转；镜像写入前按目标槽自动重定位并重签 |
 | 2026-09-16 | 脚本收敛：只留 Slot A 打包 + 单一 OTA 脚本 `zcanpro_ext_ota_auto.py`，删除 from_boot / 指定槽副本 |
