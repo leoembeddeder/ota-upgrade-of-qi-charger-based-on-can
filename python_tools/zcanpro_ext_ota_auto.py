@@ -112,9 +112,6 @@ _GX = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
 _GY = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
 
 stopTask = False
-# 原始帧发送模式缓存（transmit/send × list/dict），首次命中后固定，
-# 避免每次4种组合都试一遍。见 _can_send_raw。
-_raw_tx_mode = None
 
 
 class UdsNrcError(RuntimeError):
@@ -445,7 +442,7 @@ def _uds_init_cfg():
         "frame_type": 1,
         "trans_stmin_valid": 1,
         "trans_stmin": 1,
-        "enhanced_timeout_ms": 30000,
+        "enhanced_timeout_ms": 120000,
     }
 
 
@@ -459,10 +456,8 @@ def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
 
     注意（实测定性）：本机 ZCANPRO 库内部消化 NRC 0x78（不把 7F xx 78 当返回
     数据抛给脚本），并把 enhanced_timeout_ms 当绝对上限计时。因此下面
-    wait_pending_s>0 的 0x78 重试分支在本库上是死代码——长操作一律在
-    enhanced_timeout_ms 整点被掐断。仅当换用会把 7F xx 78 当 data 返回、
-    且每收 78 刷新计时的库时，该分支才生效。长耗时请求（如 0x31 擦除）请走
-    uds_req_raw_longop（原始收发 + 自管 0x78 看门狗），不要依赖 wait_pending_s。
+    wait_pending_s>0 的 0x78 重试分支在本库上可能不触发。0x31 仍走
+    uds_request，enhanced_timeout_ms=120s 覆盖擦槽。
     """
     if stopTask:
         raise RuntimeError("用户停止脚本")
@@ -675,141 +670,6 @@ def _recv_frames(bus_id):
     return out
 
 
-def _flush_rx(bus_id):
-    for _ in range(20):
-        if not _recv_frames(bus_id):
-            break
-
-
-def _make_raw_frame(can_id, data):
-    """构造 ZLG 扩展帧原始发送帧。与 zcanpro_read_app_version.py 实测一致：
-    bit31=1 是 ZLG 扩展帧标志；is_extend 等多键名兼容不同 zcanpro 版本。"""
-    cid29 = int(can_id) & 0x1FFFFFFF
-    cid = cid29 | 0x80000000
-    d = [int(x) & 0xFF for x in data]
-    while len(d) < 8:
-        d.append(0xCC)
-    return {
-        "can_id": cid,
-        "id": cid,
-        "is_canfd": 0,
-        "canfd_brs": 0,
-        "is_extend": 1,
-        "is_extended": 1,
-        "extend": 1,
-        "extern_flag": 1,
-        "is_extern": 1,
-        "eff": 1,
-        "id_type": 1,
-        "data": d[:8],
-    }
-
-
-def _can_send_raw(bus_id, can_id, data):
-    """原始扩展帧发送。依次尝试 transmit/send 的 list/dict 形式，
-    命中后缓存模式（zcanpro_read_app_version.py 实测模式）。"""
-    global _raw_tx_mode
-    frame = _make_raw_frame(can_id, data)
-    attempts = [
-        ("transmit(list)", "transmit", (bus_id, [frame])),
-        ("transmit(dict)", "transmit", (bus_id, frame)),
-        ("send(list)", "send", (bus_id, [frame])),
-        ("send(dict)", "send", (bus_id, frame)),
-    ]
-    if _raw_tx_mode:
-        attempts = [a for a in attempts if a[0] == _raw_tx_mode] + attempts
-    last = None
-    for label, name, args in attempts:
-        fn = getattr(zcanpro, name, None)
-        if fn is None:
-            continue
-        try:
-            fn(*args)
-            if _raw_tx_mode != label:
-                _raw_tx_mode = label
-                _log("原始 TX 使用 " + label)
-            return
-        except Exception as e:
-            last = e
-    raise RuntimeError("原始帧发送失败: %s" % last)
-
-
-def _isotp_sf(sid, payload):
-    """ISO-TP 单帧 8 字节：PCI=0x0N，N=SID+payload 长度。"""
-    body = [int(sid) & 0xFF] + [int(x) & 0xFF for x in payload]
-    n = len(body)
-    if n < 1 or n > 7:
-        raise RuntimeError("原始 UDS 单帧长度非法: %d" % n)
-    d = [n] + body
-    while len(d) < 8:
-        d.append(0xCC)
-    return d[:8]
-
-
-def uds_req_raw_longop(bus_id, sid, payload, per_78_s=10.0, total_s=120.0, desc=""):
-    """0x31 等长操作：deinit 后原始发单帧，自管 7F xx 78，结束再 uds_init。
-
-    不在回调里走库 uds_request：本机库会吞 0x78 且 enhanced_timeout 不刷新。
-    """
-    if stopTask:
-        raise RuntimeError("用户停止脚本")
-    sf = _isotp_sf(sid, payload)
-    tag = desc or ("SID=0x%02X" % sid)
-    _log("[Tx][raw] %s %s" % (tag, _hex(sf)))
-    try:
-        zcanpro.uds_deinit()
-    except Exception as e:
-        _log("UDS 通道释放失败（继续原始收发）: " + str(e))
-    time.sleep(0.05)
-    _flush_rx(bus_id)
-    try:
-        _can_send_raw(bus_id, UDS_REQ_ID, sf)
-        t0 = time.time()
-        t_total = t0 + float(total_s)
-        t_78 = t0 + float(per_78_s)
-        n78 = 0
-        last_log_78 = t0
-        while True:
-            if stopTask:
-                raise RuntimeError("用户停止脚本")
-            now = time.time()
-            if now > t_total:
-                raise RuntimeError("%s 超总上限 %.0fs（收到 %d 帧 78）" % (tag, total_s, n78))
-            if now > t_78:
-                raise RuntimeError("%s 已 %.0fs 未见新 78/最终响应（累计 %d 帧 78）"
-                                   % (tag, per_78_s, n78))
-            for cid, dat in _recv_frames(bus_id):
-                if (cid & 0x1FFFFFFF) != (UDS_RESP_ID & 0x1FFFFFFF):
-                    continue
-                if not dat:
-                    continue
-                pci = int(dat[0]) & 0xFF
-                if (pci & 0xF0) != 0x00:
-                    _log("[Rx][raw] 非单帧 %s" % _hex(dat[:8]))
-                    continue
-                ln = pci & 0x0F
-                if ln < 1 or (1 + ln) > len(dat):
-                    continue
-                uds = [int(x) & 0xFF for x in dat[1:1 + ln]]
-                _log("[Rx][raw] %s" % _hex(uds))
-                if len(uds) >= 3 and uds[0] == SID_NRC and uds[1] == sid:
-                    if uds[2] == NRC_RCRRP:
-                        n78 += 1
-                        t_78 = time.time() + float(per_78_s)
-                        if (time.time() - last_log_78) >= 1.0:
-                            _log("  ... 已收 %d 帧 7F %02X 78" % (n78, sid))
-                            last_log_78 = time.time()
-                        continue
-                    raise UdsNrcError(sid, uds[2])
-                if uds and uds[0] == ((sid + SID_PR) & 0xFF):
-                    _log("%s 正响应，累计 %d 帧 78" % (tag, n78))
-                    return uds
-            time.sleep(0.01)
-    finally:
-        time.sleep(0.05)
-        uds_init()
-
-
 def wake_bus(bus_id, listen_s=2.0):
     """SIT1145 空闲 180s 进 Standby：首帧只当 WUP，MCU 收不到内容，
     所以唤醒帧必须连发、且发完要等固件收敛再探测。
@@ -936,9 +796,8 @@ def run_ota(bus_id):
             send_security_key(bus_id, sig)
         _log("---- DID 0x2010 APP ----")
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
-        _log("---- 擦除（原始收发 + 自管0x78看门狗，绕开库增强超时/吞0x78）----")
-        uds_req_raw_longop(bus_id, SID_RC, [0x01, 0xFF, 0x00],
-                           per_78_s=10.0, total_s=120.0, desc="31 01 FF 00 擦除")
+        _log("---- 擦除 ----")
+        uds_req(bus_id, SID_RC, [0x01, 0xFF, 0x00], wait_pending_s=90)
         dest = read_did_u8(bus_id, 0x2114)
         _log("擦除目标 Slot %s (DID 0x2114=%d)" % (slot_name(dest), dest))
         if dest not in (SLOT_A, SLOT_B):
