@@ -78,8 +78,20 @@ QI_IAP_IN_PROGRESS = 0x01
 QI_IAP_SUCCESS = 0x02
 QI_IAP_FAILED = 0x03
 
-# ======== 私钥路径 ========
-PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem") if 'REPO_ROOT' in dir() else os.path.join(os.path.dirname(_TOOLS_DIR), "docs", "keys", "private.pem")
+# ======== 私钥路径（向上探测仓库根，不写死目录层级假设） ========
+def _find_repo_root(start):
+    d = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(d, "docs", "keys")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.abspath(start)
+        d = parent
+
+
+REPO_ROOT = _find_repo_root(_TOOLS_DIR)
+PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 
 stopTask = False
 

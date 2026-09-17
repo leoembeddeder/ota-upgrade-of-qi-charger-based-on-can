@@ -22,8 +22,20 @@ except ImportError:
     zcanpro = None
 
 # ======== 用户配置 ========
+def _find_repo_root(start):
+    """向上探测仓库根目录（含 docs/keys 的祖先目录），不写死目录层级假设。"""
+    d = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(d, "docs", "keys")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.abspath(start)
+        d = parent
+
+
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+REPO_ROOT = _find_repo_root(_TOOLS_DIR)
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 
 # 要写入的 SN（最多32字节ASCII，不足补空格）

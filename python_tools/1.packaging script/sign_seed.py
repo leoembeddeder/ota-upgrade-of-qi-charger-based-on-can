@@ -23,7 +23,19 @@ import subprocess
 import sys
 import tempfile
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def _find_repo_root(start):
+    """向上探测仓库根目录（含 docs/keys 的祖先目录），不写死目录层级假设。"""
+    d = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(d, "docs", "keys")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.abspath(start)
+        d = parent
+
+
+REPO_ROOT = _find_repo_root(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_KEY = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 
 # CAN IDs (extended frame, match project config)
