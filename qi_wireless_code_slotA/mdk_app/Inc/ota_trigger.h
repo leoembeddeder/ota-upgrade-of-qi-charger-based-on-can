@@ -65,6 +65,13 @@ extern "C" {
 #define TRIAL_STATE_ACTIVE      2U
 #define TRIAL_STATE_CONFIRMED   3U
 
+/** @brief  boot reason codes (metadata.last_boot_reason, must match boot_metadata.h) */
+#define OTA_BOOT_REASON_POWER_ON   0x00U   /*!< POR / NRST / unknown */
+#define OTA_BOOT_REASON_SW         0x01U   /*!< NVIC_SystemReset / UDS 0x11 */
+#define OTA_BOOT_REASON_WDG        0x02U   /*!< IWDG/WWDT */
+#define OTA_BOOT_REASON_OTA_ACT    0x03U   /*!< OTA activation */
+#define OTA_BOOT_REASON_ROLLBACK   0x04U   /*!< rollback from failed trial */
+
 /** @brief  Flash sector size for AT32F426 */
 #define OTA_FLASH_SECTOR_SIZE   0x400U        /*!< 1KB per sector */
 

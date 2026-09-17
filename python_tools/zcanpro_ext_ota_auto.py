@@ -102,6 +102,7 @@ MAX_TD_DATA = 254
 # 与上电 BOOTUP 01 41 00 ... 区分。收到它 = 唤醒收敛的正证据。
 LIFE_ANNOUNCE_ID = 0x18FF260D
 LIFE_ANNOUNCE_MAGIC = (0x01, 0x41, 0x57, 0x4B)  # 01 'A' 'W' 'K'
+LIFE_BOOTUP_MAGIC = (0x01, 0x41, 0x00)  # 01 'A' 00 — 上电/Boot 跳转标识帧
 PROBE_ROUNDS = 3
 
 # secp256r1 / prime256v1. n 必须与 bootloader uECC.c 的 N[] 一致。
@@ -554,26 +555,119 @@ def send_security_key(bus_id, sig, seed=None, priv=None):
     return uds_req(bus_id, SID_SA, [0x02], wait_pending_s=45)
 
 
+def _lifecycle_check(cid, dat):
+    """判断 0x18FF260D 上的帧类型：awk/bootup/shutdown/None。"""
+    if cid != LIFE_ANNOUNCE_ID or len(dat) < 3:
+        return None
+    if len(dat) >= 4 and tuple(dat[:4]) == LIFE_ANNOUNCE_MAGIC:
+        return "awk"          # 01 41 57 4B — 从 Standby 唤醒
+    if dat[0] == 0x01 and dat[1] == 0x41 and dat[2] == 0x00:
+        return "bootup"       # 01 41 00 — 上电/Boot 跳转
+    if dat[0] == 0x06 and dat[1] == 0x41:
+        return "shutdown"     # 06 41 53 42 — 进入 Standby
+    return None
+
+
+def _listen_lifecycle(bus_id, listen_s=1.0):
+    """释放 UDS 通道后 raw 收帧，监听 0x18FF260D 生命周期帧。
+    返回 [(类型, data), ...]；finally 恢复 UDS 通道。"""
+    found = []
+    try:
+        zcanpro.uds_deinit()
+    except Exception as e:
+        _log("UDS 通道释放失败（继续监听）: " + str(e))
+    try:
+        t_end = time.time() + float(listen_s)
+        while time.time() < t_end:
+            if stopTask:
+                raise RuntimeError("用户停止脚本")
+            for cid, dat in _recv_frames(bus_id):
+                lt = _lifecycle_check(cid, dat)
+                if lt is not None:
+                    _log("生命周期帧 [%s] 0x%08X %s" % (lt.upper(), cid, _hex(dat[:8])))
+                    found.append((lt, dat))
+            time.sleep(0.02)
+    finally:
+        uds_init()
+    return found
+
+
 def confirm_app_after_reset(bus_id):
-    """Wait for MCU after 0x11. Boot re-verifies ECDSA before jump (several seconds).
-    Do not use DID 0xF195: APP/Boot pad 32 bytes (ISO-TP FF)."""
-    last_err = None
+    """复位后等待 APP 起来。Boot 验签 ECDSA 需数秒，回退路径更久。
+
+    三阶段：前 3 次盲探 22 2113 → 失败后 wake_bus + 监听生命周期帧 →
+    继续探测并间歇监听。窗口 45s。
+
+    三态诊断：
+    a) UDS 响应 = 成功；
+    b) 生命周期帧但无 UDS = APP 已启动但链路/会话异常；
+    c) 全静默 = 可能停在 Boot 或镜像问题，提示 merge_prod_bin。
+    """
+    WINDOW_S = 45.0
+    BLIND_PROBES = 3
     rx = None
+    last_err = None
     t0 = time.time()
-    _log("等待 APP 起来（Boot 跳转前还要验签，可能数秒）")
-    while time.time() - t0 < 25.0:
+    probe_count = 0
+    woken = False
+    lifecycle_seen = []
+
+    _log("等待 APP 起来（Boot 验签+可能回退，窗口 %.0fs）" % WINDOW_S)
+
+    while time.time() - t0 < WINDOW_S:
         if stopTask:
             raise RuntimeError("用户停止脚本")
+
+        # Phase 1: blind probe (no wake frames yet)
+        if probe_count < BLIND_PROBES:
+            probe_count += 1
+            try:
+                rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                _log("复位后 22 2113 盲探 %d/%d: %s" % (probe_count, BLIND_PROBES, e))
+                time.sleep(0.5)
+                continue
+
+        # Phase 2: wake bus + listen for lifecycle frames (once)
+        if not woken:
+            _log("盲探 %d 次无应答，唤醒总线并监听生命周期帧..." % BLIND_PROBES)
+            woken = True
+            try:
+                wake_ok = wake_bus(bus_id, listen_s=2.0)
+                _log("wake_bus: %s" % ("收到 AWK，已从 Standby 唤醒" if wake_ok
+                                       else "未收到 AWK，继续探测"))
+            except Exception as e:
+                _log("wake_bus 异常: %s" % e)
+            lifecycle_seen.extend(_listen_lifecycle(bus_id, listen_s=1.0))
+
+        # Phase 3: probe + brief lifecycle listen between attempts
         try:
             rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
             last_err = None
             break
         except Exception as e:
             last_err = e
-            _log("复位后 22 2113 等待: " + str(e))
+            _log("复位后 22 2113 等待: %s" % e)
+            lifecycle_seen.extend(_listen_lifecycle(bus_id, listen_s=0.5))
             time.sleep(0.5)
+
     if last_err is not None:
-        raise RuntimeError("复位后无 UDS（跳转失败或 APP CAN 未起来）: " + str(last_err))
+        if lifecycle_seen:
+            details = "; ".join("%s %s" % (lt.upper(), _hex(dat[:8]))
+                                for lt, dat in lifecycle_seen[:4])
+            raise RuntimeError(
+                "复位后 APP 已启动（生命周期帧: %s）但 UDS 22 2113 无应答"
+                "——链路/会话异常，请检查 CAN 配置或会话状态: %s"
+                % (details, last_err))
+        else:
+            raise RuntimeError(
+                "复位后无 UDS 且无生命周期帧（%.0fs 全静默）"
+                "——可能停在 Boot（验签失败/镜像问题），"
+                "请用 merge_prod_bin.py 排查: %s" % (WINDOW_S, last_err))
+
     _log("复位后 DID 0x2113 slot=" + _hex((rx or [])[3:4]))
     try:
         fw = uds_req(bus_id, SID_RDBI, [0x20, 0x10])
@@ -586,7 +680,6 @@ def confirm_app_after_reset(bus_id):
     except UdsNrcError as e:
         _log("复位后 0x34 NRC 0x%02X，已在 APP（默认会话下正常）" % e.nrc)
     except RuntimeError as e:
-        # Boot 不应答任何 UDS：无应答只说明链路未通，不能反推运行位置
         raise RuntimeError("复位后 0x34 无应答（跳转失败或 APP CAN 未起来）: " + str(e))
 
 

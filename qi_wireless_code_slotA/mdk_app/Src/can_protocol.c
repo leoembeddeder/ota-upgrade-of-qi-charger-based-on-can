@@ -164,12 +164,23 @@ static uint8_t can_lp_trial_needs_normal(void)
   {
     return 0U;
   }
-  if ((meta.trial_state != TRIAL_STATE_PENDING) &&
-      (meta.trial_state != TRIAL_STATE_ACTIVE))
+
+  /* trial 进行中且当前槽是 trial 槽：保持 CAN 在线等确认 */
+  if (((meta.trial_state == TRIAL_STATE_PENDING) ||
+       (meta.trial_state == TRIAL_STATE_ACTIVE)) &&
+      (meta.trial_slot == ota_running_slot()))
   {
-    return 0U;
+    return 1U;
   }
-  return (meta.trial_slot == ota_running_slot()) ? 1U : 0U;
+
+  /* OTA 回退后首次启动：保持 CAN 在线让主机探测到设备状态，
+     否则旧 APP 进 Standby，脚本盲探全被 WUP 吞掉 */
+  if (meta.last_boot_reason == OTA_BOOT_REASON_ROLLBACK)
+  {
+    return 1U;
+  }
+
+  return 0U;
 }
 
 static uint8_t g_lp_ident_sent;
