@@ -34,7 +34,7 @@ APP_BIN_DIR = os.path.join(PARENT, "app bin")
 DEFAULT_BIN_A = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project", "Objects", "qi_wireless.bin")
 DEFAULT_KEY = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 
-IMAGE_VERSION = "QC_JYF_FW_1.1.2"
+IMAGE_VERSION = "QC_JYF_FW_1.1.1"
 
 
 def pack_one(bin_path, priv, version):

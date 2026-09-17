@@ -45,7 +45,7 @@
 /*  Version string constants (UTF-8, max 16 bytes including null terminator)  */
 /* ========================================================================== */
 
-static const char SW_VERSION_STR[]     = "QC_JYF_FW_1.1.2";
+static const char SW_VERSION_STR[]     = "QC_JYF_FW_1.1.1";
 static const char BOOTLOADER_VER_STR[] = "QC_JYF_BL_1.0.0";
 static const char HW_VERSION_STR[]     = "QC_JYF_HW_1.1.5";
 
