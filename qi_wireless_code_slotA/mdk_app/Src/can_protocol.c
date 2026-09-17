@@ -364,10 +364,39 @@ static void can_lp_enter_standby(void)
  * @param  len: data length
  * @retval none
  */
+#define PROTO_TX_PEND_MAX  256U
+static uint8_t  g_tx_pend[PROTO_TX_PEND_MAX];
+static uint16_t g_tx_pend_len = 0U;
+
+static void proto_flush_pending_tx(void)
+{
+  uint16_t n = g_tx_pend_len;
+
+  if (n == 0U)
+  {
+    return;
+  }
+  g_tx_pend_len = 0U;
+  (void)isotp_tx_send(CAN_PROTO_UDS_RESPONSE, g_tx_pend, n);
+}
+
 static void proto_send_response(uint8_t *data, uint16_t len)
 {
   can_lp_mark_uds();
-  (void)isotp_tx_send(CAN_PROTO_UDS_RESPONSE, data, len);
+  if ((data == (uint8_t *)0) || (len == 0U) || (len > PROTO_TX_PEND_MAX))
+  {
+    return;
+  }
+  /* SF can send from RX callback. MF must wait for Flow Control — if we
+   * block inside can_driver_poll's callback, FC sits in the same FIFO
+   * and N_Bs times out (27 01 34-byte seed looks like "no response"). */
+  if (len <= 7U)
+  {
+    (void)isotp_tx_send(CAN_PROTO_UDS_RESPONSE, data, len);
+    return;
+  }
+  memcpy(g_tx_pend, data, len);
+  g_tx_pend_len = len;
 }
 
 /**
@@ -500,6 +529,7 @@ static void session_reset_to_default(void)
   current_session   = SESSION_DEFAULT;
   security_unlocked = 0;
   g_seed_generated  = 0;
+  g_tx_pend_len     = 0U;
   ota_dl_abort();
 }
 
@@ -1994,6 +2024,7 @@ void can_protocol_poll(void)
     (void)sit1145_normal_mode_set();
   }
 
+  proto_flush_pending_tx();
   isotp_poll();
 
   if ((now - sit_last) >= 500U)

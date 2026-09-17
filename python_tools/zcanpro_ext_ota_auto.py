@@ -884,7 +884,19 @@ def run_ota(bus_id):
         if last_err is not None:
             raise last_err
         _log("---- SecurityAccess ----")
-        rx = uds_req(bus_id, SID_SA, [0x01])
+        rx = None
+        last_sa = None
+        for sa_try in range(1, 4):
+            try:
+                rx = uds_req(bus_id, SID_SA, [0x01])
+                last_sa = None
+                break
+            except RuntimeError as e:
+                last_sa = e
+                _log("27 01 第 %d/3 次无应答: %s" % (sa_try, e))
+                time.sleep(0.4)
+        if last_sa is not None:
+            raise last_sa
         if len(rx) < 6:
             raise RuntimeError("seed 响应过短")
         if len(rx) >= 34:
