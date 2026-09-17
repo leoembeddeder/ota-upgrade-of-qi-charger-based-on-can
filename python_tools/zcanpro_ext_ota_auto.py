@@ -518,13 +518,21 @@ def read_did_u8(bus_id, did):
 
 
 def send_security_key(bus_id, sig):
-    """Send 64-byte P1363 signature as 16 single-frame 0x27 0x03 chunks, then 0x27 0x02.
+    """Send 64-byte P1363 signature.
 
-    0x27 02 runs ECDSA P-256 on MCU (seconds). MCU first replies 7F 27 78.
+    Prefer 27 02 + 64B in one ISO-TP message (APP copies data[2..65]).
+    Some builds reject 27 03 with NRC 0x12; 27 03 is only a fallback.
     """
     sig = _to_bytes(sig)
     if len(sig) != 64:
         raise RuntimeError("ECDSA 签名须 64 字节, 实际 %d" % len(sig))
+    try:
+        _log("SendKey 27 02 + 64 字节")
+        return uds_req(bus_id, SID_SA, [0x02] + _to_list(sig), wait_pending_s=45)
+    except UdsNrcError as e:
+        if e.nrc not in (0x12, 0x13, 0x24):
+            raise
+        _log("27 02 整包 NRC 0x%02X，改 27 03 分片" % e.nrc)
     seq = 1
     off = 0
     while off < 64:
@@ -892,7 +900,7 @@ def run_ota(bus_id):
                 raise RuntimeError("seed 须 32 字节, 实际 %d" % (len(rx) - 2))
             _log("seed " + _hex(rx[2:34]))
             sig = ecdsa_sign_msg(priv, seed)
-            _log("SendKey 签名 %d 字节（27 03 分片 + 27 02 验签）" % len(sig))
+            _log("SendKey 签名 %d 字节" % len(sig))
             send_security_key(bus_id, sig)
         _log("---- DID 0x2010 APP ----")
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])

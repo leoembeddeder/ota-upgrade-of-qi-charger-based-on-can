@@ -1259,7 +1259,7 @@ static void handle_security_access(uint8_t *data, uint16_t len)
     return;
   }
 
-  sub_func = data[1];
+  sub_func = data[1] & UDS_SUBFUNC_MASK;
   now_ms = timer_get_tick();
 
   if (sub_func == 0x01U)
@@ -1313,9 +1313,9 @@ static void handle_security_access(uint8_t *data, uint16_t len)
     uint8_t chunk_len;
     uint8_t i;
 
-    if (!g_seed_generated || (g_seed_sub != 0x01U))
+    if (!g_seed_generated)
     {
-      proto_send_nrc(UDS_SID_SECURITY_ACCESS, UDS_NRC_SUBFUNCTION_NOT_SUPPORTED);
+      proto_send_nrc(UDS_SID_SECURITY_ACCESS, UDS_NRC_REQUEST_SEQUENCE_ERROR);
       return;
     }
     if (len < 3U)
