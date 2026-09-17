@@ -26,7 +26,7 @@ SID_NRC  = 0x7F
 SID_PR   = 0x40
 
 DID_LIST = [
-    (0xF195, "APP 软件版本", "QC_JYF_FW_1.1.1"),
+    (0xF195, "APP 软件版本", "QC_JYF_FW_1.1.2"),
     (0xF180, "Bootloader 版本", "QC_JYF_BL_1.0.0"),
     (0xF193, "硬件版本",     "QC_JYF_HW_1.1.5"),
 ]
@@ -369,7 +369,7 @@ def z_main():
     global stopTask
     stopTask = False
     _log("======== APP 版本读取工具 ========")
-    _log("预期版本: SW=QC_JYF_FW_1.1.1 / BL=QC_JYF_BL_1.0.0 / HW=QC_JYF_HW_1.1.5")
+    _log("预期版本: SW=QC_JYF_FW_1.1.2 / BL=QC_JYF_BL_1.0.0 / HW=QC_JYF_HW_1.1.5")
     _log("DID: 0xF195(SW) / 0xF180(BL) / 0xF193(HW)")
     _log("")
     buses = zcanpro.get_buses()
