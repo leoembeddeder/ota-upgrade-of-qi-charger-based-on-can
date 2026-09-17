@@ -433,8 +433,10 @@ def pack_image_if_needed(fw_path, priv, version="1.0.0"):
     return header + data
 
 
-def uds_init():
-    zcanpro.uds_init({
+def _uds_init_cfg():
+    return {
+        "src_addr": UDS_REQ_ID,
+        "dst_addr": UDS_RESP_ID,
         "response_timeout_ms": 3000,
         "use_canfd": 0,
         "canfd_brs": 0,
@@ -444,7 +446,11 @@ def uds_init():
         "trans_stmin_valid": 1,
         "trans_stmin": 1,
         "enhanced_timeout_ms": 30000,
-    })
+    }
+
+
+def uds_init():
+    zcanpro.uds_init(_uds_init_cfg())
     _log("UDS 就绪 0x18DA0D03 / 0x18DA030D 扩展帧")
 
 
@@ -634,9 +640,24 @@ def _parse_can_frame(f):
     return (cid & 0x1FFFFFFF, [int(x) & 0xFF for x in list(dat)])
 
 
+def _unwrap_receive(raw):
+    """与 zcanpro_read_app_version.py 一致：receive 常见 (status, [frames])。"""
+    if raw is None:
+        return []
+    if isinstance(raw, tuple) or (isinstance(raw, list) and len(raw) == 2
+                                  and not isinstance(raw[0], dict)
+                                  and isinstance(raw[1], (list, tuple))):
+        a, b = raw[0], raw[1]
+        if isinstance(b, (list, tuple)):
+            return list(b)
+        if isinstance(a, (list, tuple)):
+            return list(a)
+    if isinstance(raw, dict) or (not isinstance(raw, (list, tuple))):
+        return [raw]
+    return list(raw)
+
+
 def _recv_frames(bus_id):
-    """ZCANPRO 原始收帧。实测 receive(bus_id) 返回 (status, [frames])，
-    个别版本无参；任何异常都返回空表，由调用方按超时处理。"""
     try:
         raw = zcanpro.receive(bus_id)
     except TypeError:
@@ -646,25 +667,18 @@ def _recv_frames(bus_id):
             return []
     except Exception:
         return []
-    if raw is None:
-        return []
-    if isinstance(raw, tuple) or (isinstance(raw, list) and len(raw) == 2
-                                  and not isinstance(raw[0], dict)
-                                  and isinstance(raw[1], (list, tuple))):
-        a, b = raw[0], raw[1]
-        items = list(b) if isinstance(b, (list, tuple)) else (list(a) if isinstance(a, (list, tuple)) else [])
-    elif isinstance(raw, dict):
-        items = [raw]
-    elif isinstance(raw, (list, tuple)):
-        items = list(raw)
-    else:
-        items = [raw]
     out = []
-    for f in items:
+    for f in _unwrap_receive(raw):
         p = _parse_can_frame(f)
         if p is not None:
             out.append(p)
     return out
+
+
+def _flush_rx(bus_id):
+    for _ in range(20):
+        if not _recv_frames(bus_id):
+            break
 
 
 def _make_raw_frame(can_id, data):
@@ -720,74 +734,80 @@ def _can_send_raw(bus_id, can_id, data):
     raise RuntimeError("原始帧发送失败: %s" % last)
 
 
+def _isotp_sf(sid, payload):
+    """ISO-TP 单帧 8 字节：PCI=0x0N，N=SID+payload 长度。"""
+    body = [int(sid) & 0xFF] + [int(x) & 0xFF for x in payload]
+    n = len(body)
+    if n < 1 or n > 7:
+        raise RuntimeError("原始 UDS 单帧长度非法: %d" % n)
+    d = [n] + body
+    while len(d) < 8:
+        d.append(0xCC)
+    return d[:8]
+
+
 def uds_req_raw_longop(bus_id, sid, payload, per_78_s=10.0, total_s=120.0, desc=""):
-    """绕开 zcanpro.uds_request，用原始收发实现长耗时 UDS 请求，自管 0x78 看门狗。
+    """0x31 等长操作：deinit 后原始发单帧，自管 7F xx 78，结束再 uds_init。
 
-    动机（实测定性）：ZCANPRO 库把 NRC 0x78 内部消化（不把 7F xx 78 当返回数据
-    抛给脚本），并把 enhanced_timeout_ms 当绝对上限计时——因此 uds_req 里
-    wait_pending_s 的 0x78 重试循环永不触发（死代码），长操作一律在
-    enhanced_timeout_ms 整点被掐断（本次擦除失败正是整30s）。改原始收发后：
-      - 每收到一帧 7F <sid> 78 刷新 per_78_s 看门狗（健康擦除时78每几ms~几十ms
-        一帧，10s 极宽松；擦完 metadata 到正响应的静默也远小于10s）；
-      - 见到正响应 <sid+0x40> 或最终 NRC 立即结束；
-      - 总时长封顶 total_s；
-      - 命中的 UDS_RESP_ID 原始帧全部打日志，下次失败可直接区分
-        「MCU 没发78（真挂死）」还是「库吞了78」——这是旧路径给不出的诊断。
-
-    时序：先 uds_deinit 释放通道（UDS 占用时 raw receive 不可靠，见 wake_bus
-    与 zcanpro_read_app_version.py 实测），收发结束 finally 里 uds_init 恢复。
-    deinit/init 只动测试端 ISO-TP 栈、不发帧给 ECU，会话/解锁状态保持。
+    不在回调里走库 uds_request：本机库会吞 0x78 且 enhanced_timeout 不刷新。
     """
     if stopTask:
         raise RuntimeError("用户停止脚本")
-    # ISO-TP 单帧：PCI=0x0N（N=1 SID + len(payload)），后跟 UDS 字节，不足补 0xCC
-    sf = [len(payload) + 1, sid] + [int(x) & 0xFF for x in payload]
+    sf = _isotp_sf(sid, payload)
     tag = desc or ("SID=0x%02X" % sid)
-    _log("[Tx][raw] %s: %02X %s" % (tag, sid, _hex(payload)))
+    _log("[Tx][raw] %s %s" % (tag, _hex(sf)))
     try:
         zcanpro.uds_deinit()
     except Exception as e:
         _log("UDS 通道释放失败（继续原始收发）: " + str(e))
+    time.sleep(0.05)
+    _flush_rx(bus_id)
     try:
         _can_send_raw(bus_id, UDS_REQ_ID, sf)
         t0 = time.time()
         t_total = t0 + float(total_s)
         t_78 = t0 + float(per_78_s)
         n78 = 0
+        last_log_78 = t0
         while True:
             if stopTask:
                 raise RuntimeError("用户停止脚本")
             now = time.time()
             if now > t_total:
-                raise RuntimeError("%s 超总上限 %.0fs（收到 %d 帧78），MCU 疑似挂死"
-                                   % (tag, total_s, n78))
+                raise RuntimeError("%s 超总上限 %.0fs（收到 %d 帧 78）" % (tag, total_s, n78))
             if now > t_78:
-                raise RuntimeError("%s 已 %.0fs 未见新78/最终响应（累计 %d 帧78），"
-                                   "MCU 疑似擦除中挂死" % (tag, per_78_s, n78))
+                raise RuntimeError("%s 已 %.0fs 未见新 78/最终响应（累计 %d 帧 78）"
+                                   % (tag, per_78_s, n78))
             for cid, dat in _recv_frames(bus_id):
-                if (cid & 0x1FFFFFFF) != UDS_RESP_ID:
+                if (cid & 0x1FFFFFFF) != (UDS_RESP_ID & 0x1FFFFFFF):
                     continue
-                _log("[Rx][raw] %s" % _hex(dat[:8]))
                 if not dat:
                     continue
-                pci = dat[0]
-                if (pci >> 4) != 0x0:  # 只处理单帧；长响应理论上不出现
-                    _log("[Rx][raw] 非单帧 PCI=0x%02X，忽略" % pci)
+                pci = int(dat[0]) & 0xFF
+                if (pci & 0xF0) != 0x00:
+                    _log("[Rx][raw] 非单帧 %s" % _hex(dat[:8]))
                     continue
                 ln = pci & 0x0F
+                if ln < 1 or (1 + ln) > len(dat):
+                    continue
                 uds = [int(x) & 0xFF for x in dat[1:1 + ln]]
+                _log("[Rx][raw] %s" % _hex(uds))
                 if len(uds) >= 3 and uds[0] == SID_NRC and uds[1] == sid:
                     if uds[2] == NRC_RCRRP:
                         n78 += 1
-                        t_78 = time.time() + float(per_78_s)  # 收到78即刷新看门狗
+                        t_78 = time.time() + float(per_78_s)
+                        if (time.time() - last_log_78) >= 1.0:
+                            _log("  ... 已收 %d 帧 7F %02X 78" % (n78, sid))
+                            last_log_78 = time.time()
                         continue
                     raise UdsNrcError(sid, uds[2])
-                if uds and uds[0] == (sid + SID_PR):
-                    _log("%s 正响应，累计 %d 帧78" % (tag, n78))
+                if uds and uds[0] == ((sid + SID_PR) & 0xFF):
+                    _log("%s 正响应，累计 %d 帧 78" % (tag, n78))
                     return uds
             time.sleep(0.01)
     finally:
-        uds_init()  # 恢复 UDS 通道，供后续 22/34/36/37 使用
+        time.sleep(0.05)
+        uds_init()
 
 
 def wake_bus(bus_id, listen_s=2.0):
