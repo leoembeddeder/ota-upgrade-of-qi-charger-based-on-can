@@ -86,7 +86,6 @@ UDS_RESP_ID = 0x18DA030D
 SID_DSC, SID_ER, SID_RDBI, SID_SA = 0x10, 0x11, 0x22, 0x27
 SID_WDBI, SID_RC, SID_RD, SID_TD, SID_RTE = 0x2E, 0x31, 0x34, 0x36, 0x37
 SID_NRC, SID_PR = 0x7F, 0x40
-NRC_SNS = 0x11
 NRC_RCRRP = 0x78
 SA_SIG_CHUNK = 4  # 27 03 单帧：SID+03+seq+4B = 7，避开 ISO-TP 多帧
 IMAGE_MAGIC = 0x4F544158
@@ -568,48 +567,27 @@ def confirm_app_after_reset(bus_id):
         _log("DID 0x2010 NRC 0x%02X（Boot 无此 DID）" % e.nrc)
     try:
         uds_req(bus_id, SID_RD, [0x00])
+        _log("复位后 0x34 正响应，已在 APP")
     except UdsNrcError as e:
-        if e.nrc == NRC_SNS:
-            _log("复位后 0x34 NRC 0x11，已在 APP")
-            return
-        raise RuntimeError("复位后 0x34 异常: " + str(e))
-    raise RuntimeError("复位后 0x34 未回 NRC 0x11，仍在 Bootloader")
+        _log("复位后 0x34 NRC 0x%02X，已在 APP（默认会话下正常）" % e.nrc)
+    except RuntimeError as e:
+        raise RuntimeError("复位后无 UDS 应答，仍在 Bootloader: " + str(e))
 
 
 def probe_in_app(bus_id):
-    """APP 对 0x34 回 NRC 0x11；Boot 为 0x22/0x24/0x33 等。"""
+    """Boot 无 UDS，不应答任何请求；APP 实现 0x34 但需 Programming 会话，
+    默认会话下回 NRC 0x22（conditionsNotCorrect）。
+    故：任一 NRC = 在 APP；无应答 = 不在 APP（Boot 或空片）。"""
     try:
         uds_req(bus_id, SID_RD, [0x00])
-        _log("探测 0x34 正响应，视为已在 Boot")
-        return False
+        _log("探测 0x34 正响应，当前在 APP")
+        return True
     except UdsNrcError as e:
-        if e.nrc == NRC_SNS:
-            _log("探测 0x34 NRC 0x11，当前在 APP")
-            return True
-        _log("探测 0x34 NRC 0x%02X，视为已在 Boot" % e.nrc)
+        _log("探测 0x34 NRC 0x%02X，当前在 APP" % e.nrc)
+        return True
+    except RuntimeError as e:
+        _log("探测 0x34 无应答，不在 APP: " + str(e))
         return False
-
-
-def enter_boot_from_app(bus_id, priv):
-    _log("---- APP 进 Boot (10 02 → 27 → 11 01) ----")
-    try:
-        uds_req(bus_id, SID_DSC, [0x02])
-        rx = uds_req(bus_id, SID_SA, [0x01])
-        if len(rx) >= 34:
-            seed = _to_bytes(rx[2:34])
-            if seed == b"\x00" * 32:
-                _log("APP 已解锁 (seed=0)")
-            else:
-                send_security_key(bus_id, ecdsa_sign_msg(priv, seed))
-    except Exception as e:
-        _log("APP 10 02/27 失败，仍尝试 11 01: " + str(e))
-    time.sleep(0.05)
-    uds_ecu_reset(bus_id)
-    t0 = time.time()
-    while time.time() - t0 < 1.0:
-        if stopTask:
-            raise RuntimeError("用户停止脚本")
-        time.sleep(0.05)
 
 
 def run_ota(bus_id):
