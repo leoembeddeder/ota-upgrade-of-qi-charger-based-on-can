@@ -762,8 +762,8 @@ def run_ota(bus_id):
             send_security_key(bus_id, sig)
         _log("---- DID 0x2010 APP ----")
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
-        _log("---- 擦除 ----")
-        uds_req(bus_id, SID_RC, [0x01, 0xFF, 0x00], wait_pending_s=45)
+        _log("---- 擦除（对面槽已有镜像时可能 10s+，应持续收到 7F 31 78）----")
+        uds_req(bus_id, SID_RC, [0x01, 0xFF, 0x00], wait_pending_s=90)
         dest = read_did_u8(bus_id, 0x2114)
         _log("擦除目标 Slot %s (DID 0x2114=%d)" % (slot_name(dest), dest))
         if dest not in (SLOT_A, SLOT_B):

@@ -15,6 +15,7 @@
 #include "sha256.h"
 #include "uECC.h"
 #include "at32f422_426_flash.h"
+#include "at32f422_426.h"
 #include <string.h>
 
 #define FLASH_PHYSICAL_END  0x08020000U
@@ -307,35 +308,44 @@ void ota_dl_handle_erase(uint8_t *data, uint16_t len)
     return;
   }
 
-  g_slot = inactive_slot();
-  g_base = slot_base(g_slot);
-  g_size = OTA_APP_A_SIZE;
   g_trial_ready = 0U;
   ota_dl_abort();
   g_slot = inactive_slot();
   g_base = slot_base(g_slot);
   g_size = OTA_APP_A_SIZE;
 
-  if ((g_base + g_size) > FLASH_PHYSICAL_END)
+  if (g_base == ota_running_slot_base())
+  {
+    can_proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_CONDITIONS_NOT_CORRECT);
+    return;
+  }
+  if ((g_base < OTA_APP_A_BASE_ADDR) ||
+      ((g_base + g_size) > FLASH_PHYSICAL_END) ||
+      ((g_base + g_size) > OTA_META_PRIMARY_ADDR))
   {
     can_proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
     return;
   }
 
   can_proto_begin_long_op(UDS_SID_ROUTINE_CONTROL);
-  flash_unlock();
   for (addr = g_base; addr < (g_base + g_size); addr += OTA_FLASH_SECTOR_SIZE)
   {
-    if (flash_sector_erase(addr) != FLASH_OPERATE_DONE)
+    flash_status_type st;
+
+    /* Single-bank: IRQ fetch during sector erase hardfaults / wedges CAN. */
+    __disable_irq();
+    flash_unlock();
+    st = flash_sector_erase(addr);
+    flash_lock();
+    __enable_irq();
+    if (st != FLASH_OPERATE_DONE)
     {
-      flash_lock();
       can_proto_end_long_op();
       can_proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
       return;
     }
-    can_proto_send_pending(UDS_SID_ROUTINE_CONTROL);
+    can_proto_pump_long_op();
   }
-  flash_lock();
 
   if (ota_metadata_read(&meta) == 0)
   {
@@ -348,7 +358,9 @@ void ota_dl_handle_erase(uint8_t *data, uint16_t len)
       meta.slot_b_valid = 0U;
     }
     meta.pending_slot = g_slot;
+    __disable_irq();
     (void)ota_metadata_save(&meta);
+    __enable_irq();
   }
 
   g_erased = 1U;

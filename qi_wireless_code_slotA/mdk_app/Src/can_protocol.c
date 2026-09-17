@@ -447,6 +447,14 @@ static void proto_end_long_op(void)
   (void)can_driver_wait_tx_idle(50U);
 }
 
+void can_proto_pump_long_op(void)
+{
+  proto_can_busoff_recover();
+  (void)sit1145_normal_mode_set();
+  proto_send_pending(g_long_op_sid);
+  (void)can_driver_wait_tx_idle(20U);
+}
+
 void can_proto_send_response(uint8_t *data, uint16_t len)
 {
   proto_send_response(data, len);

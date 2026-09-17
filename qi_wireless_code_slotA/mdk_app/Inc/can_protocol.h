@@ -196,6 +196,7 @@ void can_proto_send_nrc(uint8_t service_id, uint8_t nrc);
 void can_proto_begin_long_op(uint8_t service_id);
 void can_proto_end_long_op(void);
 void can_proto_send_pending(uint8_t service_id);
+void can_proto_pump_long_op(void);
 uint8_t can_proto_security_unlocked(void);
 uint8_t can_proto_in_programming(void);
 
