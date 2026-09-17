@@ -263,43 +263,6 @@ int8_t ota_get_image_version(char *out, uint8_t out_len)
   return 0;
 }
 
-int8_t ota_trigger_prepare(void)
-{
-  ota_metadata_t meta;
-  uint8_t slot;
-
-  if (ota_metadata_read(&meta) != 0)
-  {
-    /* keep the running slot marked valid so Bootloader does not treat this
-     * APP as missing when metadata was never written or both copies failed */
-    slot = ota_running_slot();
-    meta_fill_defaults(&meta);
-    meta.active_slot = slot;
-    if (slot == OTA_SLOT_B)
-    {
-      meta.slot_b_valid = 1U;
-    }
-    else
-    {
-      meta.slot_a_valid = 1U;
-    }
-  }
-
-  meta.ota_state = OTA_STATE_DOWNLOADING;
-  return ota_metadata_save(&meta);
-}
-
-/**
- * @brief  trigger OTA upgrade mode
- * @note   sets ota_state to DOWNLOADING, saves metadata, then resets.
- *         does not return on success.
- */
-void ota_trigger_request(void)
-{
-  (void)ota_trigger_prepare();
-  NVIC_SystemReset();
-}
-
 #define TRIAL_HEALTH_DELAY_MS   100U
 
 static uint8_t  g_trial_pending = 0;

@@ -721,23 +721,20 @@ while (1)
   ota_trial_poll  (健康 100ms 后 CONFIRMED；超时 NVIC_SystemReset)
 ```
 
-### APP 触发 OTA（唯一入口）
+### OTA 下载与复位切槽（唯一路径）
 
 ```
 主机 → APP : 10 02          Programming Session
-主机 → APP : 11 01          hardReset
-APP: ota_trigger_prepare()  写 ota_state = DOWNLOADING
-    → SHUTDOWN + 等 TX
+主机 → APP : 27 解锁 → 31 01 FF00 擦非活跃槽 → 34/36 下载 → 37 验签
+APP: 0x37 验签通过 → commit_trial() 写 metadata trial PENDING
+主机 → APP : 11 01          仅复位（不写 metadata）
+    → SHUTDOWN 广播 + 等 TX
     → NVIC_SystemReset
-Bootloader: DOWNLOADING → Safe Mode
+Bootloader: select_boot_slot → try_boot_slot 验签 → 跳新槽 Trial
 ```
 
-`ota_trigger_prepare()`：
-- 读 metadata；两份都坏则填默认值，把当前运行槽标 valid（避免误判"没有 APP"）
-- **不擦槽、不改 active_slot**
-- 只写 `ota_state = DOWNLOADING`，先 Backup 再 Primary
-
-非 Programming 会话下的 `11 01`：不写 DOWNLOADING，只复位。此时 Bootloader 会再跳回 APP。
+- `11 01` 处理：发正响应 → SHUTDOWN 广播 → 等 TX 空闲 → `NVIC_SystemReset`；metadata 已由 `0x37` 写为 trial PENDING
+- 空片 / 双槽无效：Boot 挂起（无 UDS），靠产线 `merge_prod_bin.py` 从 `0x08000000` 救砖
 
 ### Trial 确认
 
@@ -747,9 +744,9 @@ Bootloader: DOWNLOADING → Safe Mode
 - 超过 `trial_timeout_sec`（10s）→ `NVIC_SystemReset()`，Bootloader 看到仍是 ACTIVE，累加 retry，超限回滚
 - 启动满 100ms 后 `ota_confirm_trial()`：`active_slot = trial_slot`，`trial_state = CONFIRMED`
 
-## 20. Safe Mode 逐步 CAN 帧
+## 20. OTA 逐步 CAN 帧
 
-适用：Bootloader 已进入 Safe Mode（空片、双槽无效，或 ota_state=DOWNLOADING）。
+适用：APP 运行中执行 UDS 下载（下载在 APP 内完成；Boot 已无 UDS，Safe Mode 仅挂起）。
 
 请求 ID `0x18DA0D03`，响应 ID `0x18DA030D`，扩展帧，250 kbps。
 
