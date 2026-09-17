@@ -89,7 +89,7 @@ SJW=4, BTS1=54, BTS2=18
 | `0x18DA0D03` | CCU → MCU | UDS 物理寻址请求（MCU 再转发给 Qi） |
 | `0x18DA030D` | MCU → CCU | UDS 物理寻址响应 |
 | `0x18DB33xx` | CCU → 所有外设 | 功能寻址广播（PF=0xDB，PS=0x33） |
-| `0x18FF260D` | MCU → 总线 | 生命周期状态广播（1Hz） |
+| `0x18FF260D` | MCU → 总线 | 生命周期状态广播（周期发送已禁用，仅事件驱动） |
 
 **功能寻址**：PS 字段为功能组地址 0x33，SA 无限制，接收端通过 PS=0x33 识别。Safe Mode 下也接收功能寻址帧。
 
@@ -395,7 +395,7 @@ ECU 收到后执行校验（CRC32 + ECDSA 签名）。
 CCU (客户端)                        MCU (服务器)
     │                                    │
     │  27 01  ──────────────────────▶    │  请求种子
-    │  ◀── 67 01 [seed 4B] ──────────   │  返回 4 字节随机种子
+    │  ◀── 67 01 [seed 32B] ─────────   │  返回 32 字节随机种子
     │                                    │
     │  3. CCU 用私钥对 SHA256(seed) 签名  │
     │                                    │
@@ -409,7 +409,7 @@ CCU (客户端)                        MCU (服务器)
 
 ```python
 import hashlib
-seed = bytes([s0, s1, s2, s3])  # 从 27 01 响应取
+seed = bytes([s0, s1, ..., s31])  # 从 27 01 响应取全部 32 字节
 h = hashlib.sha256(seed).digest()
 sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 ```
@@ -424,7 +424,7 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 ```
 
 **安全要求**：
-- 种子每次请求必须唯一（硬件 RNG）
+- 种子每次 `27 01` 请求重新生成（LFSR + SysTick 时间熵，非硬件 RNG）
 - 公钥存储在 Device Info 区（`0x0801D000+56`），支持后期更换
 - 连续 3 次验签失败锁定 30 秒（NRC `0x36`）
 - 锁定期间返回 NRC `0x37`（requiredTimeDelayNotExpired）
@@ -434,7 +434,7 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 
 | NRC | 名称 | 常见场景 |
 |-----|------|---------|
-| 0x11 | ServiceNotSupported | APP 收到下载类 SID（APP 不支持 0x34/0x36/0x37） |
+| 0x11 | ServiceNotSupported | APP 收到 `0x38` TransferSignature（签名在 XATO 头，由 `0x37` 验） |
 | 0x12 | SubFunctionNotSupported | 非法 session / resetType |
 | 0x13 | IncorrectMessageLength | 请求长度错误 |
 | 0x22 | ConditionsNotCorrect | 非 Programming 就擦/下载；非 Programming 就写固件类型 |
@@ -475,8 +475,8 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
       ┌─────────┴──────────┐  ┌────────┴─────────┐
       │ Bootloader 16 KB   │  │ APP 48 KB/槽     │
       │ 0x08000000         │  │ 槽基址+256 入口  │
-      │ 引导 / 验签 / 跳转 │  │ 充电业务 + 触发  │
-      │ APP 内下载(擦写)   │  │ Trial 确认/超时  │
+      │ 引导/验签/跳转     │  │ 充电业务 + UDS   │
+      │ （无 UDS）         │  │ 擦写下载+Trial   │
       └─────────┬──────────┘  └────────┬─────────┘
                 │   共享 metadata / XATO 头
                 ▼
@@ -486,25 +486,29 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 | 工程 | 目录 | 职责 |
 |------|------|------|
 | Bootloader | `qi_wireless_bootloader/` | 上电引导、槽选择、镜像校验、跳转（无 UDS，Safe Mode = 挂起） |
-| APP Slot A | `qi_wireless_code_slotA/` | 充电业务、生命周期广播、UDS 查询；只负责把 MCU 送进 Boot |
-| APP Slot B | `qi_wireless_code_slotB/` | 同 Slot A，IROM1 Start = `0x08010100` |
+| APP | `qi_wireless_code_slotA/` | 充电业务、生命周期广播、全部 UDS 服务（含擦写下载）；Trial 确认 |
+
+> 固件位置无关（运行时按 PC 判断所在槽，写入前自动重定位重签），只维护一份 APP 源码工程；`qi_wireless_code_slotB/` 副本已于 2026-09-17 删除。
 
 **产线只烧 Bootloader + Slot A**。Slot B 出厂为空，第一次现场 OTA 写入。
 
 ### APP 与 Boot 的能力对比
 
-| 能力 | APP | Bootloader Safe Mode |
-|------|-----|---------------------|
-| `0x10` 会话 | Default/Programming/Extended | 同左 |
-| `0x11` hardReset | Programming 下先写 DOWNLOADING 再复位 | 回 0x51 后复位 |
-| `0x27` SecurityAccess | ECDSA 解锁（与 Boot 共用公钥） | ECDSA 解锁，下载硬门禁 |
-| `0x22` 读 DID | 版本、槽、OTA 状态等 | 同左 |
-| `0x2E 2010` 写固件类型 | Programming + 解锁后可写 01 | 只接受 01=APP |
-| `0x31 FF00` 擦槽 | NRC 0x11（不支持） | 擦非活跃槽 |
-| `0x34/0x36/0x37/0x38` | 一律 NRC 0x11 | 完整下载路径 |
+架构反转后所有 UDS 服务都在 APP 侧实现，Bootloader 无 UDS（仅选槽+验签+跳转）。
+
+| 能力 | APP | Bootloader |
+|------|-----|-----------|
+| `0x10` 会话 | Default/Programming/Extended | 无（不响应任何 UDS） |
+| `0x11` hardReset | 仅复位（metadata 已由 `0x37` 写 PENDING） | 无 |
+| `0x27` SecurityAccess | ECDSA 解锁（32B seed + `27 03` 分块签名） | 无 |
+| `0x22` 读 DID | 版本、槽、OTA 状态等 | 无 |
+| `0x2E 2010` 写固件类型 | Programming + 解锁后可写 01 | 无 |
+| `0x31 FF00` 擦槽 | 擦非活跃槽（APP 内完成） | 无 |
+| `0x34/0x36/0x37` | 完整下载路径（APP 内完成） | 无 |
+| `0x38` TransferSignature | NRC 0x11（签名在 XATO 头，由 `0x37` 验） | 无 |
 | Trial 确认/超时 | 100 ms 健康后确认 | 超限回滚 |
 
-**识别当前固件**：不要用 `0xF180` 或 `0x2113` 判断。APP 和 Boot 都实现了 `0x27`。正确方法：发 `0x34`——APP 回 `7F 34 11`，Boot 不回 `0x11`。
+> 旧版"发 `0x34` 区分 APP/Boot"的方法已失效——Boot 不再响应任何 UDS，所有诊断流量只在 APP 处理。
 
 ## 14. Flash 布局
 
@@ -529,7 +533,7 @@ sig = ecdsa_sign(private_key, h)  # ECDSA P-256, 输出 64B R‖S
 | `trial_state` | 0 IDLE / 1 PENDING / 2 ACTIVE / 3 CONFIRMED |
 | `trial_slot` / `trial_retry_count` | 试运行槽与重试（默认上限 3） |
 | `trial_timeout_sec` | APP 确认窗口，默认 10 秒 |
-| `ota_state` | 0 IDLE / 1 DOWNLOADING（为 1 时 Boot 不跳 APP） |
+| `ota_state` | 0 IDLE / 1 DOWNLOADING（legacy，Boot 已忽略此字段） |
 | `last_boot_reason` | 0x00 上电 / 0x01 软件复位 / 0x02 WDG / 0x03 OTA 激活 / 0x04 回滚 |
 
 ### Image Header（槽起始 256B，magic `"XATO"`）
@@ -595,7 +599,7 @@ CRC32 和 ECDSA 只覆盖头后面的固件（不含头本身）。跳转地址 
 
 ## 16. 生命周期广播
 
-ECU 通过 CAN ID `0x18FF260D` 广播生命周期状态（1Hz）：
+ECU 通过 CAN ID `0x18FF260D` 广播生命周期状态（周期发送已禁用，仅事件驱动；原设计 1Hz）：
 
 ```
 Byte0: 状态码
@@ -618,35 +622,37 @@ Byte2~7: 扩展信息
 
 ## 17. 端到端 OTA 全景
 
-### 场景 A — 板子正在跑 APP（现场升级）
+### 场景 A — 板子正在跑 APP（现场升级，唯一路径）
 
 ```
 主机                        APP                        Bootloader
  │  10 02                    │                             │
  ├─────────────────────────▶│ 50 02                       │
- │  11 01                    │ prepare DOWNLOADING         │
+ │  27 01/03/02 解锁         │                             │
+ ├─────────────────────────▶│ 67 02                       │
+ │  31 01 FF00 擦非活跃槽    │                             │
+ ├─────────────────────────▶│ 71 01 FF00                  │
+ │  34 / 36×N / 37 下载验签  │                             │
+ ├─────────────────────────▶│ 37 验签通过 → 写 trial PENDING│
+ │  11 01                    │ 仅复位（不写 metadata）      │
  ├─────────────────────────▶│ 51 01 → reset ─────────────▶│
- │                           │                             │ DOWNLOADING → Safe Mode
- │  （等 ~2.5s）             │                             │
- │  10 02 / 27 / 2E / 31 …  │                             │
- ├─────────────────────────────────────────────────────────▶│ 擦对面槽、写镜像
- │  11 01                    │                             │ 37 置 PENDING
- ├─────────────────────────────────────────────────────────▶│ reset
+ │                           │                             │ select_boot_slot → 验签
  │                           │◀──── 跳 trial 槽入口 ───────┤
  │  22 F195 读版本           │ 100ms 后 CONFIRMED           │
 ```
 
-### 场景 B — 已在 Safe Mode（空片/双槽无效/上次下载未完成）
+### 场景 B — 空片 / 双槽无效（Boot 挂起）
 
-直接从下面第 20 节的 Safe Mode 逐步 CAN 帧开始，不需要先发 `10 02 + 11`。
+Boot 无 UDS，Safe Mode 仅挂起（`while(1)`），**不能通过 CAN 救砖**。
+唯一恢复手段：产线 `merge_prod_bin.py` 合并镜像从 `0x08000000` 整片烧录。
 
 ### 两种场景的差别
 
-| | 场景 A（APP → Boot） | 场景 B（Safe Mode） |
+| | 场景 A（APP 内下载） | 场景 B（Boot 挂起） |
 |--|--|--|
-| 触发方式 | `10 02` + `11 01` → APP 写 DOWNLOADING 后复位 | 直接在 Safe Mode |
-| 镜像链接要求 | 必须链接到**非活跃槽**（Reset Handler 落在目标槽） | 空片时链接到 Slot A |
-| 首帧 | `10 02`（进编程会话） | 同左 |
+| 触发方式 | APP 内 `10 02`+`27` 解锁+`31/34/36/37`，`0x37` 验签后写 trial PENDING，`11 01` 仅复位 | 无 UDS 可用 |
+| 镜像链接要求 | 链接到 Slot A（`0x08004100`）；写 B 槽时 OTA 脚本自动重定位重签 | 同左 |
+| 恢复手段 | 正常 OTA 流程 | 产线整片烧录 |
 
 ## 18. Bootloader 工作流
 
@@ -658,9 +664,7 @@ Byte2~7: 扩展信息
   ├─ system_clock_config()  180 MHz
   ├─ boot_metadata_init(&g_meta)  主区 → 备份 → 默认值
   ├─ last_boot_reason = detect_boot_reason()
-  │
-  ├─ ota_state == DOWNLOADING ?
-  │     是 → enter_safe_mode()  （不返回）
+  │   （ota_state=DOWNLOADING 已忽略，legacy metadata）
   │
   ├─ process_trial_state(&g_meta)
   ├─ select_boot_slot()
@@ -671,10 +675,8 @@ Byte2~7: 扩展信息
 
 ### enter_safe_mode
 
-- 事件循环：`timer_poll` + `can_driver_poll` + `isotp_poll` + SIT1145 保活（每 500ms 重发 `sit1145_normal_mode_set()`）
-- **不清 ota_state**，保持 DOWNLOADING，直到：
-  - `0x37` 成功（写成 IDLE + PENDING）
-  - S3 超时 / 切回 Default，且至少有一个槽 valid（写成 IDLE）
+- 纯挂起：`while(1) { __NOP(); }`，无 UDS、无 CAN、无 SIT1145 操作（`boot_safe_mode.c` 仅 19 行）
+- 空片 / 双槽无效时进入，唯一恢复手段是产线 `merge_prod_bin.py` 整片烧录
 
 ### select_inactive_slot（选非活跃槽）
 
@@ -687,7 +689,7 @@ Byte2~7: 扩展信息
 | A 无效（含出厂空片） | A |
 | 其余 | B |
 
-### boot_verify_image（镜像校验 5 步）
+### boot_verify_image（镜像校验 6 步）
 
 | 步骤 | 校验内容 |
 |------|---------|
@@ -695,7 +697,8 @@ Byte2~7: 扩展信息
 | 2 | 0 < image_length ≤ 槽大小 − 256 |
 | 3 | CRC32(固件) == header.crc32 |
 | 4 | Reset Handler（清 Thumb 位）落在 [入口, 槽末) |
-| 5 | SHA256(固件) + uECC_verify(Boot 内公钥, signature) |
+| 5 | 公钥完整性（`g_pubkey_magic == "KEYP"`） |
+| 6 | SHA256(固件) + uECC_verify(公钥, signature) |
 
 ### boot_jump_to_app
 
@@ -717,7 +720,7 @@ ota_trial_init  (若本镜像正在 trial，启动 10s 窗口)
 
 while (1)
   timer_poll / can_driver_poll / can_protocol_poll / qi_uart_poll
-  lifecycle_poll  (OPERATIONAL 时每 1000ms 广播)
+  lifecycle_poll  (周期发送已禁用，仅事件驱动)
   ota_trial_poll  (健康 100ms 后 CONFIRMED；超时 NVIC_SystemReset)
 ```
 
