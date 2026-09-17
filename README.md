@@ -1,27 +1,24 @@
 # Qi 无线充电模块 — CAN-UDS OTA 固件升级系统
 
-> 基于 AT32F426 的车载 Qi 无线充电模块，通过 CAN 总线实现 UDS 诊断与双槽 OTA 空中固件升级。
+> 基于 AT32F426 的车载 Qi 无线充电模块，通过 CAN 总线实现 UDS 诊断与双槽 OTA 固件升级。
+>
+> **架构、协议、功能需求等技术细节统一在 [docs/16. 功能需求文档](docs/16.%20功能需求文档.md) 描述**，本 README 只负责版本跟踪与功能开发状态。
 
 ---
 
 ## 目录
 
-- [1. 项目概述](#1-项目概述)
-- [2. 系统拓扑](#2-系统拓扑)
-- [3. 核心特性](#3-核心特性)
-- [4. 仓库目录结构](#4-仓库目录结构)
-- [5. Flash 空间布局](#5-flash-空间布局)
-- [6. 协议栈架构](#6-协议栈架构)
-- [7. OTA 升级流程](#7-ota-升级流程)
-- [8. Bootloader 启动流程](#8-bootloader-启动流程)
-- [9. Python 工具集](#9-python-工具集)
-- [10. 构建与烧录](#10-构建与烧录)
-- [11. 文档索引](#11-文档索引)
-- [12. 功能开发状态](#12-功能开发状态)
+- [1. 项目简介](#1-项目简介)
+- [2. 仓库目录结构](#2-仓库目录结构)
+- [3. 快速上手](#3-快速上手)
+- [4. Python 工具集](#4-python-工具集)
+- [5. 版本跟踪](#5-版本跟踪)
+- [6. 功能开发状态](#6-功能开发状态)
+- [7. 文档索引](#7-文档索引)
 
 ---
 
-## 1. 项目概述
+## 1. 项目简介
 
 ### 1.1 项目目标
 
@@ -43,528 +40,137 @@
 
 ### 1.3 工程组成
 
-项目包含 **两个独立 Keil 工程** + **一套 Python 工具链**：
+项目包含 **两个 Keil 工程** + **一套 Python 工具链**：
 
 | 工程 | 目录 | 职责 |
 |------|------|------|
-| Bootloader | `qi_wireless_bootloader/` | 上电引导、镜像验签、双槽选择、Trial Boot 管理（无UDS，Safe Mode仅挂起） |
-| APP Slot A | `qi_wireless_code_slotA/` | Qi 充电业务、CAN 生命周期广播、OTA 下载（APP内完成）+ 充电控制 |
-| APP Slot B | `qi_wireless_code_slotB/` | 同 Slot A，IROM 基址不同 (0x08010100)，用于 A/B 交替升级 |
+| Bootloader | `qi_wireless_bootloader/` | 上电引导、镜像验签、双槽选择、Trial Boot 管理（无 UDS，Safe Mode 仅挂起） |
+| APP | `qi_wireless_code_slotA/` | Qi 充电业务、CAN 生命周期广播、UDS 诊断与 OTA 下载（APP 内完成擦写） |
 | 工具集 | `python_tools/` | 镜像打包、签名、合并、验证、一键 OTA、功能测试脚本 |
 
----
-
-## 2. 系统拓扑
-
-### 2.1 整车网络拓扑
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        整车 CAN 总线 (250 kbps)                     │
-│                     29-bit 扩展帧, 120Ω 终端                        │
-│                                                                     │
-│  ┌──────────┐          ┌──────────┐          ┌──────────────┐      │
-│  │   CCU    │  CAN Bus │  Qi 模块  │  USART2  │  Qi 充电芯片  │      │
-│  │ (主机)   │◄────────►│ (本项目)  │◄────────►│  (无线充)    │      │
-│  │ 0x03     │          │ 0x0D     │  9600bps  │              │      │
-│  └────┬─────┘          └────┬─────┘          └──────────────┘      │
-│       │                     │                                       │
-│       │ UDS 诊断            │ 霍尔 PA0                              │
-│       │ ISO-TP              │ (磁场检测)                            │
-│       │                     │                                       │
-│  ┌────┴─────┐          ┌────┴─────┐                                 │
-│  │ PC 工具   │          │ SIT1145  │                                 │
-│  │ ZCANPRO  │          │ CAN 收发器│                                 │
-│  │ CAN 分析仪│          │ SPI 配置  │                                 │
-│  └──────────┘          └──────────┘                                 │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 2.2 CAN 寻址
-
-| 方向 | CAN ID | 说明 |
-|------|--------|------|
-| 请求 (CCU → Qi) | `0x18DA0D03` | 物理寻址, 目标=0x0D, 源=0x03 |
-| 响应 (Qi → CCU) | `0x18DA030D` | 物理寻址, 目标=0x03, 源=0x0D |
-
-### 2.3 MCU 引脚分配
-
-```
-                        AT32F426KBU7-4 (QFN32)
-                       ┌─────────────────────┐
-              VDD 3.3V │1                32│ PB8 (NC, 输出低)
-          HEXT_IN 8MHz │2                31│ BOOT0
-         HEXT_OUT 8MHz │3                30│ PB7 (Debug RX)
-               M_NRST  │4                29│ PB6 (Debug TX)
-              VDDA 3.3V│5                28│ PB5 (NC, 输出低)
-        PA0 (霍尔检测) │6                27│ PB4 (NC, 输出低)
-          PA1 (NC,低)  │7                26│ PB3 (SIT1145, 输出低)
-     PA2 (USART2_TX→Qi)│8                25│ PA15 (NC, 输出低)
-     PA3 (USART2_RX←Qi)│9                24│ PA14 (SWCLK)
-      PA4 (SPI1_CS)    │10               23│ PA13 (SWDIO)
-      PA5 (SPI1_SCK)   │11               22│ PA12 (CAN_TX)
-      PA6 (SPI1_MISO)  │12               21│ PA11 (CAN_RX)
-      PA7 (SPI1_MOSI)  │13               20│ PA10 (NC, 输出低)
-          PB0 (NC,低)  │14               19│ PA9  (NC, 输出低)
-  PB1 (12V_Buck,低有效)│15               18│ PA8  (NC, 输出低)
-  PB2 (5V_Qi,高有效)   │16               17│ PB10 (NC, 输出低)
-                       └─────────────────────┘
-```
-
-### 2.4 系统模块关系
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Qi 无线充电模块                            │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │              Bootloader (16KB @ 0x08000000)            │  │
-│  │                                                       │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐  │  │
-│  │  │boot_jump │ │boot_safe │ │boot_trial│ │boot_meta│  │  │
-│  │  │  跳转控制 │ │  Safe    │ │  Trial   │ │ Metadata│  │  │
-│  │  │          │ │  Mode    │ │  Boot    │ │ 管理    │  │  │
-│  │  └──────────┘ └──────────┘ └──────────┘ └─────────┘  │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐  │  │
-│  │  │boot_verify│ │  isotp   │ │sit1145   │ │can_drv  │  │  │
-│  │  │ CRC/ECDSA│ │ ISO-TP   │ │CAN 收发器│ │CAN 驱动 │  │  │
-│  │  └──────────┘ └──────────┘ └──────────┘ └─────────┘  │  │
-│  │  ┌──────────┐ ┌──────────┐                           │  │
-│  │  │  sha256  │ │  uECC    │                           │  │
-│  │  │  哈希    │ │ ECDSA签名│                           │  │
-│  │  └──────────┘ └──────────┘                           │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                           │ 跳转                             │
-│  ┌────────────────────────▼──────────────────────────────┐  │
-│  │           Application (48KB/Slot @ +0x100)             │  │
-│  │                                                       │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐  │  │
-│  │  │can_proto │ │ qi_uart  │ │board_gpio│ │lifecycle│  │  │
-│  │  │CAN 协议栈│ │Qi 串口   │ │  GPIO    │ │生命周期 │  │  │
-│  │  └──────────┘ └──────────┘ └──────────┘ └─────────┘  │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐  │  │
-│  │  │ota_trigger│ │device_inf│ │ nvm_drv  │ │  isotp  │  │  │
-│  │  │OTA 触发  │ │设备信息  │ │NVM 驱动  │ │ ISO-TP  │  │  │
-│  │  └──────────┘ └──────────┘ └──────────┘ └─────────┘  │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                共享 Flash 区域                          │  │
-│  │  Metadata (主+备) │ Device Info (SN) │ NVM Config      │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-```
+> **说明**：APP 固件是位置无关的（运行时按 PC 判断所在槽，写入前自动重定位重签），因此**只需维护一份 APP 源码工程**。
+> 早期的 `qi_wireless_code_slotB/` 副本已于 2026-09-17 删除，Flash 双槽 A/B 机制不受影响。
 
 ---
 
-## 3. 核心特性
-
-### 3.1 双槽 A/B Ping-Pong 升级
-
-```
-出厂状态:                    第一次 OTA:                 第二次 OTA:
-┌──────────┐               ┌──────────┐               ┌──────────┐
-│ Slot A   │ ← 活跃        │ Slot A   │ ← 旧版        │ Slot A   │ ← 新版(活跃)
-│ (v1.0)   │               │ (v1.0)   │               │ (v1.1)   │
-├──────────┤               ├──────────┤               ├──────────┤
-│ Slot B   │ ← 空          │ Slot B   │ ← 新版(活跃)  │ Slot B   │ ← 旧版
-│ (空)     │               │ (v1.1)   │               │ (v1.0)   │
-└──────────┘               └──────────┘               └──────────┘
-```
-
-- 只擦写 **非活跃槽**，活跃槽始终保留可回退
-- 掉电安全：先写 Metadata 备份副本，再写主副本（先备后主）
-
-### 3.2 Trial Boot 试运行机制
-
-```
-OTA 下载完成 → 复位 → Bootloader 选择新槽
-                              │
-                    ┌─────────▼──────────┐
-                    │  Trial Boot (10s)   │
-                    │  新槽 APP 运行      │
-                    │                     │
-                    │  APP 健康检查通过?   │
-                    │  ├─ 是 → 确认       │
-                    │  │       active=新槽 │
-                    │  │       (永久生效)  │
-                    │  └─ 否 → 超时复位   │
-                    │         回滚旧槽    │
-                    └─────────────────────┘
-```
-
-状态流转: `IDLE → PENDING(OTA写入完成后) → ACTIVE(APP启动后) → CONFIRMED(APP确认后)`
-
-### 3.3 安全机制
-
-| 安全层 | 实现 |
-|--------|------|
-| 镜像签名 | ECDSA P-256, 64字节 R‖S (IEEE P1363) |
-| 完整性校验 | CRC32 (IEEE 802.3) + SHA-256 哈希 |
-| 安全访问 | UDS 0x27 SecurityAccess, Seed(32B) → SHA-256 → ECDSA 签名验签 |
-| 防回滚 | 版本号校验 (XATO 头 version 字段) |
-| 掉电保护 | Metadata 双副本 (先写备后写主) |
-| Device Info 保护 | OTA 擦写跳过 0x0801D000~0x0801DFFF, SN 永久保留 |
-
-### 3.4 Safe Mode 救砖
-
-当双槽镜像均无效或 metadata 标记为 `DOWNLOADING` 时，Bootloader 自动进入 Safe Mode：
-- 不跳转 APP，停留在 Bootloader
-- 开放完整 UDS 下载路径 (0x34/0x36/0x37)
-- 支持从空片状态恢复
-
----
-
-## 4. 仓库目录结构
+## 2. 仓库目录结构
 
 ```
 ota-upgrade-of-qi-charger-based-on-can/
 │
-├── README.md                               ← 本文件
+├── README.md                               ← 本文件（版本跟踪 + 开发状态）
 │
-├── qi_wireless_bootloader/                 ← Bootloader 工程
-│   ├── mdk_project/                        ← Keil 工程文件 (.uvprojx)
-│   ├── mdk_user/
-│   │   ├── Inc/                            ← 时钟、中断配置头文件
-│   │   └── Src/
-│   │       └── main.c                      ← 入口: bootloader_main()
-│   ├── mdk_can/
-│   │   ├── Inc/can_driver.h
-│   │   └── Src/can_driver.c               ← CAN 底层驱动
-│   ├── mdk_app/
-│   │   ├── Inc/
-│   │   │   ├── boot_jump.h                 ← 跳转控制
-│   │   │   ├── boot_metadata.h             ← Metadata 读写
-│   │   │   ├── boot_safe_mode.h            ← Safe Mode 挂起
-│   │   │   ├── boot_trial.h                ← Trial Boot 管理
-│   │   │   ├── boot_verify.h               ← CRC/ECDSA 校验
-│   │   │   ├── isotp.h                     ← ISO-TP 传输层
-│   │   │   ├── sha256.h                    ← SHA-256 哈希
-│   │   │   ├── sit1145.h                   ← SIT1145 CAN 收发器驱动
-│   │   │   ├── timer_drv.h                 ← 定时器驱动
-│   │   │   └── uECC.h                      ← ECDSA P-256 签名库
-│   │   └── Src/                            ← 对应 .c 实现
-│   └── libraries/
-│       ├── cmsis/                          ← ARM CMSIS 核心文件
-│       └── drivers/                        ← AT32 SPL 外设驱动库
+├── qi_wireless_bootloader/                 ← Bootloader 工程 (16KB)
+│   ├── mdk_project/                        ← Keil 工程 (.uvprojx)，输出 bootloader.bin
+│   ├── mdk_user/                           ← main.c 入口、时钟、中断
+│   ├── mdk_can/                            ← CAN 底层驱动
+│   ├── mdk_app/                            ← boot_jump / boot_metadata / boot_trial
+│   │   │                                   boot_safe_mode / boot_verify / isotp
+│   │   │                                   sha256 / uECC / sit1145 / timer_drv
+│   └── libraries/                          ← CMSIS + AT32 SPL 驱动库
 │
-├── qi_wireless_code_slotA/                 ← APP 工程 (Slot A, IROM=0x08004100)
-│   ├── mdk_project/
-│   ├── mdk_user/
-│   │   ├── Inc/
-│   │   │   ├── at32f422_426_conf.h         ← 外设模块配置
-│   │   │   └── ...
-│   │   └── Src/
-│   │       └── main.c                      ← APP 入口
-│   ├── mdk_can/
-│   │   ├── Inc/can_driver.h
-│   │   └── Src/can_driver.c
-│   └── mdk_app/
-│       ├── Inc/
-│       │   ├── board_gpio.h                ← GPIO 配置 (霍尔/供电)
-│       │   ├── can_protocol.h              ← CAN-UDS 协议处理
-│       │   ├── device_info.h               ← 设备信息 (SN 等)
-│       │   ├── lifecycle.h                 ← 生命周期状态广播
-│       │   ├── nvm_drv.h                   ← NVM 配置存储
-│       │   ├── ota_trigger.h               ← OTA 触发 (进入 Boot)
-│       │   ├── qi_uart.h                   ← Qi 芯片串口通信
-│       │   └── ...
-│       └── Src/                            ← 对应 .c 实现
-│
-├── qi_wireless_code_slotB/                 ← APP 工程 (Slot B, IROM=0x08010100)
-│   └── (结构同 Slot A)
+├── qi_wireless_code_slotA/                 ← APP 工程 (48KB/槽, IROM=0x08004100)
+│   ├── mdk_project/                        ← Keil 工程，输出 qi_wireless.bin
+│   ├── mdk_user/                           ← main.c 入口、时钟、中断
+│   ├── mdk_can/                            ← CAN 底层驱动
+│   ├── mdk_app/                            ← can_protocol / ota_download / ota_trigger
+│   │   │                                   qi_uart / qi_protocol / board_gpio
+│   │   │                                   lifecycle / device_info / nvm_drv
+│   │   │                                   isotp / sha256 / uECC / sit1145 / timer_drv
+│   └── libraries/                          ← CMSIS + AT32 SPL 驱动库
 │
 ├── python_tools/                           ← Python 工具集
 │   ├── 1.packaging script/                 ← 打包签名子目录
-│   │   ├── pack_image_slotA_1_1_1.py       ← 镜像打包 (XATO 头 + CRC32 + ECDSA)
+│   │   ├── pack_image_slotA_1_1_1.py       ← 裸 bin → XATO 头 .ota.bin
 │   │   ├── merge_prod_bin.py               ← Boot + APP 合并产线镜像
 │   │   ├── verify_image.py                 ← 镜像完整性 + 签名校验
-│   │   └── sign_seed.py                    ← SecurityAccess seed 签名 (ECDSA P-256)
-│   ├── 2.functional test script/           ← 功能测试子目录
-│   │   ├── zcanpro_read_app_version.py     ← 读取 APP 版本
-│   │   ├── zcanpro_sn_write.py             ← 写入设备 SN
-│   │   ├── zcanpro_charge_start.py         ← 启动充电
-│   │   ├── zcanpro_qi_read_status.py       ← 读取 Qi 芯片状态
-│   │   ├── zcanpro_qi_read_version.py      ← 读取 Qi 芯片版本
-│   │   └── zcanpro_qi_set_power.py         ← 设置 Qi 充电功率
-│   ├── iap bin/                            ← Qi 芯片 IAP 固件
-│   │   ├── log1.BIN
-│   │   └── log2.BIN
-│   ├── zcanpro_ext_ota_auto.py             ← 一键 OTA（APP内擦非活跃槽+下载+重定位+重签）
-│   ├── zcanpro_qi_iap_log1.py             ← Qi 芯片 IAP 刷写 (log1)
-│   ├── zcanpro_qi_iap_log2.py             ← Qi 芯片 IAP 刷写 (log2)
+│   │   └── sign_seed.py                    ← SecurityAccess seed 签名
+│   ├── 2.functional test script/           ← 功能测试子目录（6 个脚本）
+│   ├── iap bin/                            ← Qi 芯片 IAP 固件 (log1.BIN / log2.BIN)
+│   ├── zcanpro_ext_ota_auto.py             ← 一键 OTA（APP 内擦写 + 重定位 + 重签）
+│   ├── zcanpro_qi_iap_log1.py              ← Qi 芯片 IAP 刷写 (V1.1)
+│   ├── zcanpro_qi_iap_log2.py              ← Qi 芯片 IAP 刷写 (V1.2)
 │   └── 脚本使用说明.md
 │
+├── .gitattributes                          ← 换行符规范化 (LF 入库)
+├── .gitignore
+│
 └── docs/                                   ← 项目文档
-    ├── 1. AT32F426KBU7-4_引脚定义.md
-    ├── 2. Flash 分配方案.md
-    ├── 4. IAP数据通信协议规范.md            ← MCU ↔ Qi 芯片 UART 协议
-    ├── 6. qi_charger_srs_zh.md             ← Qi 充电模块 SRS
-    ├── 9. APP镜像打包与产线烧录.md
+    ├── 16. 功能需求文档.md                  ← ★ 架构 / 协议 / 需求 唯一权威来源
+    ├── 合并-CAN协议-UDS-OTA工作流.md        ← CAN 协议与 OTA 完整工作流
+    ├── 2. Flash 分配方案.md                 ← Flash 分区细节
+    ├── 9. APP镜像打包与产线烧录.md          ← 打包脚本用法
     ├── 10. CAN-UDS OTA 测试用例表.md        ← 62 条测试用例
-    ├── 11. 签名校验与脚本使用.md
-    ├── 12. 签名原理与Seed机制.md
-    ├── 13. 官方IAP例程vs自定义Bootloader对比.md
-    ├── 14. 宏定义切换方式.md
+    ├── 11~14. 签名 / IAP 对比 / 宏定义      ← 专题文档
     ├── 15. 计划安排表.md
-    ├── 16. 功能需求文档.md
-    ├── 合并-CAN协议-UDS-OTA工作流.md
-    ├── keys/
-    │   ├── private.pem                     ← ECDSA P-256 私钥
-    │   └── public.pem                      ← ECDSA P-256 公钥 (烧入 Bootloader)
+    ├── keys/                               ← ECDSA P-256 密钥对
     └── pdf/                                ← 参考 PDF
 ```
 
 ---
 
-## 5. Flash 空间布局
+## 3. 快速上手
 
-> **MCU**: AT32F426 — 128KB Flash, 1KB Sector
+### 3.1 编译环境
 
+| 工具 | 版本要求 |
+|------|----------|
+| Keil MDK | v5.38+ |
+| AT32 IDE Pack | AT32F426 支持包 |
+| Python | 3.8+ (工具脚本) |
+
+### 3.2 Bootloader 编译
+
+1. 打开 `qi_wireless_bootloader/mdk_project/qi_wireless.uvprojx`
+2. Target → IROM1: `0x08000000` / `0x4000`
+3. Build → 输出 `Objects/bootloader.bin`
+
+### 3.3 APP 编译
+
+1. 打开 `qi_wireless_code_slotA/mdk_project/qi_wireless.uvprojx`
+2. Target → IROM1: `0x08004100` / `0xBF00`
+3. Linker → 勾选 "Use Memory Layout from Target Dialog"
+4. Build → 输出 `Objects/qi_wireless.bin`（裸 bin，不含 XATO 头）
+
+### 3.4 产线烧录
+
+```bash
+cd "python_tools/1.packaging script"
+
+# 1. 打包 APP 镜像（加 XATO 头 + CRC32 + ECDSA 签名）
+python pack_image_slotA_1_1_1.py
+
+# 2. 合并 Boot + APP
+python merge_prod_bin.py
+
+# 3. 烧录 prod_image.bin 到 0x08000000 (J-Link / AT-Link / SWD)
 ```
-地址             大小      区域                    说明
-──────────────────────────────────────────────────────────────────
-0x08000000 ┌─────────────────────────────┐
-           │     Bootloader (16KB)       │  选槽 + 验签 + 跳转（无 UDS）
-           │     0x4000 bytes            │
-0x08004000 ├─────────────────────────────┤
-           │  Slot A: XATO Header (256B) │  magic / length / CRC32
-0x08004100 │  Slot A: APP Code (47.75KB) │  ← Keil IROM 入口
-           │  0xBF00 bytes               │
-0x08010000 ├─────────────────────────────┤
-           │  Slot B: XATO Header (256B) │  同 Slot A 结构
-0x08010100 │  Slot B: APP Code (47.75KB) │  ← OTA 写入目标（自动重定位）
-           │  0xBF00 bytes               │
-0x0801C000 ├─────────────────────────────┤
-           │  Metadata Primary (2KB)     │  ota_metadata_t (272B)
-0x0801C800 ├─────────────────────────────┤
-           │  Metadata Backup (2KB)      │  掉电安全副本
-0x0801D000 ├─────────────────────────────┤
-           │  Device Info (4KB)          │  SN 序列号, OTA 不擦除此区
-0x0801E000 ├─────────────────────────────┤
-           │  NVM Config (8KB)           │  APP 运行时配置
-0x0801FFFF └─────────────────────────────┘
-```
 
-### Metadata 结构 (`ota_metadata_t`, 272 字节)
-
-| 偏移 | 字段 | 说明 |
-|------|------|------|
-| 0x00 | magic | `0x4F54414D` ("MATO") |
-| 0x08 | active_slot | 当前活跃槽 (0=A, 1=B) |
-| 0x09 | pending_slot | 待试运行槽 (0xFE=无) |
-| 0x0A | slot_a_valid | Slot A 镜像有效标志 |
-| 0x0B | slot_b_valid | Slot B 镜像有效标志 |
-| 0x14 | trial_state | 0=IDLE, 1=PENDING, 2=ACTIVE, 3=CONFIRMED |
-| 0x21 | ota_state | 0=IDLE, 1=DOWNLOADING (旧值，Boot 已忽略) |
-| 0x10C | crc32 | 上述字段 CRC32 校验 |
-
-### XATO 镜像头 (256 字节)
-
-| 偏移 | 字段 | 说明 |
-|------|------|------|
-| 0x00 | magic | `0x4F544158` ("XATO") |
-| 0x04 | image_length | 固件长度 (不含头) |
-| 0x08 | crc32 | 固件 CRC32 校验 |
-| 0x0C | signature[64] | ECDSA P-256 签名 (R‖S, IEEE P1363) |
-| 0x4C | version[16] | 版本字符串 |
-| 0x5C | timestamp | 编译时间戳 |
+> 产线只烧 Bootloader + Slot A。Slot B 出厂为空，留给首次 CAN OTA 写入。
+> 空片 / 双槽无效时 Boot 挂起，靠 `merge_prod_bin.py` 产线镜像救砖。
 
 ---
 
-## 6. 协议栈架构
+## 4. Python 工具集
 
-```
-┌─────────────────────────────────────────────┐
-│        应用层 (Application Layer)            │
-│   ISO 14229 — UDS 诊断服务                   │
-│   0x10 会话 │ 0x11 复位 │ 0x22 读DID        │
-│   0x27 安全 │ 0x2E 写DID │ 0x31 例程        │
-│   0x34/36/37/38 下载 │ 0x3E 保活            │
-├─────────────────────────────────────────────┤
-│        传输层 (Transport Layer)              │
-│   ISO 15765-2 — ISO-TP                       │
-│   单帧(SF) / 首帧(FF) / 连续帧(CF) / 流控(FC) │
-├─────────────────────────────────────────────┤
-│        数据链路层 (Data Link Layer)          │
-│   CAN 2.0B — 29-bit 扩展帧                   │
-│   仲裁 / CRC / 错误检测 / Bus-Off 恢复       │
-├─────────────────────────────────────────────┤
-│        物理层 (Physical Layer)               │
-│   SIT1145 CAN 收发器 (SPI 配置)              │
-│   250 kbps / 120Ω 终端 / 差分信号            │
-└─────────────────────────────────────────────┘
-```
+### 4.1 打包与签名（`python_tools/1.packaging script/`）
 
-### 关键 UDS 服务
+| 脚本 | 功能 |
+|------|------|
+| `pack_image_slotA_1_1_1.py` | 裸 bin → XATO 头 .ota.bin (CRC32 + ECDSA P-256) |
+| `merge_prod_bin.py` | Bootloader + Slot A 合并为单文件产线镜像 |
+| `verify_image.py` | 校验 XATO 镜像完整性 + 签名 |
+| `sign_seed.py` | SecurityAccess seed 签名生成 (ECDSA P-256) |
 
-| SID | 名称 | Bootloader | APP |
-|-----|------|:----------:|:---:|
-| 0x10 | DiagnosticSessionControl | — | ✅ |
-| 0x11 | ECUReset | — | ✅ |
-| 0x22 | ReadDataByIdentifier | — | ✅ |
-| 0x27 | SecurityAccess (ECDSA P-256) | — | ✅ |
-| 0x2E | WriteDataByIdentifier | — | ✅ |
-| 0x31 | RoutineControl (擦槽) | — | ✅ |
-| 0x34 | RequestDownload | — | ✅ |
-| 0x36 | TransferData | — | ✅ |
-| 0x37 | RequestTransferExit | — | ✅ |
-| 0x3E | TesterPresent | — | ✅ |
-
-> Bootloader 无 UDS 服务（仅选槽+验签+跳转），所有 UDS 服务均在 APP 侧。
-> 下载（0x31/0x34/0x36/0x37）通过 `ota_download.c` 实现，擦写非活跃槽。
-
----
-
-## 7. OTA 升级流程
-
-### 7.1 端到端 OTA 时序
-
-```
-  CCU (主机)                          Qi 模块 (APP)
-     │                                      │
-     │  ── 10 02 (Programming Session) ──►  │  APP 运行中处理
-     │  ◄── 50 02 ──────────────────────────│
-     │                                      │
-     │  ── 27 01 (RequestSeed) ──────────►  │
-     │  ◄── 67 01 [seed 32B] ───────────────│
-     │                                      │
-     │  ── 27 03 [签名分片 ×16] ─────────►  │  SHA256(seed) → ECDSA
-     │  ◄── 7F 27 78 (ResponsePending) ─────│  MCU 跑 ECDSA P-256 验签
-     │                                      │  (数秒, 非阻塞)
-     │  ◄── 67 03 ──────────────────────────│
-     │                                      │
-     │  ── 27 02 (SendKey/验签) ─────────►  │  MCU 运行 ECDSA P-256 验签
-     │  ◄── 7F 27 78 (ResponsePending) ─────│  (数秒, 非阻塞)
-     │  ◄── 67 02 (OK) ─────────────────────│
-     │                                      │
-     │  ── 2E 2010 01 (选 APP) ──────────►  │
-     │  ◄── 6E 2010 ────────────────────────│
-     │                                      │
-     │  ── 31 01 FF00 (擦非活跃槽) ──────►  │  ◄── 7F 31 78 (ResponsePending)
-     │  ◄── 71 01 FF00 ─────────────────────│      擦除中...
-     │                                      │
-     │  ── 34 (RequestDownload) ─────────►  │
-     │  ◄── 74 20 01 00 (maxBlock=256) ─────│  上限 256B，实际每帧 128B
-     │                                      │
-     │  ── 36 [seqNum + 128B 数据] ──────►  │  每帧 128B，重复 N 次
-     │  ◄── 76 [seqNum] ────────────────────│
-     │                                      │
-     │  ── 37 (TransferExit) ────────────►  │  ◄── 7F 37 78 (验签中...)
-     │  ◄── 77 ─────────────────────────────│
-     │                                      │
-     │  ── 11 01 (HardReset) ────────────►  │
-     │  ◄── 51 01 ──────────────────────────│
-     │                                      │
-     │         MCU 复位 → Trial Boot        │
-```
-
-### 7.2 APP 直接下载 OTA
-
-```
-APP 运行中直接处理 UDS 下载（全程在 APP 内完成，不进 Boot）
-    │
-    ├─ 10 02 → 27 解锁
-    ├─ 31 01 FF00 擦非活跃槽
-    ├─ 34/36/37 下载镜像到非活跃槽（自动重定位）
-    ├─ commit_trial() 写 metadata: pending_slot + trial_state=PENDING
-    ├─ 11 01 复位
-    │
-    └─ Bootloader: select_boot_slot → 验签(ECDSA+CRC32) → jump
-       └─ 新 APP: ota_trial_poll() 10s 确认 → active
-```
-
-> 旧模式（写 metadata=DOWNLOADING → 复位 → Boot Safe Mode 下载）已废弃。
-> 空片 / 双槽无效时 Boot 挂起(`enter_safe_mode` = `while(1)`)，靠产线 `merge_prod_bin.py` 救砖。
-
-### 7.3 OTA 脚本
-
-唯一 OTA 脚本 `zcanpro_ext_ota_auto.py`，在 APP 内完成全部擦写（31/34/36/37），`11 01` 后由 Boot 切槽。固件只编 Slot A（IROM1=0x08004100）；写入 B 槽时脚本自动将镜像重定位到 Slot B 基址并重新签名。
-
-
-
-### 7.4 OTA 关键机制
-
-**非活跃槽擦写**
-
-OTA 过程只擦写非活跃槽，活跃槽始终保留可回退。通过 `2E 2010` DID 选择目标 Slot 后，`31 01 FF00` 仅擦除非活跃槽 Flash。
-
-**掉电安全（Metadata 双副本）**
-
-Metadata 区域包含主副本 (`0x0801C000`) 和备份副本 (`0x0801C800`)。写入顺序：先写备份 → 校验通过 → 再写主副本。掉电发生在写主副本过程中时，Bootloader 可从备份恢复。
-
-**Trial Boot 试运行**
-
-OTA 下载完成后写入 metadata `trial_state = PENDING`，MCU 复位后 Bootloader 选择新槽启动。APP 启动后 `trial_state → ACTIVE`，APP 确认健康后 `→ CONFIRMED`（永久生效）。若 10s 窗口内未确认，超时复位回滚旧槽。
-
-**镜像验签**
-
-APP 在 `37 TransferExit` 后执行 ECDSA P-256 签名验证（64 字节 R‖S P1363 格式）+ CRC32 校验（`ota_download.c` 的 `verify_slot_image`），确认后才写 metadata PENDING。Boot 在 `try_boot_slot` 时再次验签，失败则回滚。
-
-**防回滚**
-
-Bootloader 在 `select_boot_slot()` 时校验 XATO 头中的版本号字段，拒绝降级镜像。
-
----
-
-## 8. Bootloader 启动流程
-
-```
-上电 / 复位
-  │
-  ├─ system_clock_config()          ← 180 MHz
-  ├─ nvic_priority_group_config()
-  ├─ timer_drv_init()
-  ├─ boot_metadata_init()           ← 读主区 → 备份 → 默认值
-  ├─ detect_boot_reason()           ← 上电/软复位/WDG/OTA/回滚
-  │
-  ├─ ota_state=DOWNLOADING 忽略（旧 metadata，下载已在 APP 侧）
-  │
-  ├─ process_trial_state()          ← PENDING→ACTIVE, 超限回滚
-  ├─ select_boot_slot()             ← PENDING/ACTIVE→trial_slot, 否则→active_slot
-  │
-  ├─ try_boot_slot(选中槽)           ← 验签 XATO 头 + ECDSA
-  │     ├─ 通过 → jump_to_app()
-  │     └─ 失败 → try_boot_slot(另一槽)
-  │           ├─ 旧槽成功 → 写回滚 metadata → jump
-  │           └─ 双槽失败 → enter_safe_mode()
-  │
-  └─ enter_safe_mode()              ← 挂起（空片/双槽无效，靠产线镜像救砖）
-```
-
----
-
-## 9. Python 工具集
-
-### 9.1 打包与签名工具
-
-位于 `python_tools/1.packaging script/` 子目录。
-
-| 脚本 | 功能 | 依赖 |
-|------|------|------|
-| `pack_image_slotA_1_1_1.py` | 裸 bin → XATO 头 .ota.bin (CRC32 + ECDSA P-256) | 标准库 |
-| `merge_prod_bin.py` | Bootloader + Slot A 合并为单文件产线镜像 | 标准库 |
-| `verify_image.py` | 校验 XATO 镜像完整性 + 签名 | 标准库 |
-| `sign_seed.py` | SecurityAccess seed 签名生成 (ECDSA P-256) + CAN 帧输出 | `cryptography` |
-
-### 9.2 OTA 脚本
-
-位于 `python_tools/` 根目录。唯一 OTA 脚本，在 APP 内完成全部擦写：
+### 4.2 OTA 与 Qi IAP（`python_tools/` 根目录）
 
 | 脚本 | 说明 |
 |------|------|
-| `zcanpro_ext_ota_auto.py` | 一键 OTA（APP 内擦非活跃槽 + 下载 + 重定位 + 重签） |
+| `zcanpro_ext_ota_auto.py` | 唯一 OTA 脚本：APP 内擦非活跃槽 + 下载 + 重定位 + 重签 |
+| `zcanpro_qi_iap_log1.py` | Qi 芯片 IAP 刷写 (固件包 log1.BIN, V1.1) |
+| `zcanpro_qi_iap_log2.py` | Qi 芯片 IAP 刷写 (固件包 log2.BIN, V1.2) |
 
-### 9.3 Qi 芯片 IAP 脚本
-
-| 脚本 | 说明 |
-|------|------|
-| `zcanpro_qi_iap_log1.py` | Qi 芯片 IAP 刷写 (固件包 1) |
-| `zcanpro_qi_iap_log2.py` | Qi 芯片 IAP 刷写 (固件包 2) |
-
-### 9.4 功能测试脚本
-
-位于 `python_tools/2.functional test script/` 子目录。
+### 4.3 功能测试（`python_tools/2.functional test script/`）
 
 | 脚本 | 功能 |
 |------|------|
@@ -575,130 +181,67 @@ Bootloader 在 `select_boot_slot()` 时校验 XATO 头中的版本号字段，�
 | `zcanpro_qi_read_version.py` | 读取 Qi 芯片版本 |
 | `zcanpro_qi_set_power.py` | 设置 Qi 充电功率 |
 
-### 快速使用
-
-```bash
-# 打包镜像 (需先切换到 packaging script 子目录)
-cd "python_tools/1.packaging script"
-python pack_image_slotA_1_1_1.py \
-  --bin ../../qi_wireless_code_slotA/mdk_project/Objects/qi_wireless.bin \
-  --key ../../docs/keys/private.pem \
-  --out ../../qi_wireless_code_slotA/mdk_project/Objects/qi_wireless.ota.bin
-
-# 合并产线镜像
-python merge_prod_bin.py \
-  --boot ../../qi_wireless_bootloader/mdk_project/Objects/qi_wireless.bin \
-  --app  ../../qi_wireless_code_slotA/mdk_project/Objects/qi_wireless.ota.bin \
-  --out  ../../prod_image.bin
-
-# 校验镜像 (回到仓库根目录)
-cd ../..
-python python_tools/1.packaging\ script/verify_image.py \
-  --bin qi_wireless_code_slotA/mdk_project/Objects/qi_wireless.ota.bin \
-  --pub docs/keys/public.pem
-
-# 一键 OTA (需 ZCANPRO + python-can)
-python python_tools/zcanpro_ext_ota_auto.py
-```
-
 ---
 
-## 10. 构建与烧录
+## 5. 版本跟踪
 
-### 10.1 编译环境
+### 5.1 当前版本
 
-| 工具 | 版本要求 |
+| 组件 | 版本号 | 版本字符串位置 |
+|------|--------|----------------|
+| APP 固件 | **QC_JYF_FW_1.1.1** | `can_protocol.c` → `SW_VERSION_STR` |
+| Bootloader | QC_JYF_BL_1.0.0 | `can_protocol.c` → `BOOTLOADER_VER_STR` |
+| 硬件版本 | QC_JYF_HW_1.1.5 | `can_protocol.c` → `HW_VERSION_STR` |
+
+查询方式：UDS `22 F195`（APP 版本）/ `22 F180`（Bootloader 版本）/ `22 F193`（硬件版本）。
+
+### 5.2 变更记录
+
+| 日期 | 变更内容 |
 |------|----------|
-| Keil MDK | v5.38+ |
-| AT32 IDE Pack | AT32F426 支持包 |
-| Python | 3.8+ (工具脚本) |
+| 2026-09-17 | 删除冗余 `qi_wireless_code_slotB/` 源码工程（固件位置无关，一份 bin 可跑 A/B 槽）；仓库治理：新增 `.gitattributes` 换行符规范化、移除误跟踪构建产物 |
+| 2026-09-17 | APP 版本号回正为 QC_JYF_FW_1.1.1（与打包脚本 `IMAGE_VERSION` 一致） |
+| 2026-09-17 | 全部文档对齐 OTA 架构反转（Boot 16KB / Slot 48KB / 地址上移） |
+| 2026-09-16 | **OTA 架构反转**：下载迁入 APP（0x31/0x34/0x36/0x37 在 APP 内擦写非活跃槽），Boot 16KB 只负责选槽 + 验签 + 跳转；镜像写入前按目标槽自动重定位并重签 |
+| 2026-09-16 | 脚本收敛：只留 Slot A 打包 + 单一 OTA 脚本 `zcanpro_ext_ota_auto.py`，删除 from_boot / 指定槽副本 |
+| 2026-09-16 | Bootloader Safe Mode 改为挂起（`while(1)`），空片 / 双槽无效靠产线 `merge_prod_bin.py` 救砖 |
+| 2026-09-15 | SecurityAccess seed 4 字节 → 32 字节；CAN 采样点改 75%（BTS1=54, BTS2=18, 18MHz÷72Tq） |
+| 2026-09-15 | Qi 芯片 IAP：拆分 log1 / log2 两版脚本，实现完整 ACK 链路 + NRC 重试 |
+| 2026-09-15 | 版本号统一加 QC_JYF 前缀；打包脚本迁移至 `1.packaging script/` 子目录 |
+| 2026-09-14 | 项目初始化：Bootloader + 双槽 APP + Python 工具链 |
 
-### 10.2 Bootloader 编译
-
-1. 打开 `qi_wireless_bootloader/mdk_project/qi_wireless.uvprojx`
-2. Target → IROM1: `0x08000000` / `0x4000`
-3. Build → 输出 `qi_wireless.bin`
-
-### 10.3 APP 编译 (Slot A)
-
-1. 打开 `qi_wireless_code_slotA/mdk_project/qi_wireless.uvprojx`
-2. Target → IROM1: `0x08004100` / `0xBF00`
-3. Linker → 勾选 "Use Memory Layout from Target Dialog"
-4. Build → 输出 `qi_wireless.bin` (裸 bin，不含 XATO 头)
-
-### 10.4 产线烧录
-
-```bash
-# 1. 打包 APP 镜像
-cd "python_tools/1.packaging script"
-python pack_image_slotA_1_1_1.py \
-  --bin ../../qi_wireless_code_slotA/mdk_project/Objects/qi_wireless.bin
-
-# 2. 合并 Boot + APP
-python merge_prod_bin.py
-
-# 3. 烧录合并后的 prod_image.bin 到 0x08000000
-# (使用 J-Link / AT-Link / SWD)
-```
-
-> **注意**: 产线只烧 Bootloader + Slot A。Slot B 出厂为空，留给首次 CAN OTA 写入。
+> 完整提交历史见 `git log`。
 
 ---
 
-## 11. 文档索引
+## 6. 功能开发状态
 
-| 编号 | 文档 | 内容 |
-|------|------|------|
-| 1 | [引脚定义](docs/1.%20AT32F426KBU7-4_引脚定义.md) | AT32F426KBU7-4 QFN32 全引脚功能定义 |
-| 2 | [Flash 分配方案](docs/2.%20Flash%20分配方案.md) | 128KB Flash 分区、Metadata 结构、XATO 头 |
-| 4 | [IAP 数据通信协议](docs/4.%20IAP数据通信协议规范.md) | MCU ↔ Qi 芯片 UART 通信协议 |
-| 6 | [Qi 充电模块 SRS](docs/6.%20qi_charger_srs_zh.md) | 软件需求规格说明书 |
-| 9 | [镜像打包与产线烧录](docs/9.%20APP镜像打包与产线烧录.md) | 打包脚本用法、Keil IROM 配置 |
-| 10 | [OTA 测试用例表](docs/10.%20CAN-UDS%20OTA%20测试用例表.md) | 62 条测试用例 (P0/P1/P2) |
-| 11 | [签名校验与脚本](docs/11.%20签名校验与脚本使用.md) | 签名工具使用说明 |
-| 12 | [签名原理与 Seed 机制](docs/12.%20签名原理与Seed机制.md) | ECDSA P-256 + SHA-256 原理 |
-| 13 | [官方 IAP 例程 vs 自定义 Bootloader](docs/13.%20官方IAP例程vs自定义Bootloader对比.md) | 官方 IAP 方案与本项目 Bootloader 对比 |
-| 14 | [宏定义切换方式](docs/14.%20宏定义切换方式.md) | 编译宏配置与功能切换 |
-| 15 | [计划安排表](docs/15.%20计划安排表.md) | 项目开发计划 |
-| 16 | [功能需求文档](docs/16.%20功能需求文档.md) | 功能需求清单 |
-| — | [CAN 协议-UDS-OTA 工作流](docs/合并-CAN协议-UDS-OTA工作流.md) | CAN 协议与 UDS OTA 完整工作流 |
-
----
-
-## 12. 功能开发状态
-
-### 12.1 已实现并跑通
+### 6.1 已实现并跑通
 
 **Bootloader**
 
 - 选槽 + 镜像验签 (ECDSA P-256, uECC 库) + 跳转（无 UDS 服务，Safe Mode = 挂起）
-- ECDSA P-256 签名验签 (uECC 库)
 - Trial Boot 试运行管理 (PENDING → ACTIVE → CONFIRMED, 10s 窗口)
-- Metadata 双备份掉电保护
-- Bus-Off 恢复机制
+- Metadata 双备份掉电保护（先写备、后写主）
+- 防回滚：XATO 头版本号校验
 - CAN 采样点 75% (BTS1=54, BTS2=18, 18MHz÷72Tq)
 
 **APP 侧**
 
-- OTA 下载（APP内完成0x31/0x34/0x36/0x37，擦写非活跃槽 → commit metadata PENDING → 复位 → Boot切槽）
-- DID 读写 (版本/SN/配置等)
+- OTA 下载：APP 内完成 0x31 擦非活跃槽 / 0x34 / 0x36 / 0x37 验签 → commit metadata PENDING → 复位 → Boot 切槽
+- 镜像写入前按目标槽重定位 + 重签（位置无关，同一份固件适配 A/B）
+- DID 读写（版本 / SN / 配置 / OTA 状态等）
 - 生命周期 CAN 状态广播
 - Qi 芯片 IAP 支持 (DID 0x2130~0x2133, UART 0xCC 协议)
-- SN 序列号存储
-- 充电基本控制 (使能/禁用/功率限值 NVM 持久化)
+- SN 序列号存储（Device Info 区，OTA 擦写跳过）
+- 充电基本控制（使能 / 禁用 / 功率限值 NVM 持久化）
 
 **Python 工具链**
 
-- 镜像打包: `pack_image_slotA_1_1_1.py`
-- 镜像合并: `merge_prod_bin.py`
-- 镜像校验: `verify_image.py`
-- 签名工具: `sign_seed.py`
-- 一键 OTA: `zcanpro_ext_ota_auto.py`
-- Qi IAP: `zcanpro_qi_iap_log1.py` / `log2.py`
-- 功能测试脚本 (版本读取/SN写入/启停充电等)
+- 打包 / 合并 / 校验 / 签名 / 一键 OTA / Qi IAP / 功能测试脚本
 - **端到端 MCU OTA 已验证通过**
 
-### 12.2 验证中（当前红项）
+### 6.2 验证中（当前红项）
 
 | 项 | 说明 |
 |----|------|
@@ -706,7 +249,7 @@ python merge_prod_bin.py
 
 对应计划 A1.6，是当前 MCU OTA 链路唯一未关闭项，需在真实 CAN 总线压力测试中确认无遗漏。
 
-### 12.3 待实现 / 待完善
+### 6.3 待实现 / 待完善
 
 | 类别 | 项 | 说明 |
 |------|------|------|
@@ -714,20 +257,30 @@ python merge_prod_bin.py
 | 故障处理 | 热管理 / FOD / 硬件故障 (E1~E7) | 待实现 |
 | 生命周期广播 | 完整字节格式与事件驱动 (D3/D5/D6) | 当前为简化版 |
 | 低功耗管理 | H1~H8 | 当前仅 SIT1145 收发器级 Standby |
-| | | UDS 空闲 180s → `can_lp_enter_standby` → 发 SHUTDOWN 标记 `06 41 53 42` → SIT1145 切 Standby 监听 |
-| | | 唤醒靠总线活动拉低 PA11 → `can_lp_enter_normal` |
+| | | UDS 空闲 180s → SIT1145 切 Standby 监听，总线活动唤醒 |
 | | | MCU 主循环纯轮询，无 WFI/Stop，MCU 本身未休眠 |
-| | | 超时 180s 为硬编码 (`CAN_LP_IDLE_TIMEOUT_MS`)，非 SRS 要求的 DID 0x2117 可配（该 DID 未实现） |
+| | | 超时 180s 为硬编码（`CAN_LP_IDLE_TIMEOUT_MS`），非 SRS 要求的 DID 0x2117 可配（该 DID 未实现） |
 | UDS 业务流程 | F1~F6 | 待实现 |
 
-### 12.4 版本现状
+---
 
-| 组件 | 版本 |
+## 7. 文档索引
+
+| 文档 | 内容 |
 |------|------|
-| Slot A APP | QC_JYF_FW_1.1.1 |
-| Slot B APP | QC_JYF_FW_1.1.2 |
-| Bootloader | QC_JYF_BL_1.0.0 |
-| 硬件版本 | QC_JYF_HW_1.1.5 |
+| **[16. 功能需求文档](docs/16.%20功能需求文档.md)** | ★ 系统架构、协议栈、Flash 布局、OTA 流程、UDS 服务、DID 列表、功能需求 OTA-REQ-001~015 |
+| [合并-CAN协议-UDS-OTA工作流](docs/合并-CAN协议-UDS-OTA工作流.md) | CAN 协议与 UDS OTA 完整工作流实操手册 |
+| [2. Flash 分配方案](docs/2.%20Flash%20分配方案.md) | 128KB Flash 分区、Metadata 结构、XATO 头 |
+| [9. APP镜像打包与产线烧录](docs/9.%20APP镜像打包与产线烧录.md) | 打包脚本用法、Keil IROM 配置 |
+| [10. CAN-UDS OTA 测试用例表](docs/10.%20CAN-UDS%20OTA%20测试用例表.md) | 62 条测试用例 (P0/P1/P2) |
+| [11. 签名校验与脚本使用](docs/11.%20签名校验与脚本使用.md) | 签名工具使用说明 |
+| [12. 签名原理与Seed机制](docs/12.%20签名原理与Seed机制.md) | ECDSA P-256 + SHA-256 原理 |
+| [13. 官方IAP例程vs自定义Bootloader对比](docs/13.%20官方IAP例程vs自定义Bootloader对比.md) | 官方 IAP 方案与本项目 Bootloader 对比 |
+| [14. 宏定义切换方式](docs/14.%20宏定义切换方式.md) | 编译宏配置与功能切换 |
+| [15. 计划安排表](docs/15.%20计划安排表.md) | 项目开发计划 |
+| [4. IAP数据通信协议规范](docs/4.%20IAP数据通信协议规范.md) | MCU ↔ Qi 芯片 UART 通信协议 |
+| [6. qi_charger_srs_zh](docs/6.%20qi_charger_srs_zh.md) | 软件需求规格说明书 |
+| [1. AT32F426KBU7-4_引脚定义](docs/1.%20AT32F426KBU7-4_引脚定义.md) | QFN32 全引脚功能定义 |
 
 ---
 

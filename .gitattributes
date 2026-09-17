@@ -1,0 +1,11 @@
+# Normalize line endings: store LF in the repo, convert on checkout
+* text=auto
+
+# Binary files — never touch
+*.bin binary
+*.BIN binary
+*.axf binary
+*.o binary
+*.lib binary
+*.a binary
+*.dll binary

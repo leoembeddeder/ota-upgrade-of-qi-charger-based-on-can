@@ -120,22 +120,6 @@ typedef struct
 /* exported functions -------------------------------------------------------*/
 
 /**
- * @brief  trigger OTA upgrade mode
- * @note   reads current metadata from primary flash, sets ota_state to
- *         OTA_STATE_DOWNLOADING, saves metadata, then performs a system reset.
- *         this function does NOT return.
- * @param  none
- * @retval none (does not return)
- */
-void ota_trigger_request(void);
-
-/**
- * @brief  write OTA_STATE_DOWNLOADING to metadata without resetting
- * @retval 0 on success, -1 on flash write error
- */
-int8_t ota_trigger_prepare(void);
-
-/**
  * @brief  read metadata from primary flash location
  * @param  meta: pointer to metadata structure to fill
  * @retval 0 on success (valid metadata), -1 on failure (invalid or read error)
