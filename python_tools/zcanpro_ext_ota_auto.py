@@ -97,6 +97,13 @@ SLOT_B_BASE = 0x08010000
 SLOT_SIZE = 0xC000
 MAX_TD_DATA = 254
 
+# SIT1145 Standby 唤醒标识帧：固件唤醒后约 100ms（CAN_LP_ANNOUNCE_DELAY_MS）
+# 在 0x18FF260D 主动发 01 41 57 4B cnt src secL secH（can_protocol.c can_lp_send_ident_bus），
+# 与上电 BOOTUP 01 41 00 ... 区分。收到它 = 唤醒收敛的正证据。
+LIFE_ANNOUNCE_ID = 0x18FF260D
+LIFE_ANNOUNCE_MAGIC = (0x01, 0x41, 0x57, 0x4B)  # 01 'A' 'W' 'K'
+PROBE_ROUNDS = 3
+
 # secp256r1 / prime256v1. n 必须与 bootloader uECC.c 的 N[] 一致。
 _P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
 _N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
@@ -572,38 +579,130 @@ def confirm_app_after_reset(bus_id):
     except UdsNrcError as e:
         _log("复位后 0x34 NRC 0x%02X，已在 APP（默认会话下正常）" % e.nrc)
     except RuntimeError as e:
-        raise RuntimeError("复位后无 UDS 应答，仍在 Bootloader: " + str(e))
+        # Boot 不应答任何 UDS：无应答只说明链路未通，不能反推运行位置
+        raise RuntimeError("复位后 0x34 无应答（跳转失败或 APP CAN 未起来）: " + str(e))
 
 
-def wake_bus(bus_id):
-    """SIT1145 空闲 180s 进 Standby：首帧只当 WUP，MCU 收不到，
-    靠主机无 ACK 重发才能被唤醒后的 MCU 接收。
-    探测无应答时先发几帧 TesterPresent(suppress) 打破静默。"""
+def _as_int(x):
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def _parse_can_frame(f):
+    """dict / list / tuple / object → (can_id_29bit, data list) or None。
+    解析方式与 zcanpro_read_app_version.py 实测一致。"""
+    if f is None:
+        return None
+    if isinstance(f, dict):
+        cid = None
+        for k in ("can_id", "id", "CANID", "canid"):
+            if k in f:
+                cid = _as_int(f[k])
+                break
+        dat = f.get("data")
+    elif isinstance(f, (list, tuple)) and len(f) >= 2 and _as_int(f[0]) is not None:
+        cid = _as_int(f[0])
+        dat = f[1]
+    else:
+        cid = _as_int(getattr(f, "can_id", getattr(f, "id", None)))
+        dat = getattr(f, "data", None)
+    if cid is None:
+        return None
+    if not isinstance(dat, (list, tuple, bytes, bytearray)):
+        dat = []
+    return (cid & 0x1FFFFFFF, [int(x) & 0xFF for x in list(dat)])
+
+
+def _recv_frames(bus_id):
+    """ZCANPRO 原始收帧。实测 receive(bus_id) 返回 (status, [frames])，
+    个别版本无参；任何异常都返回空表，由调用方按超时处理。"""
+    try:
+        raw = zcanpro.receive(bus_id)
+    except TypeError:
+        try:
+            raw = zcanpro.receive()
+        except Exception:
+            return []
+    except Exception:
+        return []
+    if raw is None:
+        return []
+    if isinstance(raw, tuple) or (isinstance(raw, list) and len(raw) == 2
+                                  and not isinstance(raw[0], dict)
+                                  and isinstance(raw[1], (list, tuple))):
+        a, b = raw[0], raw[1]
+        items = list(b) if isinstance(b, (list, tuple)) else (list(a) if isinstance(a, (list, tuple)) else [])
+    elif isinstance(raw, dict):
+        items = [raw]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        items = [raw]
+    out = []
+    for f in items:
+        p = _parse_can_frame(f)
+        if p is not None:
+            out.append(p)
+    return out
+
+
+def wake_bus(bus_id, listen_s=2.0):
+    """SIT1145 空闲 180s 进 Standby：首帧只当 WUP，MCU 收不到内容，
+    所以唤醒帧必须连发、且发完要等固件收敛再探测。
+
+    步骤：
+    1. 连发 3 帧 3E 80（suppress，间隔 200ms）打破静默；
+    2. 释放 UDS 通道后原始收帧监听 1~2s（zcanpro_read_app_version.py
+       验证过：UDS 占用时 raw receive 不可靠，先 uds_deinit）；
+    3. 收到 0x18FF260D 上的 01 41 57 4B 唤醒标识帧 = 唤醒成功，返回 True；
+       超时未见标识帧返回 False（不能当作已唤醒）。"""
+    if stopTask:
+        raise RuntimeError("用户停止脚本")
     for _ in range(3):
         uds_try(bus_id, SID_TP, [0x80], suppress=1)
         time.sleep(0.2)
+    try:
+        zcanpro.uds_deinit()
+    except Exception as e:
+        _log("UDS 通道释放失败（继续监听）: " + str(e))
+    try:
+        t_end = time.time() + float(listen_s)
+        while time.time() < t_end:
+            if stopTask:
+                raise RuntimeError("用户停止脚本")
+            for cid, dat in _recv_frames(bus_id):
+                if cid == LIFE_ANNOUNCE_ID and tuple(dat[:4]) == LIFE_ANNOUNCE_MAGIC:
+                    _log("收到唤醒标识帧 0x%08X %s，总线已唤醒" % (cid, _hex(dat[:8])))
+                    return True
+            time.sleep(0.02)
+        _log("监听 %.1fs 未见 0x%08X 唤醒标识帧" % (listen_s, LIFE_ANNOUNCE_ID))
+        return False
+    finally:
+        uds_init()  # 恢复 UDS 通道，供后续探测/升级使用
 
 
-def probe_in_app(bus_id, retries=3):
-    """Boot 无 UDS，不应答任何请求；APP 实现 0x34 但需 Programming 会话，
-    默认会话下回 NRC 0x22（conditionsNotCorrect）。
-    故：任一 NRC = 在 APP；无应答 = 不在 APP（Boot 或空片）。
-    Standby 唤醒需时间，无应答时发唤醒帧后重试。"""
+def probe_in_app(bus_id, retries=PROBE_ROUNDS):
+    """Boot 无 UDS，不应答任何请求；APP 实现全部 UDS（含 0x34）。
+    故：有应答（正响应或任意 NRC）= 在 APP；
+    无应答 ≠ 不在 APP——必须先排除 SIT1145 Standby（空闲 180s 进入，
+    首帧被当 WUP 消耗），wake_bus 确认唤醒后再重试，最多 retries 轮。"""
     for attempt in range(1, retries + 1):
         try:
             uds_req(bus_id, SID_RD, [0x00])
             _log("探测 0x34 正响应，当前在 APP")
             return True
-        except UdsNrcError as e:
-            _log("探测 0x34 NRC 0x%02X，当前在 APP" % e.nrc)
+        except UdsNrcError as e:  # NRC 异常继承 RuntimeError，必须先于其捕获
+            _log("探测 0x34 NRC 0x%02X，当前在 APP（APP 应答的任意 NRC 均算）" % e.nrc)
             return True
         except RuntimeError as e:
+            _log("探测 0x34 无应答（第 %d/%d 轮）: %s" % (attempt, retries, e))
             if attempt < retries:
-                _log("探测 0x34 无应答（第 %d/%d 次），发唤醒帧重试: %s"
-                     % (attempt, retries, e))
-                wake_bus(bus_id)
-            else:
-                _log("探测 0x34 无应答，不在 APP: " + str(e))
+                if wake_bus(bus_id):
+                    _log("唤醒标识帧确认收敛，重试探测")
+                else:
+                    _log("未见唤醒标识帧，仍重试探测")
     return False
 
 
@@ -621,9 +720,9 @@ def run_ota(bus_id):
         image = pack_image_if_needed(FIRMWARE_PATH, priv)
         linked = validate_image(image)
         if not probe_in_app(bus_id):
-            raise RuntimeError("当前不在 APP。可能原因：1) 设备低功耗 Standby（空闲 180s 自动进入，"
-                               "已自动发唤醒帧重试仍无应答）→ 断电重启后立即重试；"
-                               "2) 空片/双槽无效 → merge_prod_bin.py 烧录后再升级")
+            raise RuntimeError("唤醒帧已重试 %d 轮仍无应答，判定不在 APP。排查："
+                               "1) 断电重启后立即重试（Standby 唤醒可能未收敛）；"
+                               "2) 空片/双槽无效 → merge_prod_bin.py 烧录后再升级" % PROBE_ROUNDS)
         _log("镜像链接 Slot %s；将写入非活跃槽（必要时重定位）" % slot_name(linked))
         _log("在 APP 内升级（31/34/36/37），完成后 11 01 由 Boot 切槽")
         _log("---- Programming ----")
