@@ -12,12 +12,14 @@ ZCANPRO 扩展脚本 — SA 锁定恢复测试（P1 测试项）
      → 27 03 ×16 帧 → 27 02；预期 NRC 0x35/0x35/0x36（第 3 次触发锁定）
   3. 锁定确认：27 01 → 预期 NRC 0x37（requiredTimeDelay，锁定期内）
   4. S3 keepalive 等待 31s（每 3s 发 3E 80 suppress，逐次打印序号+累计时间）
-  5. 恢复解锁：真 private.pem → 完整 SA（27 01 → seed → ECDSA 真签 → 27 03×16 → 27 02）
-     → 预期 67 02
+  5. 恢复解锁：真 private.pem → 完整 SA（27 01 → seed → ECDSA 真签 →
+     [自检] public.pem 本地验签 → 27 03×16 → 27 02）→ 预期 67 02
   6. 验证（S3 防护实机验证点）：
      a. 解锁态确认：27 01 → 预期 67 01 + 32×0x00（已解锁）
-     b. 幂等写验证：2E F1 8C + 相同 SN → 预期 6E F1 8C——证明 31s 锁定等待期间
-        keepalive 保住了会话+安全态（S3 防护失效时此处必撞 NRC 0x22/0x33）
+     b. 幂等写验证：2E F1 8C + 相同 SN → 预期 6E F1 8C——写步 NRC 判读：
+        0x22=疑似 S3 会话失效；0x33 且 Step 5 未解锁=下游失败（0x33≠0x22，
+        会话检查已通过=S3 keepalive 有效证据）；0x33 且 Step 5 已解锁=异常
+        （安全态被清，非会话失效）
 
 固件事实（2026-09-18 evaluator/主管已验证，file:line）：
   - SA 无会话门禁（handle_security_access，can_protocol.c:1320+，仅长度/锁定/序检查）
@@ -28,8 +30,20 @@ ZCANPRO 扩展脚本 — SA 锁定恢复测试（P1 测试项）
   - 验签失败同时清 g_seed_generated（:1469）→ 裸发 27 02/27 03→NRC 0x24
     （:1429-1433）——脚本每次尝试从 27 01 开局不受影响
   - 已解锁确认：27 01→67 01+32×0x00（:1343-1352）
-  - 写门禁 0xF18C：SESSION_PROGRAMMING+security_unlocked（:1051-1062）；
-    相同值重写=幂等无副作用
+  - 写门禁 0xF18C：SESSION_PROGRAMMING+security_unlocked，顺序=先会话检查
+    （:1055-1057，不满足回 NRC 0x22）后安全检查（:1060-1062，回 0x33）；
+    相同值重写=幂等无副作用。诊断判据：写步得 0x33 = 会话检查已通过 =
+    keepalive 保住会话的正证据；仅 0x22 才提示疑似 S3 会话失效
+  - 验签对象 = SHA-256(g_seed 32 字节)（:1445-1446 sha256_hash+uECC_verify）
+  - 签名本地自检（2026-09-18 新增）：签名完成后、发送 27 03 前用
+    docs/keys/public.pem 做 ECDSA 验签（独立仿射实现，验签对象=SHA-256(seed
+    32B)，与固件一致），日志"[自检] 签名本地验证 PASS/FAIL"；FAIL 不发送、
+    直接报错——mock/实机都能拦截签名数据差分类缺陷
+  - 2026-09-18 修复记录（c81bb18 首测实机 Step 5 27 02→NRC 0x35）：根因 =
+    EC 点运算实现损坏——_jp_add s2 误用 x1（正确式 y2*z1，对照
+    zcanpro_sn_write.py 实机成功路径）+ _jp_mul 仿射转换 y 坐标误用 rx，
+    标量乘结果错误 → 签名 r 值错误 → 与固件验签对象不一致；已对齐
+    sn_write 实现 + 新增签名本地自检
   - S3：SESSION_TIMEOUT_MS=5000（can_protocol.h:167）；任何诊断请求刷新计时
     （uds_process_message:1770 + handle_tester_present:1509，3E 80 suppress 同样
     刷新——d770e86 evaluator 已双点确证）；锁定等待 31s 若无 keepalive，固件 poll
@@ -74,6 +88,7 @@ def _find_repo_root(start):
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = _find_repo_root(_TOOLS_DIR)
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
+PUBLIC_KEY_PATH  = os.path.join(REPO_ROOT, "docs", "keys", "public.pem")  # 签名本地自检用（2026-09-18）
 
 # 要写入的 SN（与 zcanpro_sn_write.py 一致；幂等写验证用，相同值无副作用）
 SN_CODE = "LSCH42JY012606020001"
@@ -107,7 +122,7 @@ NRC_DESC = {
     0x36: "exceededNumberOfAttempts——验签失败达上限（fail_count≥3），固件随即锁定约 30s",
     0x37: "requiredTimeDelay——锁定期内 27 01 应答，设备仍在锁定中",
     0x22: "conditionsNotCorrect——写门禁：会话不满足（S3 超时后会话回 default）",
-    0x33: "securityAccessDenied——写门禁：安全态被清（S3 超时/会话切换清 security_unlocked）",
+    0x33: "securityAccessDenied——写门禁：security_unlocked=0（S3 清安全态或上游 SA 未解锁；0x33≠0x22=会话存活证据）",
     0x24: "requestSequenceError——固件已清 g_seed_generated，裸发 27 02/27 03 撞序检查",
 }
 
@@ -121,6 +136,8 @@ NRC_DESC = {
 S3_KEEPALIVE_INTERVAL_S = 3.0      # keepalive 周期：3s < 5s 超时窗，留 2s 余量
 S3_SIGN_GAP_GUARD_S     = 3.0      # 签名耗时超过该值：先发 3E 再进 27 03 分片
 SA_LOCKOUT_WAIT_S       = 31.0     # SA 锁定等待总时长（>30s 锁定期）
+
+KEEPALIVE_GAPS = []    # keepalive 实际发送间隔取证（s），结束判定 S3 联合判定用
 
 
 class UdsNrcError(RuntimeError):
@@ -212,7 +229,14 @@ def _jp_add(x1, y1, z1, x2, y2, z2):
     u1 = (x1 * z2z2) % _P
     u2 = (x2 * z1z1) % _P
     s1 = (y1 * z2 * z2z2) % _P
-    s2 = (y2 * x1 * z1z1) % _P
+    # 2026-09-18 修复：S2 = Y2·Z1³（z1z1=Z1²）——c81bb18 误写 y2*x1，
+    # 破坏雅可比加法 → 标量乘 x 错误 → 签名 r 错 → 实机 27 02 回 NRC 0x35；
+    # 同步恢复 u1==u2（P=Q 倍增 / P=-Q 无穷远）分支，对齐 sn_write 成功路径
+    s2 = (y2 * z1 * z1z1) % _P
+    if u1 == u2:
+        if (s1 + s2) % _P == 0:
+            return 0, 0, 0
+        return _jp_double(x1, y1, z1)
     h = (u2 - u1) % _P
     r = (s2 - s1) % _P
     h2 = (h * h) % _P
@@ -235,7 +259,9 @@ def _jp_mul(k, x, y):
         return 0, 0
     zinv = _inv(rz, _P)
     z2 = (zinv * zinv) % _P
-    return (rx * z2) % _P, (rx * z2 * zinv) % _P
+    # 2026-09-18 修复：仿射转换 Y = ry/Z³——c81bb18 误写 rx（签名路径 y 被
+    # 丢弃属死计算，仍对齐 sn_write，防未来验签复用踩坑）
+    return (rx * z2) % _P, (ry * z2 * zinv) % _P
 
 
 def _i2b32(v):
@@ -336,6 +362,168 @@ def load_ec_private_key(path):
     raise ValueError("无法解析私钥: " + path)
 
 
+# ======== 宿主侧签名自检（2026-09-18 新增）========
+# 背景：c81bb18 首测（2026-09-18 23:05 实机）Step 5 恢复解锁 27 02 回
+# NRC 0x35 invalidKey。根因 = 本文件 EC 点运算损坏（_jp_add/_jp_mul，已
+# 修复）→ 签名数据与固件验签对象（sha256_hash(g_seed,32U)+uECC_verify，
+# can_protocol.c:1445-1446）不一致；mock 只断言"签名非全 0+分片完整"，
+# 无密码学校验，拦截不了此类缺陷 → 签名后、发送 27 03 前宿主侧验签自检。
+# 验签实现 = 独立仿射 EC 数学（不复用签名路径 _jp_* 雅可比代码），
+# 自检不与签名共享失效模式；零新增依赖。
+
+def load_ec_public_key(path):
+    """解析 public.pem（SPKI PEM/DER 或 65 字节裸未压缩点），
+    返回 (x, y) 仿射坐标 int 对；未找到 0x04||X||Y 即报错。"""
+    raw = open(path, "rb").read()
+    if sys.version_info[0] >= 3:
+        text = raw.decode("ascii", "ignore")
+    else:
+        text = raw
+    if "BEGIN" in text:
+        lines = []
+        take = False
+        for line in text.splitlines():
+            s = line.strip()
+            if "BEGIN" in s:
+                take = True
+                continue
+            if "END" in s:
+                break
+            if take:
+                lines.append(s)
+        import base64
+        der = base64.b64decode("".join(lines))
+    else:
+        der = raw
+    pt = None
+    if len(der) == 65 and _hex(der[:1]) == "04":
+        pt = der[1:65]
+    else:
+        # SPKI：递归 TLV 遍历（顶层 SEQUENCE(0x30) 内嵌套 BIT STRING(0x03)
+        # = 0x00 未用位 + 0x04||X||Y；与 _collect_octet32 同款按 int 比较
+        # tag，ZCANPRO 生产解释器为 py3）
+        def _walk_spki(buf, start, end):
+            i = start
+            while i + 2 <= end:
+                tag = buf[i]
+                try:
+                    ln, j = _der_len(buf, i + 1, end)
+                except Exception:
+                    return None
+                if j + ln > end:
+                    return None
+                body = buf[j:j + ln]
+                if tag == 0x03 and ln >= 66 and _hex(body[:2]) == "00 04":
+                    return body[2:66]
+                if tag == 0x04 and ln == 64:
+                    return body
+                if tag in (0x30, 0x31):  # 构造类型：递归进入
+                    found = _walk_spki(buf, j, j + ln)
+                    if found is not None:
+                        return found
+                i = j + ln
+            return None
+        pt = _walk_spki(der, 0, len(der))
+    if pt is None:
+        raise ValueError("无法解析公钥（未找到未压缩点 0x04||X||Y）: " + path)
+    px = _int_be(pt[:32])
+    py = _int_be(pt[32:64])
+    if not (0 < px < _P and 0 < py < _P):
+        raise ValueError("公钥坐标超出曲线域: " + path)
+    return px, py
+
+
+def _ec_aff_double(pt):
+    """仿射倍点（None=无穷远点）。仅用于宿主侧验签自检。"""
+    if pt is None:
+        return None
+    x, y = pt
+    if y % _P == 0:
+        return None
+    m = ((3 * x * x + _A) * _inv((2 * y) % _P, _P)) % _P
+    x3 = (m * m - 2 * x) % _P
+    y3 = (m * (x - x3) - y) % _P
+    return x3, y3
+
+
+def _ec_aff_add(p1, p2):
+    """仿射点加（None=无穷远点）。仅用于宿主侧验签自检。"""
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2:
+        if (y1 + y2) % _P == 0:
+            return None
+        return _ec_aff_double(p1)
+    m = ((y2 - y1) * _inv((x2 - x1) % _P, _P)) % _P
+    x3 = (m * m - x1 - x2) % _P
+    y3 = (m * (x1 - x3) - y1) % _P
+    return x3, y3
+
+
+def _ec_aff_mul(k, pt):
+    """仿射标量乘 double-and-add。仅用于宿主侧验签自检。"""
+    k %= _N
+    result = None
+    addend = pt
+    while k > 0:
+        if k & 1:
+            result = _ec_aff_add(result, addend)
+        addend = _ec_aff_double(addend)
+        k >>= 1
+    return result
+
+
+def ecdsa_verify_msg(pub_xy, msg, sig):
+    """ECDSA 验签（secp256r1+SHA-256），验签对象=SHA-256(msg)，
+    sig=r||s 各 32 字节大端——与固件 sha256_hash(g_seed,32U)+uECC_verify
+    语义一致。返回 True/False；供签名自检与 mock 冒烟宿主验签复用。"""
+    import hashlib
+    if pub_xy is None:
+        return False
+    px, py = pub_xy
+    if not (0 < px < _P and 0 < py < _P):
+        return False
+    sig = _to_bytes(sig)
+    if len(sig) != 64:
+        return False
+    r = _int_be(sig[:32])
+    s = _int_be(sig[32:])
+    if not (1 <= r < _N and 1 <= s < _N):
+        return False
+    z = _int_be(hashlib.sha256(msg).digest()) % _N
+    w = _inv(s, _N)
+    u1 = (z * w) % _N
+    u2 = (r * w) % _N
+    pt = _ec_aff_add(_ec_aff_mul(u1, (_GX, _GY)), _ec_aff_mul(u2, (px, py)))
+    if pt is None:
+        return False
+    return (pt[0] % _N) == r
+
+
+def _sig_self_check(sig, seed):
+    """签名本地自检：public.pem 对 SHA-256(seed) 验签本地签名。
+    日志"[自检] 签名本地验证 PASS/FAIL"；FAIL 时调用方不发送 27 03。"""
+    if not os.path.isfile(PUBLIC_KEY_PATH):
+        _log("  [自检] 签名本地验证 FAIL——找不到公钥 %s（自检无法执行）"
+             % PUBLIC_KEY_PATH)
+        return False
+    try:
+        pub = load_ec_public_key(PUBLIC_KEY_PATH)
+        ok = ecdsa_verify_msg(pub, seed, sig)
+    except Exception as e:
+        _log("  [自检] 签名本地验证 FAIL——验签执行异常: %s" % e)
+        return False
+    if ok:
+        _log("  [自检] 签名本地验证 PASS（public.pem 对 SHA-256(seed) 验签通过）")
+        return True
+    _log("  [自检] 签名本地验证 FAIL（public.pem 验签失败，签名数据差分）")
+    return False
+
+
 # ======== UDS 通信 ========
 
 def uds_init():
@@ -401,6 +589,8 @@ def uds_try(bus_id, sid, payload, suppress=0):
 
 
 def _s3_keepalive_wait(bus_id, total_s=SA_LOCKOUT_WAIT_S, interval_s=S3_KEEPALIVE_INTERVAL_S):
+    # 2026-09-18：新增实际发送间隔取证（KEEPALIVE_GAPS），供结束判定 S3
+    # 联合判定使用；等待流程逻辑不变
     """S3 会话超时防护：SA 锁定等待期间周期发送 3E 80 keepalive。
 
     固件验证（can_protocol.c）：uds_process_message 对任何诊断请求（含
@@ -416,6 +606,7 @@ def _s3_keepalive_wait(bus_id, total_s=SA_LOCKOUT_WAIT_S, interval_s=S3_KEEPALIV
     """
     t_start = time.time()
     t_end = t_start + float(total_s)
+    t_prev = t_start
     sent = 0
     _log("S3 keepalive 等待 %.0fs（每 %.0fs 发 3E 80 suppress，防会话超时回 default+清 security）"
          % (total_s, interval_s))
@@ -428,10 +619,16 @@ def _s3_keepalive_wait(bus_id, total_s=SA_LOCKOUT_WAIT_S, interval_s=S3_KEEPALIV
             raise RuntimeError("用户停止脚本")
         uds_try(bus_id, SID_TP, [0x80], suppress=1)
         sent += 1
-        elapsed = time.time() - t_start
+        t_now = time.time()
+        KEEPALIVE_GAPS.append(t_now - t_prev)  # 实际发送间隔取证（仅测量，不改流程）
+        t_prev = t_now
+        elapsed = t_now - t_start
         _log("  keepalive #%d（累计 %.1fs）3E 80 已发送" % (sent, elapsed))
     total_elapsed = time.time() - t_start
     _log("S3 keepalive 等待结束：%.1fs 内共发 %d 次 3E 80" % (total_elapsed, sent))
+    if KEEPALIVE_GAPS:
+        _log("S3 keepalive 实际发送间隔：最大 %.1fs（S3 超时窗 5s，须 <5s）"
+             % max(KEEPALIVE_GAPS))
     return sent
 
 
@@ -510,16 +707,23 @@ def _sa_real_unlock(bus_id, priv):
         return rx
     _log("  seed(32B) " + _hex(rx[2:34]))
 
-    # S3 防护：签名前后计时，距上次 UDS 交换 >3s 则先发 3E 80
+    # S3 防护：签名+自检前后计时，距上次 UDS 交换 >3s 则先发 3E 80
     t_sign = time.time()
     sig = ecdsa_sign_msg(priv, seed)
+    # 宿主侧密码学自检（2026-09-18）：签名完成后、发送 27 03 前执行；
+    # FAIL 不发送、直接报错——mock/实机都能拦截签名数据差分类缺陷
+    if not _sig_self_check(sig, seed):
+        raise RuntimeError(
+            "[自检] 签名本地验证 FAIL：本地 ECDSA 签名无法通过 public.pem "
+            "验签（签名数据差分），已中止发送 27 03——请检查 ECDSA 实现与"
+            "公钥文件 " + PUBLIC_KEY_PATH)
     sign_gap = time.time() - t_sign
     if sign_gap > S3_SIGN_GAP_GUARD_S:
-        _log("  ECDSA 签名耗时 %.1fs（>%.1fs）：先发 3E 80 刷新 S3 计时"
+        _log("  ECDSA 签名+自检耗时 %.1fs（>%.1fs）：先发 3E 80 刷新 S3 计时"
              % (sign_gap, S3_SIGN_GAP_GUARD_S))
         uds_try(bus_id, SID_TP, [0x80], suppress=1)
 
-    _log("  ECDSA 真签名完成，27 03 分片发送...")
+    _log("  ECDSA 真签名完成（自检 PASS），27 03 分片发送...")
     _sa_send_sig(bus_id, sig)
 
     _log("  27 02 验签（真签名）...")
@@ -821,6 +1025,7 @@ def run_sa_lockout_test(bus_id):
 
     # 测试结果收集（每步 pass/fail + 详情）
     results = []  # [(step_name, passed, expected, actual, note)]
+    del KEEPALIVE_GAPS[:]  # 间隔取证清零（模块级复用安全）
 
     def _record(step, passed, expected, actual, note=""):
         results.append((step, passed, expected, actual, note))
@@ -923,20 +1128,33 @@ def run_sa_lockout_test(bus_id):
     keepalive_count = _s3_keepalive_wait(bus_id)
     _log("keepalive 发送 %d 次 / %.0fs" % (keepalive_count, SA_LOCKOUT_WAIT_S))
     keepalive_ok = keepalive_count >= 9  # 31s/3s ≈ 10.3，至少 9 次为合理下限
+    ka_max_gap = max(KEEPALIVE_GAPS) if KEEPALIVE_GAPS else None
+    ka_interval_ok = (ka_max_gap is None) or (ka_max_gap < 5.0)
+    ka_note = ""
+    if ka_max_gap is not None:
+        ka_note = "实际发送最大间隔 %.1fs（S3 窗 5s，%s）" % (
+            ka_max_gap, "<5s 达标" if ka_interval_ok else "≥5s 不达标")
     _record("Step4-keepalive", keepalive_ok,
             "≥9 次（31s/3s≈10-11）", "%d 次" % keepalive_count,
-            "" if keepalive_ok else "keepalive 次数偏少，S3 防护可能不充分")
+            ka_note if keepalive_ok else
+            ("keepalive 次数偏少，S3 防护可能不充分" +
+             (("；" + ka_note) if ka_note else "")))
 
     # ---- Step 5: 恢复解锁（真 private.pem → 完整 SA） ----
     _log("---- Step 5: 恢复解锁（真 private.pem → 完整 SA）----")
     _log("固件侧解读：锁定期过→fail_count=0（can_protocol.c:1340）；"
-         "真签名 ECDSA 验签通过 → security_unlocked=1（:1454）")
+         "真签名 ECDSA 验签通过 → security_unlocked=1（:1454）；签名发送前"
+         "先经 [自检] public.pem 本地验签（2026-09-18）")
+    step5_unlock_ok = False
     try:
         rx = _sa_real_unlock(bus_id, priv)
         if len(rx) >= 2 and rx[0] == 0x67 and rx[1] == 0x02:
+            step5_unlock_ok = True
             _log("  解锁成功：67 02 ✓")
-            _record("Step5-恢复解锁", True, "67 02", "67 02", "ECDSA 真签验签通过")
+            _record("Step5-恢复解锁", True, "67 02", "67 02",
+                    "ECDSA 真签验签通过（宿主自检 PASS + 固件验签通过）")
         elif len(rx) >= 34 and rx[0] == 0x67 and rx[1] == 0x01 and _to_bytes(rx[2:34]) == b"\x00" * 32:
+            step5_unlock_ok = True
             _log("  已解锁（seed 全 0），无需签名")
             _record("Step5-恢复解锁", True, "67 02", "67 01+32×00", "已解锁状态")
         else:
@@ -946,15 +1164,25 @@ def run_sa_lockout_test(bus_id):
     except UdsNrcError as e:
         _log("  恢复解锁失败：NRC 0x%02X（%s）" % (e.nrc, NRC_DESC.get(e.nrc, "未知")))
         hint = ""
-        if e.nrc in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
+        if e.nrc == NRC_INVALID_KEY:
+            hint = ("验签失败（invalidKey）：签名已经过宿主自检 PASS（发送前本地"
+                    "public.pem 验签通过）——签名数据无差分，疑设备端公钥与 "
+                    "private.pem 不配对或设备验签对象不同；若自检 FAIL 脚本已"
+                    "拦截发送，不会到达此处")
+        elif e.nrc in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
             hint = "设备可能仍在锁定中——建议断电重启后重跑"
         elif e.nrc == 0x24:
             hint = "g_seed_generated 已被清（裸发 27 02 撞序检查），流程异常"
         _record("Step5-恢复解锁", False, "67 02", "NRC 0x%02X" % e.nrc, hint)
     except RuntimeError as e:
         _log("  恢复解锁失败: %s" % e)
-        _record("Step5-恢复解锁", False, "67 02", str(e),
-                "设备可能仍在锁定/会话复位，建议断电重启后重跑")
+        if "[自检]" in str(e):
+            _record("Step5-恢复解锁", False, "67 02", "自检 FAIL",
+                    "签名本地验签失败（签名数据差分），脚本已拦截发送 27 03——"
+                    "检查 ECDSA 实现/公钥文件，设备侧未受本次失败影响")
+        else:
+            _record("Step5-恢复解锁", False, "67 02", str(e),
+                    "设备可能仍在锁定/会话复位，建议断电重启后重跑")
 
     # ---- Step 6a: 解锁态确认 ----
     _log("---- Step 6a: 解锁态确认（27 01 → 预期 67 01 + 32×0x00）----")
@@ -994,10 +1222,13 @@ def run_sa_lockout_test(bus_id):
         sn_bytes = str(SN_CODE)
     sn32 = _to_list(sn_bytes) + [0x20] * (32 - len(sn_bytes))
     _log("  写入数据（相同 SN，幂等）: " + _hex(sn32))
+    step6b_ok = False
+    step6b_nrc = None
 
     try:
         rx = uds_req(bus_id, SID_WDBI, [0xF1, 0x8C] + sn32, wait_pending_s=10)
         if len(rx) >= 3 and rx[0] == 0x6E and rx[1] == 0xF1 and rx[2] == 0x8C:
+            step6b_ok = True
             _log("  写入成功：6E F1 8C ✓——S3 keepalive 防护有效！"
                  "31s 锁定等待期间会话+安全态保持")
             _record("Step6b-幂等写", True, "6E F1 8C", "6E F1 8C",
@@ -1007,14 +1238,26 @@ def run_sa_lockout_test(bus_id):
             _record("Step6b-幂等写", False, "6E F1 8C", _hex(rx[:6]),
                     "应答格式不符")
     except UdsNrcError as e:
+        step6b_nrc = e.nrc
         _log("  写入失败：NRC 0x%02X（%s）" % (e.nrc, NRC_DESC.get(e.nrc, "未知")))
         if e.nrc == NRC_CONDITIONS_NOT_CORRECT:
-            hint = ("NRC 0x22 conditionsNotCorrect——S3 防护失效：31s 等待期间"
-                    "无 keepalive（或间隔>5s），固件 poll（:2094-2098）已将会话"
-                    "回 default → 写门禁 SESSION_PROGRAMMING 不满足")
+            hint = ("NRC 0x22 conditionsNotCorrect——疑似 S3 会话失效（S3 防护"
+                    "失效判据）：31s 等待期间无 keepalive（或间隔>5s），固件 poll"
+                    "（:2094-2098）已将会话回 default → 写门禁 SESSION_PROGRAMMING"
+                    " 不满足（can_protocol.c:1055 先查会话回 0x22）")
         elif e.nrc == NRC_SECURITY_ACCESS_DENIED:
-            hint = ("NRC 0x33 securityAccessDenied——S3 防护失效：会话切换/"
-                    "超时清了 security_unlocked → 写门禁 security_unlocked 不满足")
+            if not step5_unlock_ok:
+                hint = ("NRC 0x33 securityAccessDenied——下游失败（Step 5 未解锁"
+                        "所致），非 S3 失效：固件写门禁先查会话（:1055-1057，"
+                        "不满足回 0x22）后查安全（:1060-1062，回 0x33）——拿到"
+                        " 0x33 = 会话检查已通过 = 31s 等待后会话仍为 Programming"
+                        "，S3 keepalive 防护有效；安全态缺失来源=Step 5 验签未"
+                        "解锁，处置=先排查 Step 5（0x33≠0x22）")
+            else:
+                hint = ("NRC 0x33 securityAccessDenied——异常：Step 5 已解锁但"
+                        "写步安全门禁失败（会话检查已过、非 S3 会话失效，"
+                        "0x33≠0x22），疑安全态在写步前被其他因素清零，建议"
+                        "断电重启后单独复测 SA+写步")
         else:
             hint = NRC_DESC.get(e.nrc, "未知 NRC")
         _record("Step6b-幂等写", False, "6E F1 8C", "NRC 0x%02X" % e.nrc, hint)
@@ -1024,6 +1267,24 @@ def run_sa_lockout_test(bus_id):
 
     # ---- 结束判定 ----
     _log("======== 测试结束判定 ========")
+
+    # ---- S3 keepalive 联合判定（2026-09-18：Step 4 达标 + Step 6b 写步证据）----
+    # 判据：0xF18C 写门禁先查会话（can_protocol.c:1055-1057 回 0x22）后查
+    # 安全（:1060-1062 回 0x33）→ 写步非 0x22 = 会话检查通过 = keepalive
+    # 保住会话的正证据（含 0x33——Step 5 未解锁的下游失败不否定 S3 防护）
+    step6b_evidence_ok = step6b_ok or (
+        step6b_nrc is not None and step6b_nrc != NRC_CONDITIONS_NOT_CORRECT)
+    if keepalive_ok and ka_interval_ok and step6b_evidence_ok:
+        _log("[正面判定] S3 keepalive 防护实机有效：Step 4 keepalive %d 次%s "
+             "达标（<5s）+ 后续写步未见 NRC 0x22（固件写门禁先查会话已通过）"
+             "——31s 锁定等待期间会话存活" % (
+                 keepalive_count,
+                 ("/最大间隔 %.1fs" % ka_max_gap) if ka_max_gap is not None else ""))
+    elif keepalive_ok and step6b_nrc == NRC_CONDITIONS_NOT_CORRECT:
+        _log("[负面判定] Step 6b 得 NRC 0x22（疑似 S3 会话失效）与 Step 4 "
+             "keepalive 次数/间隔达标矛盾——请核查 keepalive 实际生效性"
+             "（发送时刻/间隔）与设备 S3 poll 状态")
+
     all_pass = all(r[1] for r in results)
     fail_items = [r for r in results if not r[1]]
 
@@ -1045,10 +1306,23 @@ def run_sa_lockout_test(bus_id):
                 _log("  %s: %s" % (step, note))
         _log("---- 处置建议 ----")
         if any("Step5" in r[0] for r in fail_items):
-            _log("  恢复解锁失败→设备可能仍在锁定/会话复位，建议断电重启后重跑")
+            _log("  恢复解锁失败→签名已过宿主自检时疑设备公钥与 private.pem "
+                 "不配对；自检 FAIL 时为签名数据差分（脚本已拦截发送，设备侧"
+                 "未受影响）；设备可能仍在锁定/会话复位时建议断电重启后重跑")
         if any("Step6b" in r[0] for r in fail_items):
-            _log("  写步失败→S3 keepalive 防护可能未生效，检查 keepalive 日志"
-                 "（Step 4）确认发送次数与间隔")
+            step6b_fail_actuals = [str(r[3]) for r in fail_items if "Step6b" in r[0]]
+            if any("NRC 0x33" in a for a in step6b_fail_actuals) and any(
+                    "Step5" in r[0] for r in fail_items):
+                _log("  写步 NRC 0x33 = 下游失败（Step 5 未解锁所致），非 S3 "
+                     "失效：0x33≠0x22——固件写门禁先查会话（:1055-1057 回 "
+                     "0x22）后查安全（:1060-1062 回 0x33），拿到 0x33 即会话"
+                     "检查通过 = S3 keepalive 有效证据；处置=排查 Step 5")
+            elif any("NRC 0x22" in a for a in step6b_fail_actuals):
+                _log("  写步 NRC 0x22 = 疑似 S3 会话失效——检查 keepalive 日志"
+                     "（Step 4）确认发送次数与间隔")
+            else:
+                _log("  写步失败→按上方固件侧解释处置（0x33+Step 5 未解锁=下游"
+                     "失败；0x22=疑似 S3 会话失效）")
         if any("Step2" in r[0] for r in fail_items):
             _log("  错 key NRC 不符→固件 SA 锁定逻辑可能与预期不同，"
                  "请核对 can_protocol.c 锁定分支（:1333-1341/:1465-1472）")
