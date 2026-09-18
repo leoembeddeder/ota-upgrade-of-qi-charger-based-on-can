@@ -81,7 +81,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 │
 ├── python_tools/                           ← Python 工具集
 │   ├── 1.packaging script/                 ← 打包签名子目录
-│   │   ├── pack_image_slotA_1_1_1.py       ← 裸 bin → XATO 头 .ota.bin
+│   │   ├── pack_image.py                    ← 裸 bin → XATO 头 .ota.bin
 │   │   ├── merge_prod_bin.py               ← Boot + APP 合并产线镜像
 │   │   ├── verify_image.py                 ← 镜像完整性 + 签名校验
 │   │   └── sign_seed.py                    ← SecurityAccess seed 签名
@@ -138,7 +138,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 cd "python_tools/1.packaging script"
 
 # 1. 打包 APP 镜像（加 XATO 头 + CRC32 + ECDSA 签名）
-python pack_image_slotA_1_1_1.py
+python pack_image.py
 
 # 2. 合并 Boot + APP
 python merge_prod_bin.py
@@ -157,7 +157,7 @@ python merge_prod_bin.py
 
 | 脚本 | 功能 |
 |------|------|
-| `pack_image_slotA_1_1_1.py` | 裸 bin → XATO 头 .ota.bin (CRC32 + ECDSA P-256) |
+| `pack_image.py` | 裸 bin → XATO 头 .ota.bin (CRC32 + ECDSA P-256) |
 | `merge_prod_bin.py` | Bootloader + Slot A 合并为单文件产线镜像 |
 | `verify_image.py` | 校验 XATO 镜像完整性 + 签名 |
 | `sign_seed.py` | SecurityAccess seed 签名生成 (ECDSA P-256) |
@@ -203,7 +203,7 @@ python merge_prod_bin.py
 | 2026-09-18 | **打包产物 XATO 镜像头不再携带版本号**：头 version 区（0x4C，16B）打包固定填 `0x00`；删打包脚本 `IMAGE_VERSION` 常量及 pack/verify/OTA/relocate 全链路对头 version 字段的写入/解析/日志；固件删 `ota_get_image_version()`（Boot/APP 校验均不依赖该字段）；版本号唯一定义在固件 `SW_VERSION_STR`，发版只改固件常量 + 文档；头总长 256B/magic/长度/CRC/签名偏移全部不变，旧 bin 兼容 |
 | 2026-09-18 | **软件版本读取源改造**：DID 0xF195 应答改取 APP 编译常量 `SW_VERSION_STR`（`can_protocol.c` 唯一真相源），不再读 OTA metadata / XATO 镜像头；镜像头 version 字段保留镜像标识/打包校验用途；`zcanpro_ext_ota_auto.py` 复位确认增加 0xF195 编译版本日志 |
 | 2026-09-17 | 删除冗余 `qi_wireless_code_slotB/` 源码工程（固件位置无关，一份 bin 可跑 A/B 槽）；仓库治理：新增 `.gitattributes` 换行符规范化、移除误跟踪构建产物 |
-| 2026-09-17 | APP 版本号回正为 QC_JYF_FW_1.1.1（与打包脚本 `IMAGE_VERSION` 一致） |
+| 2026-09-17 | APP 版本号回正为 QC_JYF_FW_1.1.1（与当时打包脚本的 `IMAGE_VERSION` 常量一致；该常量已于 2026-09-18 删除，镜像头不再携带版本号） |
 | 2026-09-17 | APP 版本号升至 QC_JYF_FW_1.1.2（固件 `SW_VERSION_STR` + 打包脚本 `IMAGE_VERSION` + 版本读取脚本三处同步） |
 | 2026-09-17 | APP 版本号回退至 QC_JYF_FW_1.1.1（固件 + 脚本 + 文档同步，1.1.2 未发布即回退） |
 | 2026-09-17 | 全部文档对齐 OTA 架构反转（Boot 16KB / Slot 48KB / 地址上移） |

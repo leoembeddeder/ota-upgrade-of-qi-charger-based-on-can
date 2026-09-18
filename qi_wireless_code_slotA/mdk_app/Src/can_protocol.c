@@ -153,7 +153,8 @@ static uint8_t  g_lp_need_online = 0;
 /** after CAN online, spin-poll RX so host hardware retransmit of 10 01 can be ACKed */
 #define CAN_LP_RX_HARVEST_MS      30U
 
-/** 180 s with no UDS RX/TX → SIT1145 Standby (ISO 11898-2 WUP can wake) */
+/** 180 s with no UDS RX/TX → SIT1145 Standby (ISO 11898-2 WUP can wake)
+ *  受 CAN_LP_STANDBY_ENABLE 总开关控制：开关=0 时该超时路径整段不编译 */
 #define CAN_LP_IDLE_TIMEOUT_MS  (180UL * 1000UL)
 
 static void can_lp_mark_uds(void)
@@ -344,6 +345,10 @@ static void can_lp_enter_normal(void)
   }
 }
 
+/* Standby 进入函数：受 CAN_LP_STANDBY_ENABLE 总开关控制（can_protocol.h）。
+ * 开关=0（回归调试期临时禁用）时不编译，源码完整保留，唤醒/恢复路径不受影响；
+ * 生产恢复改 1 后本段与历史实现逐字节一致。 */
+#if (CAN_LP_STANDBY_ENABLE != 0U)
 static void can_lp_hold_standby(void)
 {
   /* 先关 MCU CAN、再切收发器 Standby，最后才改 GPIO。
@@ -369,6 +374,7 @@ static void can_lp_enter_standby(void)
   }
   can_lp_hold_standby();
 }
+#endif /* CAN_LP_STANDBY_ENABLE */
 
 /* ========================================================================== */
 /*  Private helper functions                                                 */
@@ -1894,16 +1900,26 @@ void can_protocol_init(void)
   /* load persistent Qi config from NVM (nvm_drv_init already called in main) */
   qi_nvm_load_config();
 
-  /* sit1145_init() 已进 Standby。OTA trial 必须在 SysTick 中断起来后再 enter_normal
-   * （harvest / sit1145_wait_cts / wait_tx_idle 都看 timer_get_tick）。其余上电保持 Standby。 */
+  /* CAN_LP_STANDBY_ENABLE=1：sit1145_init() 已进 Standby。OTA trial 必须在
+   * SysTick 中断起来后再 enter_normal（harvest / sit1145_wait_cts / wait_tx_idle
+   * 都看 timer_get_tick）。其余上电保持 Standby。
+   * CAN_LP_STANDBY_ENABLE=0（回归调试期临时禁用）：上电/复位一律不进 Standby，
+   * 与 trial 同路径置 g_lp_need_online，首次 can_protocol_poll 统一延时
+   * can_lp_enter_normal（SysTick 已就绪），CAN 常在线；trial confirm 流程
+   * 本就要求 CAN 在线，行为只会更可靠，流程本身不受影响。 */
   if (can_lp_trial_needs_normal() != 0U)
   {
     g_lp_need_online = 1U;
   }
   else
   {
+#if (CAN_LP_STANDBY_ENABLE != 0U)
     g_lp_need_online = 0U;
     can_lp_hold_standby();
+#else
+    /* 临时禁用：非 trial 上电同样延时 enter_normal，保持 CAN 在线 */
+    g_lp_need_online = 1U;
+#endif
   }
 }
 
@@ -2061,7 +2077,7 @@ void can_protocol_poll(void)
     }
   }
 
-#if (CAN_LP_IDLE_TIMEOUT_MS > 0U)
+#if (CAN_LP_STANDBY_ENABLE != 0U) && (CAN_LP_IDLE_TIMEOUT_MS > 0U)
   if ((now - g_uds_last_ms) >= CAN_LP_IDLE_TIMEOUT_MS)
   {
     can_lp_enter_standby();

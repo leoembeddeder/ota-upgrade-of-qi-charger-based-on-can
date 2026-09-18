@@ -46,6 +46,23 @@ extern "C" {
 #define CAN_ID_LIFECYCLE_BROADCAST   0x18FF260DU
 
 /* ========================================================================== */
+/*  CAN low-power (Standby) compile switch                                    */
+/* ========================================================================== */
+
+/**
+ * @brief  SIT1145 Standby 进入总开关（编译期单一开关，回归调试期临时禁用）
+ * @note   临时禁用：回归调试期设备保持 CAN 常在线；生产恢复改 1。
+ *         =1：与既有行为一致——空闲 CAN_LP_IDLE_TIMEOUT_MS 进 Standby，
+ *             非 trial/rollback 上电保持 Standby（can_lp_hold_standby）。
+ *         =0：所有进入 Standby 的入口关闭（上电/复位分支、空闲超时、
+ *             sit1145_init 步骤10），唤醒/恢复代码全部保留不删，
+ *             仅不再触发进入；改回 1 后行为与历史完全一致。
+ *         受控调用点：can_lp_hold_standby / can_lp_enter_standby 定义与
+ *         调用点、sit1145.c sit1145_init() 步骤10（sit1145_standby_mode_set）。
+ */
+#define CAN_LP_STANDBY_ENABLE        0
+
+/* ========================================================================== */
 /*  UDS service identifiers                                                  */
 /* ========================================================================== */
 

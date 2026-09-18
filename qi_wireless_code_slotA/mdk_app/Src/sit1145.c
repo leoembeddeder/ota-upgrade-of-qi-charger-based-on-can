@@ -31,6 +31,7 @@
 /* 头文件 ------------------------------------------------------------------*/
 #include "sit1145.h"
 #include "timer_drv.h"
+#include "can_protocol.h"   /* CAN_LP_STANDBY_ENABLE：Standby 进入总开关 */
 
 /* ==========================================================================
  *  私有宏定义
@@ -1082,7 +1083,12 @@ uint8_t sit1145_init(void)
 
   /* ---- 步骤10：进入 Standby 模式（APP 低功耗默认状态）----
    *   Standby 下 SPI 仍可访问，CAN 总线被动监听
-   *   失败时重试一次 */
+   *   失败时重试一次
+   *   CAN_LP_STANDBY_ENABLE=0（回归调试期临时禁用）时跳过：收发器不进
+   *   Standby，随后 can_protocol_init → 首次 poll 的 can_lp_enter_normal
+   *   会兜底 sit1145_normal_mode_set + can_driver_online，CAN 常在线。
+   *   宏未定义时保持进入 Standby（生产语义，防误配）。 */
+#if !defined(CAN_LP_STANDBY_ENABLE) || (CAN_LP_STANDBY_ENABLE != 0U)
   if (sit1145_standby_mode_set() == 0U)
   {
     sit1145_delay_ms(1U);
@@ -1091,6 +1097,7 @@ uint8_t sit1145_init(void)
       return 0;  /* 两次都失败 */
     }
   }
+#endif /* CAN_LP_STANDBY_ENABLE */
 
   return 1;  /* 初始化成功 */
 }

@@ -75,7 +75,7 @@ def _pick_firmware():
         if os.path.isfile(path):
             _log("固件 " + path)
             return path
-    raise RuntimeError("找不到固件。请编 Slot A 或运行 pack_image_slotA_1_1_1.py")
+    raise RuntimeError("找不到固件。请编 Slot A 或运行 pack_image.py")
 
 FIRMWARE_PATH = ""
 DOWNLOAD_ADDR = 0x08004000
