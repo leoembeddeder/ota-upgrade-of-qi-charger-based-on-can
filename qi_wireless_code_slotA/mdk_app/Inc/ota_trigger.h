@@ -90,7 +90,7 @@ typedef struct
   uint32_t image_length;       /*!< firmware size excluding this header */
   uint32_t crc32;              /*!< CRC32 of firmware (excluding header) */
   uint8_t  signature[64];      /*!< ECDSA P-256 R||S */
-  char     version[16];        /*!< 保留：打包固定填 0x00，不携带版本号 */
+  uint8_t  hdr_reserved_ver[16]; /*!< 原 version 字段，已废弃保留占位，偏移锁定不可回收（打包固定填 0x00） */
   uint32_t build_timestamp;    /*!< Unix timestamp */
   uint8_t  reserved[160];      /*!< pad to 256 bytes */
 } ota_image_header_t;
@@ -170,9 +170,10 @@ uint8_t ota_running_slot(void);
  */
 uint32_t ota_running_slot_base(void);
 
-/* 2026-09-18：ota_get_image_version() 已删除（镜像头 version 区打包固定
-   0x00，不携带版本号；DID 0xF195 取 can_protocol.c 的 SW_VERSION_STR）。
-   version[16] 字段在 ota_image_header_t 中保留占位，头布局/偏移不变。*/
+/* 2026-09-18：ota_get_image_version() 已删除（DID 0xF195 取 can_protocol.c
+   的 SW_VERSION_STR）。image_header_t/ota_image_header_t 的 version[16]
+   字段声明已删除，0x4C 区改为 hdr_reserved_ver[16] 保留占位（打包固定填
+   0x00，偏移锁定不可回收），头总长 256B 与其余字段偏移逐字节不变。*/
 
 #ifdef __cplusplus
 }

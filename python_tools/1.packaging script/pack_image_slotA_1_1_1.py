@@ -4,7 +4,8 @@
 只编一份 Slot A（IROM1=0x08004100）。OTA 写入 B 时由 zcanpro_ext_ota_auto.py 重定位。
 产线：merge_prod_bin.py 把本输出烧到 0x08004000。
 
-镜像头 version 区（0x4C，16B）固定填 0x00，打包产物不携带版本号；
+镜像头 0x4C 起 16B 为保留占位（原 version 字段已从 image_header_t 定义删除，
+打包固定填 0x00，偏移锁定不可回收），打包产物不携带版本号；
 版本号唯一定义在固件 SW_VERSION_STR（can_protocol.c），发版只改固件常量 + 文档。
 """
 
@@ -57,14 +58,14 @@ def pack_one(bin_path, priv):
     print("输出: %s" % os.path.abspath(out_path))
     print("总长: %d  (头 %d + 固件 %d)" % (len(image), IMAGE_HEADER_SIZE, len(image) - IMAGE_HEADER_SIZE))
     print("链接: Slot %s  → 产线烧录地址 %s" % (slot_name(linked), burn_addr))
-    print("版本号不在镜像头（version 区固定 0x00），见固件 SW_VERSION_STR")
+    print("版本号不在镜像头（0x4C 为保留占位区，原 version 字段已删除，固定填 0x00），见固件 SW_VERSION_STR")
     print("")
     return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Pack Keil APP .bin with XATO header (CRC32 + ECDSA P-256); 镜像头不携带版本号"
+        description="Pack Keil APP .bin with XATO header (CRC32 + ECDSA P-256); 镜像头不携带版本号（0x4C 为保留占位区，原 version 字段已删除）"
     )
     parser.add_argument("--bin", default=DEFAULT_BIN_A, help="Slot A Keil bin（IROM1=0x08004100）")
     parser.add_argument("--key", default=DEFAULT_KEY, help="ECDSA P-256 私钥 PEM（须与 Bootloader 公钥成对）")
@@ -89,7 +90,7 @@ def main(argv=None):
         print("输出: %s" % os.path.abspath(args.out))
         print("总长: %d  (头 %d + 固件 %d)" % (len(image), IMAGE_HEADER_SIZE, len(image) - IMAGE_HEADER_SIZE))
         print("链接: Slot %s  → 产线烧录地址 %s" % (slot_name(linked), burn_addr))
-        print("版本号不在镜像头（version 区固定 0x00），见固件 SW_VERSION_STR")
+        print("版本号不在镜像头（0x4C 为保留占位区，原 version 字段已删除，固定填 0x00），见固件 SW_VERSION_STR")
         return 0
     return pack_one(args.bin, priv)
 

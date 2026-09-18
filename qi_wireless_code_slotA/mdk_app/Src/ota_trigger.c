@@ -248,11 +248,12 @@ uint8_t ota_running_slot(void)
   return OTA_SLOT_A;
 }
 
-/* 2026-09-18：ota_get_image_version() 已删除——XATO 镜像头 version 区打包
-   固定填 0x00，不携带版本号（版本号唯一真相源=can_protocol.c 的
-   SW_VERSION_STR 编译常量，DID 0xF195 直接取该常量）。51e52cf 改造后本
-   函数已无调用者，镜像头中亦不再存在可读的版本字节。头布局不变，
-   ota_image_header_t.version[16] 字段保留占位以维持 256B 布局与偏移。*/
+/* 2026-09-18：ota_get_image_version() 已删除——镜像头不再携带版本号
+   （版本号唯一真相源=can_protocol.c 的 SW_VERSION_STR 编译常量，DID 0xF195
+   直接取该常量）。51e52cf 改造后本函数已无调用者；后续改造又将
+   image_header_t/ota_image_header_t 的 version[16] 字段声明删除，0x4C 区
+   改为 hdr_reserved_ver[16] 保留占位（固定填 0x00，偏移锁定不可回收）。
+   头总长 256B 与其余字段偏移逐字节不变，无任何代码引用该区域。*/
 
 #define TRIAL_HEALTH_DELAY_MS   100U
 

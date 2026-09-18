@@ -4,8 +4,8 @@ ZCANPRO 脚本 — 读取 APP 侧版本号 DID 0xF195 / 0xF180 / 0xF193
 
 版本数据源（2026-09-18 改造）：
   DID 0xF195 应答 = APP 固件编译时常量 SW_VERSION_STR（can_protocol.c），
-  不读 OTA metadata / XATO 镜像头（镜像头 version 区打包固定 0x00，
-  不携带版本号）。应答格式不变：32 字节 ASCII 右补空格。
+  不读 OTA metadata / XATO 镜像头（镜像头 0x4C 区为保留占位，原 version
+  字段已从结构定义删除，打包固定填 0x00）。应答格式不变：32 字节 ASCII 右补空格。
   本脚本期望值必须与固件编译常量一致。
 
 流程：

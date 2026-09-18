@@ -76,10 +76,10 @@ def verify_crc32(header, firmware):
     return True, "CRC32 正确: 0x{:08X}".format(stored_crc)
 
 
-# 镜像头 version 区（0x4C..0x5C，16B）自 2026-09-18 起打包固定 0x00，
-# 不携带版本号（版本号唯一定义在固件 SW_VERSION_STR）。校验忽略该字段：
-# CRC32 只覆盖头后 payload、ECDSA 签名只签 payload，version 区不在任何
-# 校验范围内，历史镜像中残留的版本字节同样不影响校验结果。
+# 0x4C..0x5C（16B）为保留占位区：原 version 字段已从 image_header_t 定义
+# 删除（2026-09-18），打包固定填 0x00（版本号唯一定义在固件 SW_VERSION_STR）。
+# 校验忽略该区：CRC32 只覆盖头后 payload、ECDSA 签名只签 payload，保留占位
+# 区不在任何校验范围内，历史镜像中该区的残留字节同样不影响校验结果。
 
 
 def verify_build_timestamp(header):

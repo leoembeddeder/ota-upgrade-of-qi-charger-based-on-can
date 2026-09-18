@@ -77,7 +77,7 @@ typedef struct
   uint32_t image_length;       /*!< valid image size in bytes (excluding header) */
   uint32_t crc32;              /*!< CRC32 of image data (excluding header) */
   uint8_t  signature[64];      /*!< ECDSA P-256 IEEE P1363 R||S */
-  char     version[16];        /*!< 保留：打包固定填 0x00，不携带版本号 */
+  uint8_t  hdr_reserved_ver[16]; /*!< 原 version 字段，已废弃保留占位，偏移锁定不可回收（打包固定填 0x00） */
   uint32_t build_timestamp;    /*!< Unix timestamp of build */
   uint8_t  reserved[160];      /*!< padding to 256 bytes */
 } image_header_t;
