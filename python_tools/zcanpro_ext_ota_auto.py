@@ -111,17 +111,27 @@ LIFE_ANNOUNCE_MAGIC = (0x01, 0x41, 0x57, 0x4B)  # 01 'A' 'W' 'K'
 LIFE_BOOTUP_MAGIC = (0x01, 0x41, 0x00)  # 01 'A' 00 — 上电/Boot 跳转标识帧
 PROBE_ROUNDS = 3
 
-# ---- Boot safe mode 诊断标记帧（与 qi_wireless_bootloader/mdk_app/Src/
+# ---- Boot safe mode 诊断帧（与 qi_wireless_bootloader/mdk_app/Src/
 # ---- boot_safe_mode.c 头部注释严格一致，两侧勿改其一）----
 # 探测请求: CAN ID 0x18DA0D03 (UDS_REQ_ID)，数据 22 21 13
-#           固件兼容 ISO-TP SF（03 22 21 13 ...）与裸 UDS（22 21 13）
-# Boot safe mode 应答: CAN ID 0x18DA030D (UDS_RESP_ID)，5 字节原始单帧
-#           （非 ISO-TP、无 PCI 字节，仅此一帧）:
-#               62 21 13 FE <fail_step>
+#           固件 RX 为自实现兼容解析（不依赖 ISO-TP 协议栈），兼容
+#           ISO-TP SF（03 22 21 13 ...）与裸 UDS（22 21 13）两种写法
+# Boot 应答（现行固件 boot_safe_mode.c safe_send_sf ISO-TP SF 组帧）:
+#   22 2113 → CAN ID 0x18DA030D (UDS_RESP_ID) ISO-TP 单帧，DLC=8:
+#               05 62 21 13 FE <fail_step> CC CC（尾部 0xCC 填充）
+#   3E（sub bit7 suppress 位为 0）→ 同 ID ISO-TP 单帧
+#               02 7E <子功能低 7 位>；suppress 位为 1 不应答
+#   其他 22 DID → NRC 7F 22 11（ISO-TP 单帧）
+# 心跳: 每 500ms 在 0x18FF260D (LIFE_ANNOUNCE_ID) 发
+#           01 41 42 54 cause fail_step A5 00（'ABT' 标记帧），并同周期
+#           重切 SIT1145 收发器 Normal（boot_safe_mode.c enter_safe_mode）
+# 主机侧解析: 本文件 _safe_mode_step —— 双格式兼容：历史裸帧
+#           62 21 13 FE <fail_step> + 现行 ISO-TP SF
+#           05 62 21 13 FE <fail_step>
 # fail_step 语义提取自 boot_verify.c g_verify_fail_step（1~6 为镜像校验
 # 步骤，0 为 select_boot_slot 无有效槽/未执行校验）。
 SAFE_MODE_RESP_ID = UDS_RESP_ID          # 0x18DA030D
-SAFE_MODE_MARKER = (0x62, 0x21, 0x13, 0xFE)
+SAFE_MODE_MARKER = (0x62, 0x21, 0x13, 0xFE)  # UDS 载荷标记（不含 ISO-TP PCI）
 FAIL_STEP_DESC = {
     0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
     1: "镜像 magic 校验失败",
@@ -541,8 +551,10 @@ def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
             _log("[Rx] " + _hex(data[:24]))
             sm_step = _safe_mode_step(data)
             if sm_step is not None:
-                # 库若把 Boot safe mode 标记帧当响应数据透传（62 21 13 FE <step>），
-                # 立即按 safe mode 报错，不得误判为 APP DID 0x2113 正响应。
+                # 库若把 Boot safe mode 应答帧当响应数据透传（历史裸帧
+                # 62 21 13 FE <step> 或 ISO-TP SF 05 62 21 13 FE <step>，
+                # _safe_mode_step 双格式识别），立即按 safe mode 报错，
+                # 不得误判为 APP DID 0x2113 正响应。
                 raise SafeModeError(sm_step)
         if len(data) >= 3 and data[0] == SID_NRC:
             if data[2] == NRC_RCRRP:
@@ -765,9 +777,10 @@ def confirm_app_after_reset(bus_id):
     a) UDS 响应 = 成功；
     b) 生命周期帧但无 UDS = APP 已启动但链路/会话异常；
     c) 全静默 = 可能停在 Boot safe mode 或镜像问题：raw 探测 22 2113 识别
-       标记帧 62 21 13 FE <fail_step>（命中→SafeModeError 精确报错），
-       未命中提示 merge_prod_bin。标记帧格式与 fail_step 语义见文件头
-       SAFE_MODE 注释（与 boot_safe_mode.c 两侧一致）。
+       safe mode 应答（_safe_mode_step 双格式识别，命中→SafeModeError
+       精确报错），未命中提示 merge_prod_bin。应答帧格式（现行 ISO-TP SF
+       05 62 21 13 FE <fail_step>）与 fail_step 语义见文件头 SAFE_MODE
+       注释（与 boot_safe_mode.c 两侧一致）。
     """
     WINDOW_S = 45.0
     BLIND_PROBES = 3
@@ -984,9 +997,11 @@ def _raw_send(bus_id, can_id, data):
 
 def _raw_probe_safe_mode(bus_id, sniff_s=2.0):
     """失败路径取证：raw 发 22 2113 探测帧（ISO-TP SF）后监听 Boot safe
-    mode 标记帧 62 21 13 FE <fail_step>（5 字节原始单帧，非 ISO-TP）。
-    返回 fail_step（int）或 None；finally 恢复 UDS 通道。
-    标记帧仅在设备收到探测帧时应答一次，库路径可能吞掉，故须 raw 重探。"""
+    mode 应答：现行固件为 ISO-TP 单帧 05 62 21 13 FE <fail_step>
+    （DLC=8，0xCC 填充）；_safe_mode_step 双格式兼容历史裸帧
+    62 21 13 FE <fail_step>。返回 fail_step（int）或 None；finally 恢复
+    UDS 通道。应答仅在设备收到探测帧时发一次，库路径可能吞掉，故须 raw
+    重探。"""
     step = None
     try:
         zcanpro.uds_deinit()

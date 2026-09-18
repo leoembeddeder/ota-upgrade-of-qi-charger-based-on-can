@@ -9,16 +9,30 @@
   * Empty chip / both slots invalid: stay here and report why via CAN.
   * Factory image: merge_prod_bin.py from 0x08000000.
   *
-  * ---- safe mode 诊断标记帧格式（与 python_tools/zcanpro_ext_ota_auto.py
+  * ---- safe mode 诊断帧格式（与 python_tools/zcanpro_ext_ota_auto.py
   * ---- 头部 SAFE_MODE 注释严格一致，两侧勿改其一）----
   *
   *   探测请求: CAN ID 0x18DA0D03 (CAN_ID_UDS_REQUEST)
-  *             数据 22 21 13 —— 兼容 ISO-TP SF (03 22 21 13 ...) 与裸
-  *             UDS (22 21 13 ...) 两种写法
-  *   Boot 应答: CAN ID 0x18DA030D (CAN_ID_UDS_RESPONSE)
-  *             5 字节原始单帧，非 ISO-TP、无 PCI 字节，仅此一帧:
+  *             数据 22 21 13 —— RX 为自实现兼容解析（不依赖 ISO-TP
+  *             协议栈，见下方 enter_safe_mode 接收循环），兼容 ISO-TP SF
+  *             (03 22 21 13 ...) 与裸 UDS (22 21 13 ...) 两种写法
+  *   22 2113 应答: CAN ID 0x18DA030D (CAN_ID_UDS_RESPONSE)
+  *             ISO-TP 单帧，DLC=8（safe_send_sf 组帧，尾部 0xCC 填充）:
   *
-  *             62 21 13 FE <fail_step>
+  *             05 62 21 13 FE <fail_step> CC CC
+  *
+  *             PCI=0x05 表示单帧载荷 5 字节。主机侧解析在
+  *             python_tools/zcanpro_ext_ota_auto.py _safe_mode_step，
+  *             双格式兼容：历史裸帧 62 21 13 FE <fail_step> + 现行
+  *             ISO-TP SF 05 62 21 13 FE <fail_step>
+  *   3E 应答: suppress 位（sub bit7）为 0 时回 ISO-TP 单帧
+  *             02 7E <子功能低 7 位>（同 0x18DA030D）；suppress 位
+  *             为 1 不应答
+  *   其他 22 DID: 回 NRC ISO-TP 单帧 7F 22 11（servicesNotSupported）
+  *   心跳: 每 500ms 在 CAN ID 0x18FF260D (CAN_ID_LIFECYCLE_BROADCAST)
+  *             发 01 41 42 54 cause fail_step A5 00（'ABT' 标记帧），
+  *             并同周期重切 SIT1145 收发器 Normal
+  *             （sit1145_normal_mode_set，见 enter_safe_mode 主循环）
   *
   *   fail_step 语义（提取自 boot_verify.c g_verify_fail_step）:
   *     0 = 未执行镜像校验 / select_boot_slot 无有效槽
