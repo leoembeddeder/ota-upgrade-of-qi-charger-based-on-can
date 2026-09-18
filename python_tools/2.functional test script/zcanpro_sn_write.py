@@ -53,6 +53,7 @@ SID_SA  = 0x27
 SID_WDBI = 0x2E
 SID_RDBI = 0x22   # 运行侧探测：22 2113
 SID_RD   = 0x34   # 运行侧探测：仅 APP 实现，Boot 不应答
+SID_TP   = 0x3E   # TesterPresent：wake_bus 唤醒 burst（3E 80 suppress）；对齐 charge_start.py:64
 SID_NRC  = 0x7F
 SID_PR   = 0x40
 
