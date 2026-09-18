@@ -73,9 +73,10 @@ def _pad8(data):
 
 def _uds_init():
     zcanpro.uds_init({
-        "response_timeout_ms": 2000, "use_canfd": 0, "canfd_brs": 0,
+        "src_addr": UDS_REQ_ID, "dst_addr": UDS_RESP_ID,
+        "response_timeout_ms": 3000, "use_canfd": 0, "canfd_brs": 0,
         "trans_ver": 0, "fill_byte": 0xCC, "frame_type": 1,
-        "trans_stmin_valid": 1, "trans_stmin": 10, "enhanced_timeout_ms": 8000,
+        "trans_stmin_valid": 1, "trans_stmin": 1, "enhanced_timeout_ms": 8000,
     })
 
 
@@ -272,13 +273,16 @@ def isotp_raw_request(bus_id, sid, payload, timeout_s=2.5):
         saw, ",".join("%d" % k for k in sorted(cfs.keys())) or "无"))
 
 
-def uds_req(bus_id, sid, payload, timeout_note=""):
+def uds_req(bus_id, sid, payload, timeout_note="", suppress=0):
     req = {
         "src_addr": UDS_REQ_ID, "dst_addr": UDS_RESP_ID,
-        "suppress_response": 0, "sid": sid, "data": list(payload),
+        "suppress_response": 1 if suppress else 0,
+        "sid": sid, "data": list(payload),
     }
-    _log("[Tx uds] %02X %s" % (sid, _hex(payload)))
+    _log("[Tx uds] %02X %s%s" % (sid, _hex(payload), " (suppress)" if suppress else ""))
     resp = zcanpro.uds_request(bus_id, req)
+    if suppress:
+        return None
     data = list((resp or {}).get("data") or [])
     if data:
         _log("[Rx uds] %s" % _hex(data[:40]))
@@ -299,44 +303,33 @@ def parse_did_string(did, rx):
 
 
 def wake_mcu(bus_id):
-    """3E 00 是单帧正响应，可唤醒 Standby。第一帧可能被当 WUP 吃掉。"""
+    """Standby 下首帧只当 WUP。用 3E 80（不需正响应）连发，再用 22 2113 探活。
+    不要用 3E 00 空等 2s：唤醒失败会误判 MCU 死掉，随后 deinit+raw 收 (1,[])。"""
     _uds_init()
-    ok = False
-    for i in range(1, 4):
+    for _ in range(3):
         if stopTask:
             raise RuntimeError("用户停止")
         try:
-            rx = uds_req(bus_id, SID_TP, [0x00], timeout_note=" (唤醒第%d次)" % i)
-            if rx and rx[0] == (SID_TP + SID_PR):
-                _log("MCU 已在线 (7E)")
-                ok = True
-                break
-        except Exception as e:
-            _log("唤醒 %d/3: %s" % (i, e))
-            time.sleep(0.15)
-    return ok
+            uds_req(bus_id, SID_TP, [0x80], suppress=1)
+        except Exception:
+            pass
+        time.sleep(0.15)
+    time.sleep(0.35)
+    try:
+        rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
+        slot = rx[3] if rx and len(rx) >= 4 else None
+        _log("MCU 在线 (22 2113 slot=%s)" % (("%02X" % slot) if slot is not None else "?"))
+        return True
+    except Exception as e:
+        _log("22 2113 无应答: %s" % e)
+        _log("MCU 未在 APP 或 CAN 未起来（Boot 无 UDS / bus-off）。请断电重启后再读。")
+        return False
 
 
 def read_did_string(bus_id, did):
     payload = [(did >> 8) & 0xFF, did & 0xFF]
-    last = []
-    # 先原始扩展帧组包：uds_request 会自己发 FC STmin=0，CF 乱序后直接超时，
-    # 且把 MCU 那一轮多帧吃掉，后面 raw 再发已晚。
-    try:
-        rx = isotp_raw_request(bus_id, SID_RDBI, payload)
-        return parse_did_string(did, rx)
-    except Exception as e:
-        last.append("raw=" + str(e))
-        _log("原始组帧失败，改试 uds_request: " + str(e))
-    _uds_init()
-    try:
-        rx = uds_req(bus_id, SID_RDBI, payload)
-        return parse_did_string(did, rx)
-    except Exception as e:
-        last.append("uds=" + str(e))
-        raise RuntimeError(" ; ".join(last))
-    finally:
-        _uds_deinit()
+    rx = uds_req(bus_id, SID_RDBI, payload)
+    return parse_did_string(did, rx)
 
 
 def run(bus_id):
@@ -346,10 +339,8 @@ def run(bus_id):
     _log("zcanpro API: " + ", ".join(names))
     _log("")
 
-    wake_mcu(bus_id)
-    time.sleep(0.05)
-    _uds_deinit()
-    _log("UDS 已释放，改原始扩展帧读 DID（CAN 视图应变为 18da0d03x）")
+    if not wake_mcu(bus_id):
+        return
 
     results = []
     for did, name, expected in DID_LIST:
