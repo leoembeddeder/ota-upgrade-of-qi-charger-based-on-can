@@ -105,6 +105,27 @@ LIFE_ANNOUNCE_MAGIC = (0x01, 0x41, 0x57, 0x4B)  # 01 'A' 'W' 'K'
 LIFE_BOOTUP_MAGIC = (0x01, 0x41, 0x00)  # 01 'A' 00 — 上电/Boot 跳转标识帧
 PROBE_ROUNDS = 3
 
+# ---- Boot safe mode 诊断标记帧（与 qi_wireless_bootloader/mdk_app/Src/
+# ---- boot_safe_mode.c 头部注释严格一致，两侧勿改其一）----
+# 探测请求: CAN ID 0x18DA0D03 (UDS_REQ_ID)，数据 22 21 13
+#           固件兼容 ISO-TP SF（03 22 21 13 ...）与裸 UDS（22 21 13）
+# Boot safe mode 应答: CAN ID 0x18DA030D (UDS_RESP_ID)，5 字节原始单帧
+#           （非 ISO-TP、无 PCI 字节，仅此一帧）:
+#               62 21 13 FE <fail_step>
+# fail_step 语义提取自 boot_verify.c g_verify_fail_step（1~6 为镜像校验
+# 步骤，0 为 select_boot_slot 无有效槽/未执行校验）。
+SAFE_MODE_RESP_ID = UDS_RESP_ID          # 0x18DA030D
+SAFE_MODE_MARKER = (0x62, 0x21, 0x13, 0xFE)
+FAIL_STEP_DESC = {
+    0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
+    1: "镜像 magic 校验失败",
+    2: "image_length 为 0 或超出槽范围",
+    3: "镜像 CRC32 校验失败",
+    4: "Reset handler 不在槽内（跨槽链接镜像）",
+    5: "ECDSA 公钥缺失/无效（Device Info 与内置公钥均不可用）",
+    6: "ECDSA P-256 验签失败",
+}
+
 # secp256r1 / prime256v1. n 必须与 bootloader uECC.c 的 N[] 一致。
 _P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
 _N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
@@ -120,6 +141,27 @@ class UdsNrcError(RuntimeError):
         RuntimeError.__init__(self, "NRC SID=0x%02X NRC=0x%02X" % (sid, nrc))
         self.sid = sid
         self.nrc = nrc
+
+
+def _safe_mode_step(dat):
+    """识别 Boot safe mode 标记帧 62 21 13 FE <fail_step>，返回 step 或 None。"""
+    if (len(dat) >= 5 and dat[0] == 0x62 and dat[1] == 0x21
+            and dat[2] == 0x13 and dat[3] == 0xFE):
+        return int(dat[4])
+    return None
+
+
+def _safe_mode_msg(step):
+    desc = FAIL_STEP_DESC.get(step, "未知 fail_step（Boot 固件可能早于本标记帧版本）")
+    return ("设备处于 Boot safe mode，fail_step=%d（%s）→ merge_prod_bin 烧录器重刷"
+            % (step, desc))
+
+
+class SafeModeError(RuntimeError):
+    """Boot safe mode 标记帧命中：设备停在 Boot，需 merge_prod_bin 重刷。"""
+    def __init__(self, step):
+        RuntimeError.__init__(self, _safe_mode_msg(step))
+        self.step = step
 
 
 def z_notify(type, obj):
@@ -484,6 +526,11 @@ def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
         data = list((resp or {}).get("data") or [])
         if data:
             _log("[Rx] " + _hex(data[:24]))
+            sm_step = _safe_mode_step(data)
+            if sm_step is not None:
+                # 库若把 Boot safe mode 标记帧当响应数据透传（62 21 13 FE <step>），
+                # 立即按 safe mode 报错，不得误判为 APP DID 0x2113 正响应。
+                raise SafeModeError(sm_step)
         if len(data) >= 3 and data[0] == SID_NRC:
             if data[2] == NRC_RCRRP:
                 if wait_pending_s <= 0 or time.time() >= t_end:
@@ -680,7 +727,11 @@ def _erase_with_retry(bus_id):
             if probe:
                 alive = "应答正常（%s），设备存活" % _hex(probe[:8])
             else:
-                alive = "无应答（MCU 疑似挂死或 CAN TX 黑洞）"
+                sm_step = _raw_probe_safe_mode(bus_id)
+                if sm_step is not None:
+                    alive = _safe_mode_msg(sm_step)
+                else:
+                    alive = "无应答（MCU 疑似挂死或 CAN TX 黑洞）"
             raise RuntimeError(
                 "0x31 擦除两次失败：第1次 %.1fs「%s」，第2次 %.1fs「%s」，总计 %.1fs；"
                 "wait_pending 上限 %ds，库 enhanced_timeout 配置 %ds"
@@ -700,7 +751,10 @@ def confirm_app_after_reset(bus_id):
     三态诊断：
     a) UDS 响应 = 成功；
     b) 生命周期帧但无 UDS = APP 已启动但链路/会话异常；
-    c) 全静默 = 可能停在 Boot 或镜像问题，提示 merge_prod_bin。
+    c) 全静默 = 可能停在 Boot safe mode 或镜像问题：raw 探测 22 2113 识别
+       标记帧 62 21 13 FE <fail_step>（命中→SafeModeError 精确报错），
+       未命中提示 merge_prod_bin。标记帧格式与 fail_step 语义见文件头
+       SAFE_MODE 注释（与 boot_safe_mode.c 两侧一致）。
     """
     WINDOW_S = 45.0
     BLIND_PROBES = 3
@@ -724,9 +778,14 @@ def confirm_app_after_reset(bus_id):
                 rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
                 last_err = None
                 break
+            except SafeModeError:
+                raise
             except Exception as e:
                 last_err = e
                 _log("复位后 22 2113 盲探 %d/%d: %s" % (probe_count, BLIND_PROBES, e))
+                sm_step = _raw_probe_safe_mode(bus_id)
+                if sm_step is not None:
+                    raise SafeModeError(sm_step)
                 time.sleep(0.5)
                 continue
 
@@ -741,16 +800,24 @@ def confirm_app_after_reset(bus_id):
             except Exception as e:
                 _log("wake_bus 异常: %s" % e)
             lifecycle_seen.extend(_listen_lifecycle(bus_id, listen_s=1.0))
+            sm_step = _raw_probe_safe_mode(bus_id)
+            if sm_step is not None:
+                raise SafeModeError(sm_step)
 
         # Phase 3: probe + brief lifecycle listen between attempts
         try:
             rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
             last_err = None
             break
+        except SafeModeError:
+            raise
         except Exception as e:
             last_err = e
             _log("复位后 22 2113 等待: %s" % e)
             lifecycle_seen.extend(_listen_lifecycle(bus_id, listen_s=0.5))
+            sm_step = _raw_probe_safe_mode(bus_id)
+            if sm_step is not None:
+                raise SafeModeError(sm_step)
             time.sleep(0.5)
 
     if last_err is not None:
@@ -762,10 +829,14 @@ def confirm_app_after_reset(bus_id):
                 "——链路/会话异常，请检查 CAN 配置或会话状态: %s"
                 % (details, last_err))
         else:
+            sm_step = _raw_probe_safe_mode(bus_id)
+            if sm_step is not None:
+                raise SafeModeError(sm_step)
             raise RuntimeError(
                 "复位后无 UDS 且无生命周期帧（%.0fs 全静默）"
-                "——可能停在 Boot（验签失败/镜像问题），"
-                "请用 merge_prod_bin.py 排查: %s" % (WINDOW_S, last_err))
+                "——可能停在 Boot（验签失败进 safe mode / 镜像问题），"
+                "safe-mode 标记帧也未捕获（旧 Boot 固件无此应答或 CAN 未起）；"
+                "请用 merge_prod_bin.py 重刷排查: %s" % (WINDOW_S, last_err))
 
     _log("复位后 DID 0x2113 slot=" + _hex((rx or [])[3:4]))
     try:
@@ -849,6 +920,72 @@ def _recv_frames(bus_id):
     return out
 
 
+def _raw_send(bus_id, can_id, data):
+    """扩展帧 raw 发送（ZLG bit31=1，参考 zcanpro_read_app_version.py
+    实测模式）。仅用于 safe-mode 取证探测，不进 UDS 请求主路径
+    （qi-can-uds-ota-scripts §3：raw 模式仅限取证/唤醒监听）。"""
+    cid = (int(can_id) & 0x1FFFFFFF) | 0x80000000
+    frame = {
+        "can_id": cid,
+        "id": cid,
+        "is_canfd": 0,
+        "canfd_brs": 0,
+        "is_extend": 1,
+        "is_extended": 1,
+        "extend": 1,
+        "extern_flag": 1,
+        "is_extern": 1,
+        "eff": 1,
+        "id_type": 1,
+        "data": list(data) + [0xCC] * (8 - len(data)),
+    }
+    for name in ("transmit", "send"):
+        fn = getattr(zcanpro, name, None)
+        if fn is None:
+            continue
+        try:
+            fn(bus_id, [frame])
+            return True
+        except Exception:
+            try:
+                fn(bus_id, frame)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def _raw_probe_safe_mode(bus_id, sniff_s=2.0):
+    """失败路径取证：raw 发 22 2113 探测帧（ISO-TP SF）后监听 Boot safe
+    mode 标记帧 62 21 13 FE <fail_step>（5 字节原始单帧，非 ISO-TP）。
+    返回 fail_step（int）或 None；finally 恢复 UDS 通道。
+    标记帧仅在设备收到探测帧时应答一次，库路径可能吞掉，故须 raw 重探。"""
+    step = None
+    try:
+        zcanpro.uds_deinit()
+    except Exception as e:
+        _log("UDS 通道释放失败（继续 safe-mode 取证）: " + str(e))
+    try:
+        if _raw_send(bus_id, UDS_REQ_ID, [0x03, 0x22, 0x21, 0x13,
+                                          0xCC, 0xCC, 0xCC, 0xCC]):
+            _log("[Tx-raw] 0x%08X 03 22 21 13 (safe-mode 探测)" % UDS_REQ_ID)
+        t_end = time.time() + float(sniff_s)
+        while time.time() < t_end:
+            if stopTask:
+                raise RuntimeError("用户停止脚本")
+            for cid, dat in _recv_frames(bus_id):
+                if (cid & 0x1FFFFFFF) == SAFE_MODE_RESP_ID:
+                    step = _safe_mode_step(dat)
+                    if step is not None:
+                        _log("[Rx-raw] 0x%08X %s → Boot safe mode fail_step=%d"
+                             % (cid, _hex(dat[:8]), step))
+                        return step
+            time.sleep(0.02)
+    finally:
+        uds_init()
+    return step
+
+
 def wake_bus(bus_id, listen_s=2.0):
     """SIT1145 空闲 180s 进 Standby：首帧只当 WUP，MCU 收不到内容，
     所以唤醒帧必须连发、且发完要等固件收敛再探测。
@@ -885,26 +1022,57 @@ def wake_bus(bus_id, listen_s=2.0):
 
 
 def probe_in_app(bus_id, retries=PROBE_ROUNDS):
-    """Boot 无 UDS。APP 在线则 22 2113 有应答（正响应或 NRC）。
+    """Boot 无 UDS（safe mode 除外，见下）。APP 在线则 22 2113 有应答
+    （正响应或 NRC）。
 
     不要用 0x34 探测：APP 已实现下载，默认会话回 0x22；且 Standby 下首帧
     只当 WUP，3s 超时后 ident 早已发出，再去听 0x18FF260D 会漏。
-    无应答时连发 3E 80 再立刻重试 2113（MCU 此时应已 Normal）。"""
+    无应答时：① raw 取证探测 Boot safe mode 标记帧（命中→SafeModeError，
+    报错带 fail_step 语义，不再笼统"无应答"）；② 连发 3E 80 再立刻重试
+    2113（MCU 此时应已 Normal）；③ 全部轮次失败后 wake_bus + 生命周期帧
+    监听再判一次（禁止纯裸探循环），唤醒后再探。"""
     for attempt in range(1, retries + 1):
         try:
             rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
             _log("探测 22 2113 成功 slot=%s，当前在 APP" % _hex((rx or [])[3:4]))
             return True
+        except SafeModeError:
+            raise
         except UdsNrcError as e:
             _log("探测 22 2113 NRC 0x%02X，当前在 APP" % e.nrc)
             return True
         except RuntimeError as e:
             _log("探测 22 2113 无应答（第 %d/%d 轮）: %s" % (attempt, retries, e))
+            sm_step = _raw_probe_safe_mode(bus_id)
+            if sm_step is not None:
+                raise SafeModeError(sm_step)
             if attempt < retries:
                 for _ in range(3):
                     uds_try(bus_id, SID_TP, [0x80], suppress=1)
                     time.sleep(0.15)
                 time.sleep(0.4)
+    # 全部轮次无应答：唤醒 + 生命周期帧监听后再判（Standby 首帧只当 WUP）
+    try:
+        wake_ok = wake_bus(bus_id, listen_s=2.0)
+        life = _listen_lifecycle(bus_id, listen_s=1.0)
+        _log("wake_bus=%s，生命周期帧 %d 个" % (wake_ok, len(life)))
+        if wake_ok or life:
+            try:
+                rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
+                _log("唤醒后探测 22 2113 成功 slot=%s，当前在 APP"
+                     % _hex((rx or [])[3:4]))
+                return True
+            except SafeModeError:
+                raise
+            except Exception as e:
+                _log("唤醒后探测 22 2113 仍无应答: %s" % e)
+    except SafeModeError:
+        raise
+    except Exception as e:
+        _log("唤醒/监听异常: %s" % e)
+    sm_step = _raw_probe_safe_mode(bus_id)
+    if sm_step is not None:
+        raise SafeModeError(sm_step)
     return False
 
 

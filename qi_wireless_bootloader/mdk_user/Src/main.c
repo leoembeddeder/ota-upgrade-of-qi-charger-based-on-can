@@ -75,7 +75,8 @@ int main(void)
   /* step 6: PENDING/ACTIVE → trial_slot, else active_slot */
   if (select_boot_slot(&g_meta, &boot_slot) != 0)
   {
-    enter_safe_mode();
+    /* cause 0x01: metadata 无有效 active/trial 槽，镜像校验未执行 */
+    enter_safe_mode(0x01U);
   }
 
   /* trial 10s window is enforced in APP (ota_trial_poll). */
@@ -105,7 +106,9 @@ int main(void)
     boot_jump_to_app(boot_metadata_slot_addr(other_slot) + IMAGE_HEADER_SIZE);
   }
 
-  enter_safe_mode();
+  /* cause 0x02: 双槽镜像校验/向量检查均失败，g_verify_fail_step 现场
+   * 已由 enter_safe_mode 落盘到 reserved 字段并在 CAN 标记帧中上报 */
+  enter_safe_mode(0x02U);
   while (1)
   {
     __NOP();
