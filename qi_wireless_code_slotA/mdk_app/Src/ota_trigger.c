@@ -168,11 +168,20 @@ static int8_t meta_write_to_flash(uint32_t addr, const ota_metadata_t *meta)
   uint32_t i;
   flash_status_type status;
 
+  /* Single Bank: metadata 保存 = 擦 1KB 扇区 + 逐字编程，擦写期间内核
+   * 从同一 Bank 取指会卡死（4ec5858 事故同根因），IRQ 取指同样踩 Flash。
+   * 本函数是 APP 侧 metadata 落盘唯一咽喉点：trial confirm、0x37
+   * commit_trial、0x31 擦除后 invalidate 落盘等全部调用方自动受保护。
+   * 调用点不得再包一层 __disable_irq/__enable_irq：__enable_irq 无条件
+   * 清 PRIMASK，双层包裹会在内层返回时提前开中断，属误导性代码。 */
+  __disable_irq();
+
   flash_unlock();
   status = flash_sector_erase(addr);
   if (status != FLASH_OPERATE_DONE)
   {
     flash_lock();
+    __enable_irq();
     return -1;
   }
 
@@ -184,10 +193,13 @@ static int8_t meta_write_to_flash(uint32_t addr, const ota_metadata_t *meta)
     if (status != FLASH_OPERATE_DONE)
     {
       flash_lock();
+      __enable_irq();
       return -1;
     }
   }
   flash_lock();
+
+  __enable_irq();
   return 0;
 }
 

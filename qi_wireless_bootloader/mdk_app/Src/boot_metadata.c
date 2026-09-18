@@ -84,11 +84,20 @@ static int8_t meta_write_to_flash(uint32_t addr, const ota_metadata_t *meta)
   uint32_t words;
   uint32_t i;
 
+  /* Single Bank: metadata 保存 = 擦 1KB 扇区 + 逐字编程 + 读回，擦写期间
+   * 中断取指踩同一 Bank 会卡死内核（4ec5858 事故同根因）。Boot 上电后
+   * SysTick 已在跑（timer_drv_init），状态机落盘（boot_trial.c 5 处、
+   * try_boot_slot 2 处、boot_metadata_init 2 处、main.c 回滚落盘、
+   * safe mode 现场落盘）全部经本咽喉点，自动受保护。
+   * 关中断区间内仅 Flash 寄存器操作与 68 字读回，无 SPI/CAN/长循环。 */
+  __disable_irq();
+
   flash_unlock();
 
   if (meta_flash_erase_page(addr) != 0)
   {
     flash_lock();
+    __enable_irq();
     return -1;
   }
 
@@ -101,6 +110,7 @@ static int8_t meta_write_to_flash(uint32_t addr, const ota_metadata_t *meta)
     if (meta_flash_write_word(addr + (i * 4U), src[i]) != 0)
     {
       flash_lock();
+      __enable_irq();
       return -1;
     }
   }
@@ -111,11 +121,14 @@ static int8_t meta_write_to_flash(uint32_t addr, const ota_metadata_t *meta)
     if (*(volatile uint32_t *)(addr + (i * 4U)) != src[i])
     {
       flash_lock();
+      __enable_irq();
       return -1;
     }
   }
 
   flash_lock();
+
+  __enable_irq();
   return 0;
 }
 

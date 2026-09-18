@@ -362,9 +362,11 @@ void ota_dl_handle_erase(uint8_t *data, uint16_t len)
       meta.slot_b_valid = 0U;
     }
     meta.pending_slot = g_slot;
-    __disable_irq();
+    /* metadata 落盘的关中断保护已下沉到 ota_trigger.c meta_write_to_flash
+     * 咽喉点（erase+program 全覆盖）。此处不再外层包裹：__enable_irq
+     * 无条件清 PRIMASK，双层包裹会在内层返回时提前开中断，名存实亡。
+     * 上方泵帧 0x78 保持在落盘之前，长操作静默段规则不变。 */
     (void)ota_metadata_save(&meta);
-    __enable_irq();
   }
 
   g_erased = 1U;
