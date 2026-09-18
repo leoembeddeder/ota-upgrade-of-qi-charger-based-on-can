@@ -330,6 +330,24 @@ def _sniff(bus_id, seconds):
     return saw_boot, saw_app, saw_life, n
 
 
+def wake_mcu(bus_id):
+    """V1.0.0：3E 00 等 7E。第一帧可能被 WUP 吃掉。"""
+    ok = False
+    for i in range(1, 3):
+        if stopTask:
+            raise RuntimeError("用户停止")
+        try:
+            rx = uds_req(bus_id, SID_TP, [0x00], timeout_note=" (唤醒第%d次)" % i)
+            if rx and rx[0] == (SID_TP + SID_PR):
+                _log("MCU 已在线 (7E)")
+                ok = True
+                break
+        except Exception as e:
+            _log("唤醒 %d/2: %s" % (i, e))
+            time.sleep(0.15)
+    return ok
+
+
 def read_did_string(bus_id, did):
     payload = [(did >> 8) & 0xFF, did & 0xFF]
     rx = isotp_raw_request(bus_id, SID_RDBI, payload)
@@ -345,17 +363,40 @@ def run(bus_id):
     _log("CAN ID: Tx 0x%08X  Rx 0x%08X" % (UDS_REQ_ID, UDS_RESP_ID))
     names = [a for a in dir(zcanpro) if not a.startswith("_")]
     _log("zcanpro API: " + ", ".join(names))
-    _log("全程原始 CAN，不使用 uds_init（避免库占通道导致 receive=(1,[])）")
     _log("")
 
-    try:
-        zcanpro.uds_deinit()
-    except Exception:
-        pass
+    # V1.0.0：必须先 uds_init，ZLG 才会开接收。不 init 时 receive 恒为 (1,[])。
+    _uds_init()
+    online = wake_mcu(bus_id)
+    if online:
+        _log("UDS 已通，直接 uds_request 读 DID")
+        results = []
+        for did, name, expected in DID_LIST:
+            try:
+                payload = [(did >> 8) & 0xFF, did & 0xFF]
+                rx = uds_req(bus_id, SID_RDBI, payload)
+                ver = parse_did_string(did, rx)
+                match = "[OK]" if ver == expected else "[不匹配 期望:%s]" % expected
+                _log("DID 0x%04X [%s]: %s %s" % (did, name, ver, match))
+                results.append((name, ver, expected, None))
+            except Exception as e:
+                _log("DID 0x%04X [%s]: 读取失败 - %s" % (did, name, e))
+                results.append((name, None, expected, str(e)))
+            time.sleep(0.05)
+        _log("")
+        _log("---- 汇总 ----")
+        for name, ver, expected, err in results:
+            if ver is not None:
+                match = "✓" if ver == expected else "✗ 期望:%s" % expected
+                _log("  %s = %s %s" % (name, ver, match))
+            else:
+                _log("  %s = [失败] %s" % (name, err))
+        return
 
-    can_send(bus_id, UDS_REQ_ID, [0x02, 0x3E, 0x00])
-    _log("[Tx raw] 02 3E 00")
-    time.sleep(0.2)
+    _log("UDS 无 7E，deinit 后 raw 嗅探（init 过才能 receive）")
+    time.sleep(0.05)
+    _uds_deinit()
+
     can_send(bus_id, UDS_REQ_ID, [0x02, 0x3E, 0x00])
     _log("[Tx raw] 02 3E 00")
     time.sleep(0.2)
@@ -371,8 +412,6 @@ def run(bus_id):
              "2) 已用当前 main 同时烧 16KB Boot 和 Slot A APP（勿与 V1.0.0 28KB Boot 混用）；"
              "3) 断电重启后再跑。")
         return
-    if not saw_app and saw_life:
-        _log("有生命周期帧但无 UDS，继续尝试读 DID")
 
     results = []
     for did, name, expected in DID_LIST:
