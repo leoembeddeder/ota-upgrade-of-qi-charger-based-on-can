@@ -9,7 +9,9 @@ ZCANPRO 扩展脚本 — SA 锁定恢复测试（P1 测试项）
   0. 运行侧探测（唤醒收敛 + 正证据判定；仅 APP 可做 SA 锁定测试）
   1. 进入编程会话 10 02（预期 50 02 00 32 01 F4；与 sn_write 一致，后续验证写 F18C 门禁）
   2. 故意错 key ×WRONG_KEY_ATTEMPTS（默认 3）：每次完整 27 01 → 假签名（全 0x00）
-     → 27 03 ×16 帧 → 27 02；预期 NRC 0x35/0x35/0x36（第 3 次触发锁定）
+     → 27 03 ×16 帧 → 27 02；预期 NRC 0x35/0x35/0x36（第 3 次触发锁定）；
+     fail_count 残留（复测前未断电重启）时序列前移（0x36/0x37 提前出现）
+     → 打印残留指引（建议断电重启后重跑）并按设计继续后续步骤（2026-09-19）
   3. 锁定确认：27 01 → 预期 NRC 0x37（requiredTimeDelay，锁定期内）
   4. S3 keepalive 等待 31s（每 3s 发 3E 80 suppress，逐次打印序号+累计时间）
   5. 恢复解锁：真 private.pem → 完整 SA（27 01 → seed → ECDSA 真签 →
@@ -44,6 +46,13 @@ ZCANPRO 扩展脚本 — SA 锁定恢复测试（P1 测试项）
     zcanpro_sn_write.py 实机成功路径）+ _jp_mul 仿射转换 y 坐标误用 rx，
     标量乘结果错误 → 签名 r 值错误 → 与固件验签对象不一致；已对齐
     sn_write 实现 + 新增签名本地自检
+  - 2026-09-19 修复记录（00:03 复测日志）：复测未按指引断电重启 →
+    fail_count 残留（=1）→ NRC 序列前移（0x35/0x36/0x37 形态：第2次即
+    0x36、第3次 27 01→7F 27 37 锁定期内）→ 异常续行路径把 str 传入
+    "%02X" 格式化 → Step 2 后 TypeError 中断（c81bb18 原有缺陷，fcb0782
+    未触及）；已改 _fmt_nrc 安全格式化（%X 点实参强制 int/占位符）+
+    残留形态检测指引（检测到 0x36/0x37 提前出现即提示断电重启后重跑，
+    按设计继续后续步骤：锁定确认/keepalive/恢复解锁对残留场景依然有效）
   - S3：SESSION_TIMEOUT_MS=5000（can_protocol.h:167）；任何诊断请求刷新计时
     （uds_process_message:1770 + handle_tester_present:1509，3E 80 suppress 同样
     刷新——d770e86 evaluator 已双点确证）；锁定等待 31s 若无 keepalive，固件 poll
@@ -140,13 +149,25 @@ SA_LOCKOUT_WAIT_S       = 31.0     # SA 锁定等待总时长（>30s 锁定期�
 KEEPALIVE_GAPS = []    # keepalive 实际发送间隔取证（s），结束判定 S3 联合判定用
 
 
+def _fmt_nrc(v):
+    """NRC 值安全格式化（2026-09-19 %X 格式崩溃修复）：int → 0x%02X；
+    非 int（异常占位/None）→ 字符串占位，绝不送入 %X 格式化点。"""
+    if isinstance(v, int):
+        return "0x%02X" % (v & 0xFF)
+    if v is None:
+        return "N/A"
+    return str(v)
+
+
 class UdsNrcError(RuntimeError):
     """带 NRC 码的 UDS 异常；SA 锁定测试按 e.nrc 判别预期/非预期 NRC。"""
 
     def __init__(self, sid, nrc):
-        RuntimeError.__init__(self, "NRC SID=0x%02X NRC=0x%02X" % (sid, nrc))
-        self.sid = sid
-        self.nrc = nrc
+        # 2026-09-19：%X 格式崩溃修复——sid/nrc 非 int 时不进 %X 格式化
+        self.sid = sid if isinstance(sid, int) else None
+        self.nrc = nrc if isinstance(nrc, int) else None
+        RuntimeError.__init__(self, "NRC SID=%s NRC=%s"
+                              % (_fmt_nrc(self.sid), _fmt_nrc(self.nrc)))
 
 
 # secp256r1（与 zcanpro_sn_write.py 同款）
@@ -1067,35 +1088,71 @@ def run_sa_lockout_test(bus_id):
          "前两次 fail_count<3 → NRC 0x35 invalidKey")
     expected_nrc_seq = []
     actual_nrc_seq = []
+    residual_failcount = False  # fail_count 残留形态（2026-09-19，00:03 复测日志）
     for i in range(1, WRONG_KEY_ATTEMPTS + 1):
         try:
             exp_nrc, act_nrc, _seed_h = _sa_wrong_key_attempt(bus_id, i)
         except (UdsNrcError, RuntimeError) as e:
-            _log("  警告：错 key 第 %d 次异常: %s（继续后续步骤）" % (i, e))
+            e_nrc = getattr(e, "nrc", None)
+            if isinstance(e_nrc, int):
+                # NRC 异常（如锁定期内 27 01→0x37）：保留结构化 int，供
+                # 残留检测与汇总打印（2026-09-19 %X 格式崩溃修复核心）
+                act_nrc = e_nrc
+                _log("  警告：错 key 第 %d 次 NRC 异常: %s（继续后续步骤）" % (i, e))
+            else:
+                # 非 NRC 异常（无应答/超时等）：占位符 "N/A"，绝不进 %X 格式化
+                act_nrc = "N/A"
+                _log("  警告：错 key 第 %d 次异常: %s（继续后续步骤）" % (i, e))
             exp_nrc = NRC_INVALID_KEY if i < WRONG_KEY_ATTEMPTS else NRC_EXCEEDED_ATTEMPTS
-            act_nrc = "exception:%s" % e
         expected_nrc_seq.append(exp_nrc)
         actual_nrc_seq.append(act_nrc)
+        # fail_count 残留形态检测：锁定类 NRC 提前出现 = 复测前未断电重启，
+        # fail_count RAM 残留导致序列前移（00:03 复测实证：残留=1 →
+        # 第 2 次即 0x36、第 3 次 27 01→0x37 锁定期内）；检测到即打印
+        # 明确指引，后续步骤按设计继续（锁定确认/keepalive/恢复解锁对
+        # 残留场景依然有效）
+        if isinstance(act_nrc, int) and act_nrc in (
+                NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY) \
+                and (i < WRONG_KEY_ATTEMPTS
+                     or act_nrc == NRC_REQUIRED_TIME_DELAY):
+            if not residual_failcount:
+                residual_failcount = True
+                _log("  ⚠ 检测到 fail_count 残留（复测前未断电重启）：设备已进入锁定"
+                     "（第 %d/%d 次即见 %s，标准序列应第 %d 次 0x36 才触发锁定）——"
+                     "建议断电重启后重跑以获得标准序列"
+                     % (i, WRONG_KEY_ATTEMPTS, _fmt_nrc(act_nrc), WRONG_KEY_ATTEMPTS))
+                _log("  脚本按设计继续后续步骤：Step 3 锁定确认与 Step 4 keepalive "
+                     "对残留场景依然有效，Step 5 恢复解锁在锁定期过后仍可验证 "
+                     "EC 修复（锁定恢复测试核心验证对象不受残留影响）")
         if act_nrc is None:
-            _log("  警告：第 %d 次假签名收到正响应（预期 NRC 0x%02X），固件验签逻辑异常？"
-                 % (i, exp_nrc))
+            _log("  警告：第 %d 次假签名收到正响应（预期 %s），固件验签逻辑异常？"
+                 % (i, _fmt_nrc(exp_nrc)))
         elif isinstance(act_nrc, int) and act_nrc != exp_nrc:
-            _log("  警告：第 %d 次 NRC 不符——预期 0x%02X（%s），实际 0x%02X（%s）"
-                 % (i, exp_nrc, NRC_DESC.get(exp_nrc, ""), act_nrc,
-                    NRC_DESC.get(act_nrc, "未知")))
+            _log("  警告：第 %d 次 NRC 不符——预期 %s（%s），实际 %s（%s）"
+                 % (i, _fmt_nrc(exp_nrc), NRC_DESC.get(exp_nrc, ""),
+                    _fmt_nrc(act_nrc), NRC_DESC.get(act_nrc, "未知")))
+        elif isinstance(act_nrc, int):
+            _log("  第 %d 次 NRC %s 符合预期（%s）"
+                 % (i, _fmt_nrc(act_nrc), NRC_DESC.get(act_nrc, "")))
         else:
-            _log("  第 %d 次 NRC 0x%02X 符合预期（%s）"
-                 % (i, act_nrc, NRC_DESC.get(act_nrc, "")))
+            # 非 int 占位（防御分支）：%X 格式化点不再接收非 int 实参
+            _log("  第 %d 次无 NRC 码（%s），跳过 NRC 比对" % (i, act_nrc))
 
-    exp_str = "/".join("0x%02X" % n for n in expected_nrc_seq)
-    act_str = "/".join(
-        ("0x%02X" % n if isinstance(n, int) else str(n)) for n in actual_nrc_seq)
+    exp_str = "/".join(_fmt_nrc(n) for n in expected_nrc_seq)
+    act_str = "/".join(_fmt_nrc(n) for n in actual_nrc_seq)
     wrong_key_ok = all(
         isinstance(a, int) and a == e
         for a, e in zip(actual_nrc_seq, expected_nrc_seq))
+    if wrong_key_ok:
+        step2_note = ""
+    elif residual_failcount:
+        step2_note = ("fail_count 残留形态（复测前未断电重启）：锁定类 NRC 提前出现，"
+                      "非固件逻辑差异——建议断电重启后重跑以获得标准序列；"
+                      "后续步骤按设计继续（锁定确认/keepalive/恢复解锁对残留有效）")
+    else:
+        step2_note = "实际 NRC 与预期不符（日志警告，继续后续步骤）"
     _record("Step2-错key×%d" % WRONG_KEY_ATTEMPTS, wrong_key_ok,
-            exp_str, act_str,
-            "" if wrong_key_ok else "实际 NRC 与预期不符（日志警告，继续后续步骤）")
+            exp_str, act_str, step2_note)
 
     # ---- Step 3: 锁定确认 ----
     _log("---- Step 3: 锁定确认（27 01 → 预期 NRC 0x37）----")
@@ -1112,10 +1169,11 @@ def run_sa_lockout_test(bus_id):
             _record("Step3-锁定确认", True, "NRC 0x37", "NRC 0x37",
                     "设备 SecurityAccess 锁定生效")
         else:
-            _log("  警告：27 01 NRC 0x%02X（预期 0x37），设备锁定状态异常"
-                 % e.nrc)
-            _record("Step3-锁定确认", False, "NRC 0x37", "NRC 0x%02X" % e.nrc,
-                    NRC_DESC.get(e.nrc, "未知 NRC"))
+            e_nrc = getattr(e, "nrc", None)
+            _log("  警告：27 01 NRC %s（预期 0x37），设备锁定状态异常"
+                 % _fmt_nrc(e_nrc))
+            _record("Step3-锁定确认", False, "NRC 0x37", "NRC " + _fmt_nrc(e_nrc),
+                    NRC_DESC.get(e_nrc, "未知 NRC"))
     except RuntimeError as e:
         _log("  警告：27 01 异常 %s（预期 NRC 0x37）" % e)
         _record("Step3-锁定确认", False, "NRC 0x37", str(e), "无应答/通信异常")
@@ -1162,7 +1220,8 @@ def run_sa_lockout_test(bus_id):
             _record("Step5-恢复解锁", False, "67 02", _hex(rx[:6]),
                     "应答格式不符（设备可能仍在锁定/会话复位）")
     except UdsNrcError as e:
-        _log("  恢复解锁失败：NRC 0x%02X（%s）" % (e.nrc, NRC_DESC.get(e.nrc, "未知")))
+        e_nrc = getattr(e, "nrc", None)
+        _log("  恢复解锁失败：NRC %s（%s）" % (_fmt_nrc(e_nrc), NRC_DESC.get(e_nrc, "未知")))
         hint = ""
         if e.nrc == NRC_INVALID_KEY:
             hint = ("验签失败（invalidKey）：签名已经过宿主自检 PASS（发送前本地"
@@ -1173,7 +1232,7 @@ def run_sa_lockout_test(bus_id):
             hint = "设备可能仍在锁定中——建议断电重启后重跑"
         elif e.nrc == 0x24:
             hint = "g_seed_generated 已被清（裸发 27 02 撞序检查），流程异常"
-        _record("Step5-恢复解锁", False, "67 02", "NRC 0x%02X" % e.nrc, hint)
+        _record("Step5-恢复解锁", False, "67 02", "NRC " + _fmt_nrc(e_nrc), hint)
     except RuntimeError as e:
         _log("  恢复解锁失败: %s" % e)
         if "[自检]" in str(e):
@@ -1204,9 +1263,10 @@ def run_sa_lockout_test(bus_id):
             _record("Step6a-解锁确认", False, "67 01+32×00", _hex(rx[:6]),
                     "应答格式不符")
     except UdsNrcError as e:
-        _log("  27 01 NRC 0x%02X（%s）" % (e.nrc, NRC_DESC.get(e.nrc, "未知")))
-        _record("Step6a-解锁确认", False, "67 01+32×00", "NRC 0x%02X" % e.nrc,
-                NRC_DESC.get(e.nrc, "未知"))
+        e_nrc = getattr(e, "nrc", None)
+        _log("  27 01 NRC %s（%s）" % (_fmt_nrc(e_nrc), NRC_DESC.get(e_nrc, "未知")))
+        _record("Step6a-解锁确认", False, "67 01+32×00", "NRC " + _fmt_nrc(e_nrc),
+                NRC_DESC.get(e_nrc, "未知"))
     except RuntimeError as e:
         _log("  27 01 异常: %s" % e)
         _record("Step6a-解锁确认", False, "67 01+32×00", str(e), "通信异常")
@@ -1238,8 +1298,9 @@ def run_sa_lockout_test(bus_id):
             _record("Step6b-幂等写", False, "6E F1 8C", _hex(rx[:6]),
                     "应答格式不符")
     except UdsNrcError as e:
+        e_nrc = getattr(e, "nrc", None)
         step6b_nrc = e.nrc
-        _log("  写入失败：NRC 0x%02X（%s）" % (e.nrc, NRC_DESC.get(e.nrc, "未知")))
+        _log("  写入失败：NRC %s（%s）" % (_fmt_nrc(e_nrc), NRC_DESC.get(e_nrc, "未知")))
         if e.nrc == NRC_CONDITIONS_NOT_CORRECT:
             hint = ("NRC 0x22 conditionsNotCorrect——疑似 S3 会话失效（S3 防护"
                     "失效判据）：31s 等待期间无 keepalive（或间隔>5s），固件 poll"
@@ -1260,7 +1321,7 @@ def run_sa_lockout_test(bus_id):
                         "断电重启后单独复测 SA+写步")
         else:
             hint = NRC_DESC.get(e.nrc, "未知 NRC")
-        _record("Step6b-幂等写", False, "6E F1 8C", "NRC 0x%02X" % e.nrc, hint)
+        _record("Step6b-幂等写", False, "6E F1 8C", "NRC " + _fmt_nrc(e_nrc), hint)
     except RuntimeError as e:
         _log("  写入失败: %s" % e)
         _record("Step6b-幂等写", False, "6E F1 8C", str(e), "通信异常")
@@ -1324,8 +1385,13 @@ def run_sa_lockout_test(bus_id):
                 _log("  写步失败→按上方固件侧解释处置（0x33+Step 5 未解锁=下游"
                      "失败；0x22=疑似 S3 会话失效）")
         if any("Step2" in r[0] for r in fail_items):
-            _log("  错 key NRC 不符→固件 SA 锁定逻辑可能与预期不同，"
-                 "请核对 can_protocol.c 锁定分支（:1333-1341/:1465-1472）")
+            if residual_failcount:
+                _log("  Step2 序列不符 = fail_count 残留形态（复测前未断电重启），"
+                     "非固件 SA 锁定逻辑差异——断电重启清零 fail_count 后重跑"
+                     "可获得标准 0x35/0x35/0x36 序列")
+            else:
+                _log("  错 key NRC 不符→固件 SA 锁定逻辑可能与预期不同，"
+                     "请核对 can_protocol.c 锁定分支（:1333-1341/:1465-1472）")
         _log("  建议与其他测试错开执行（避免 fail_count 残留干扰其他 SA 流程）")
 
     return all_pass
