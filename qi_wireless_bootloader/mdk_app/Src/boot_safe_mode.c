@@ -80,14 +80,18 @@ void enter_safe_mode(uint8_t cause)
           ((len >= 3U) && (data[0] == 0x22U) && (data[1] == 0x21U) &&
            (data[2] == 0x13U)))
       {
-        uint8_t resp[5];
+        /* ISO-TP SF: ZCANPRO uds_request 认 PCI，不能发裸 62 21 13 FE */
+        uint8_t sf[8];
 
-        resp[0] = 0x62U;
-        resp[1] = 0x21U;
-        resp[2] = 0x13U;
-        resp[3] = 0xFEU;   /* safe mode 标记；APP DID 0x2113 应答永不带 0xFE */
-        resp[4] = step;    /* fail_step 0~6，语义见文件头注释 */
-        (void)can_driver_send(CAN_ID_UDS_RESPONSE, resp, 5U);
+        sf[0] = 0x05U;
+        sf[1] = 0x62U;
+        sf[2] = 0x21U;
+        sf[3] = 0x13U;
+        sf[4] = 0xFEU;
+        sf[5] = step;
+        sf[6] = 0xCCU;
+        sf[7] = 0xCCU;
+        (void)can_driver_send(CAN_ID_UDS_RESPONSE, sf, 8U);
       }
     }
   }

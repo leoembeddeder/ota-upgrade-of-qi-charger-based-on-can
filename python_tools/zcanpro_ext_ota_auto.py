@@ -150,7 +150,10 @@ class UdsNrcError(RuntimeError):
 
 
 def _safe_mode_step(dat):
-    """识别 Boot safe mode 标记帧 62 21 13 FE <fail_step>，返回 step 或 None。"""
+    """识别 Boot safe mode：裸 62 21 13 FE step，或 ISO-TP 05 62 21 13 FE step。"""
+    if (len(dat) >= 6 and dat[0] == 0x05 and dat[1] == 0x62 and dat[2] == 0x21
+            and dat[3] == 0x13 and dat[4] == 0xFE):
+        return int(dat[5])
     if (len(dat) >= 5 and dat[0] == 0x62 and dat[1] == 0x21
             and dat[2] == 0x13 and dat[3] == 0xFE):
         return int(dat[4])

@@ -317,12 +317,19 @@ def wake_mcu(bus_id):
     time.sleep(0.35)
     try:
         rx = uds_req(bus_id, SID_RDBI, [0x21, 0x13])
+        if rx and len(rx) >= 4 and rx[0] == 0x62 and rx[3] == 0xFE:
+            step = rx[4] if len(rx) >= 5 else 0
+            _log("MCU 在 Boot safe mode（无有效 APP）。fail_step=%d "
+                 "(0无槽 1magic 2长度 3CRC 4向量跨槽 5无公钥 6验签失败)" % step)
+            _log("请 merge_prod_bin.py 整片烧录，或断电后确认 Slot 镜像。")
+            return False
         slot = rx[3] if rx and len(rx) >= 4 else None
-        _log("MCU 在线 (22 2113 slot=%s)" % (("%02X" % slot) if slot is not None else "?"))
+        _log("MCU 在线 APP (22 2113 slot=%s)" % (("%02X" % slot) if slot is not None else "?"))
         return True
     except Exception as e:
         _log("22 2113 无应答: %s" % e)
-        _log("MCU 未在 APP 或 CAN 未起来（Boot 无 UDS / bus-off）。请断电重启后再读。")
+        _log("MCU 未应答 UDS。常见原因：1) 刚 OTA 失败停在 Boot 且旧 Boot 应答无 ISO-TP PCI；"
+             "2) APP hardfault；3) CAN bus-off。请断电重启；仍失败则用 Keil 烧 Boot+APP。")
         return False
 
 
