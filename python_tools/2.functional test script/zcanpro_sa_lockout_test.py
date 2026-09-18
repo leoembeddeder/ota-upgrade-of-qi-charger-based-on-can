@@ -1,0 +1,1083 @@
+# -*- coding: utf-8 -*-
+"""
+ZCANPRO 扩展脚本 — SA 锁定恢复测试（P1 测试项）
+
+用户明确要求："写一个用于测试故意key错的脚本"——验证 d770e86 S3 keepalive
+防护在 SA 锁定等待场景的实机效果。
+
+流程：
+  0. 运行侧探测（唤醒收敛 + 正证据判定；仅 APP 可做 SA 锁定测试）
+  1. 进入编程会话 10 02（预期 50 02 00 32 01 F4；与 sn_write 一致，后续验证写 F18C 门禁）
+  2. 故意错 key ×WRONG_KEY_ATTEMPTS（默认 3）：每次完整 27 01 → 假签名（全 0x00）
+     → 27 03 ×16 帧 → 27 02；预期 NRC 0x35/0x35/0x36（第 3 次触发锁定）
+  3. 锁定确认：27 01 → 预期 NRC 0x37（requiredTimeDelay，锁定期内）
+  4. S3 keepalive 等待 31s（每 3s 发 3E 80 suppress，逐次打印序号+累计时间）
+  5. 恢复解锁：真 private.pem → 完整 SA（27 01 → seed → ECDSA 真签 → 27 03×16 → 27 02）
+     → 预期 67 02
+  6. 验证（S3 防护实机验证点）：
+     a. 解锁态确认：27 01 → 预期 67 01 + 32×0x00（已解锁）
+     b. 幂等写验证：2E F1 8C + 相同 SN → 预期 6E F1 8C——证明 31s 锁定等待期间
+        keepalive 保住了会话+安全态（S3 防护失效时此处必撞 NRC 0x22/0x33）
+
+固件事实（2026-09-18 evaluator/主管已验证，file:line）：
+  - SA 无会话门禁（handle_security_access，can_protocol.c:1320+，仅长度/锁定/序检查）
+  - 锁定机制：验签失败 fail_count++（:1465）；fail_count≥3（SECURITY_MAX_FAILURES=3
+    :71）→ 锁定 30s（SECURITY_LOCKOUT_MS=30000U :70）+ 第 3 次失败当次 27 02 回
+    NRC 0x36（:1472）；锁定期内 27 01 回 NRC 0x37（:1333-1341）；锁定期过→
+    fail_count=0（:1340）
+  - 验签失败同时清 g_seed_generated（:1469）→ 裸发 27 02/27 03→NRC 0x24
+    （:1429-1433）——脚本每次尝试从 27 01 开局不受影响
+  - 已解锁确认：27 01→67 01+32×0x00（:1343-1352）
+  - 写门禁 0xF18C：SESSION_PROGRAMMING+security_unlocked（:1051-1062）；
+    相同值重写=幂等无副作用
+  - S3：SESSION_TIMEOUT_MS=5000（can_protocol.h:167）；任何诊断请求刷新计时
+    （uds_process_message:1770 + handle_tester_present:1509，3E 80 suppress 同样
+    刷新——d770e86 evaluator 已双点确证）；锁定等待 31s 若无 keepalive，固件 poll
+    （:2094-2098）会复位会话+清安全态→恢复后写步撞 NRC 0x22/0x33
+  - NRC 宏：0x35 UDS_NRC_INVALID_KEY（h:99）/0x36 UDS_NRC_EXCEEDED_NUMBER_OF_ATTEMPTS
+    （h:100）/0x37 UDS_NRC_REQUIRED_TIME_DELAY（h:101）
+
+安全性（docstring 承诺）：
+  - 错 key 阶段假签名零数据（64 字节全 0x00），不消耗设备任何有效密钥/计数资源
+    （fail_count 是测试目的本身，30s 后自动归零）
+  - 写步仅重写相同 SN 值（幂等写，设备状态无变化）
+  - 锁定态测试后自动清除：30s 到期 fail_count 归零 + 成功解锁双保险
+  - 建议与其他测试错开执行（避免 fail_count 残留干扰其他 SA 流程）
+
+导入: ZCANPRO → 高级功能 → 扩展脚本 → 打开本文件
+运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
+"""
+
+import os
+import sys
+import time
+import binascii
+
+try:
+    import zcanpro
+except ImportError:
+    zcanpro = None
+
+# ======== 用户配置 ========
+def _find_repo_root(start):
+    """向上探测仓库根目录（含 docs/keys 的祖先目录），不写死目录层级假设。"""
+    d = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(d, "docs", "keys")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.abspath(start)
+        d = parent
+
+
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = _find_repo_root(_TOOLS_DIR)
+PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
+
+# 要写入的 SN（与 zcanpro_sn_write.py 一致；幂等写验证用，相同值无副作用）
+SN_CODE = "LSCH42JY012606020001"
+
+WRONG_KEY_ATTEMPTS = 3   # 故意错 key 次数（= SECURITY_MAX_FAILURES，触发锁定）
+SA_SIG_CHUNK = 4         # 27 03 分片：4 字节/帧
+
+# ======== UDS 常量（d770e86 三功能脚本同款常量块）========
+UDS_REQ_ID = 0x18DA0D03
+UDS_RESP_ID = 0x18DA030D
+
+SID_DSC  = 0x10   # DiagnosticSessionControl
+SID_SA   = 0x27   # SecurityAccess
+SID_WDBI = 0x2E   # WriteDataByIdentifier
+SID_RDBI = 0x22   # ReadDataByIdentifier：运行侧探测 22 2113
+SID_RD   = 0x34   # 运行侧探测：仅 APP 实现
+SID_TP   = 0x3E   # TesterPresent：keepalive / wake_bus
+SID_NRC  = 0x7F
+SID_PR   = 0x40
+
+NRC_RCRRP = 0x78
+NRC_INVALID_KEY             = 0x35  # 验签失败（fail_count 未达上限）→ UDS_NRC_INVALID_KEY（h:99）
+NRC_EXCEEDED_ATTEMPTS       = 0x36  # 验签失败达上限当次 → UDS_NRC_EXCEEDED_NUMBER_OF_ATTEMPTS（h:100）
+NRC_REQUIRED_TIME_DELAY     = 0x37  # 锁定期内 27 01 → UDS_NRC_REQUIRED_TIME_DELAY（h:101）
+NRC_CONDITIONS_NOT_CORRECT  = 0x22  # 写门禁：会话不满足（S3 超时回 default 的典型表现）
+NRC_SECURITY_ACCESS_DENIED  = 0x33  # 写门禁：security_unlocked=0（S3 超时/会话切换被清）
+
+# NRC 描述（判定结论/失败分析用）
+NRC_DESC = {
+    0x35: "invalidKey——验签失败，fail_count 计数（未达上限）",
+    0x36: "exceededNumberOfAttempts——验签失败达上限（fail_count≥3），固件随即锁定约 30s",
+    0x37: "requiredTimeDelay——锁定期内 27 01 应答，设备仍在锁定中",
+    0x22: "conditionsNotCorrect——写门禁：会话不满足（S3 超时后会话回 default）",
+    0x33: "securityAccessDenied——写门禁：安全态被清（S3 超时/会话切换清 security_unlocked）",
+    0x24: "requestSequenceError——固件已清 g_seed_generated，裸发 27 02/27 03 撞序检查",
+}
+
+# ======== S3 会话超时防护参数（三脚本同构）========
+# 固件：SESSION_TIMEOUT_MS=5000（can_protocol.h:167）；UDS 交换间隙>5s 时
+# can_protocol_poll 会把会话回 default + 清 security（:2094-2098）。
+# 固件验证结论：3E 80（suppress）与 3E 00 均刷新 S3 计时——uds_process_message
+# 派发前对任何诊断请求统一刷新 last_tester_present_tick（can_protocol.c:1770），
+# handle_tester_present 对 suppress 帧同样刷新计时且不回响应（:1509）→
+# keepalive 优先 3E 80（无响应帧干扰，ZCANPRO suppress 请求立即返回）。
+S3_KEEPALIVE_INTERVAL_S = 3.0      # keepalive 周期：3s < 5s 超时窗，留 2s 余量
+S3_SIGN_GAP_GUARD_S     = 3.0      # 签名耗时超过该值：先发 3E 再进 27 03 分片
+SA_LOCKOUT_WAIT_S       = 31.0     # SA 锁定等待总时长（>30s 锁定期）
+
+
+class UdsNrcError(RuntimeError):
+    """带 NRC 码的 UDS 异常；SA 锁定测试按 e.nrc 判别预期/非预期 NRC。"""
+
+    def __init__(self, sid, nrc):
+        RuntimeError.__init__(self, "NRC SID=0x%02X NRC=0x%02X" % (sid, nrc))
+        self.sid = sid
+        self.nrc = nrc
+
+
+# secp256r1（与 zcanpro_sn_write.py 同款）
+_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+_A = _P - 3
+_GX = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
+_GY = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
+
+stopTask = False
+
+
+def z_notify(type, obj):
+    if type == "stop":
+        global stopTask
+        stopTask = True
+
+
+def _log(msg):
+    text = str(msg)
+    if zcanpro is not None:
+        zcanpro.write_log(text)
+    else:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+
+
+def _hex(data):
+    if data is None:
+        return ""
+    return " ".join("%02X" % (int(b) & 0xFF) for b in data)
+
+
+def _to_list(b):
+    if sys.version_info[0] >= 3:
+        return list(b)
+    return [ord(c) for c in b]
+
+
+def _to_bytes(seq):
+    if isinstance(seq, bytes):
+        return seq
+    if sys.version_info[0] >= 3:
+        return bytes(seq)
+    return "".join(chr(int(x) & 0xFF) for x in seq)
+
+
+def _int_be(b):
+    if sys.version_info[0] >= 3:
+        return int.from_bytes(b, "big")
+    return int(binascii.hexlify(b), 16)
+
+
+def _inv(x, m):
+    x %= m
+    if sys.version_info[0] >= 3:
+        return pow(x, -1, m)
+    return pow(x, m - 2, m)
+
+
+def _jp_double(x, y, z):
+    if z == 0 or y == 0:
+        return 0, 0, 0
+    ysq = (y * y) % _P
+    s = (4 * x * ysq) % _P
+    m = (3 * x * x + _A * ((z * z) % _P) * ((z * z) % _P)) % _P
+    nx = (m * m - 2 * s) % _P
+    ny = (m * (s - nx) - 8 * ysq * ysq) % _P
+    nz = (2 * y * z) % _P
+    return nx, ny, nz
+
+
+def _jp_add(x1, y1, z1, x2, y2, z2):
+    if z1 == 0:
+        return x2, y2, z2
+    if z2 == 0:
+        return x1, y1, z1
+    z1z1 = (z1 * z1) % _P
+    z2z2 = (z2 * z2) % _P
+    u1 = (x1 * z2z2) % _P
+    u2 = (x2 * z1z1) % _P
+    s1 = (y1 * z2 * z2z2) % _P
+    s2 = (y2 * x1 * z1z1) % _P
+    h = (u2 - u1) % _P
+    r = (s2 - s1) % _P
+    h2 = (h * h) % _P
+    h3 = (h * h2) % _P
+    nx = (r * r - h3 - 2 * u1 * h2) % _P
+    ny = (r * (u1 * h2 - nx) - s1 * h3) % _P
+    nz = (h * z1 * z2) % _P
+    return nx, ny, nz
+
+
+def _jp_mul(k, x, y):
+    rx, ry, rz = 0, 0, 0
+    sx, sy, sz = x, y, 1
+    while k > 0:
+        if k & 1:
+            rx, ry, rz = _jp_add(rx, ry, rz, sx, sy, sz)
+        sx, sy, sz = _jp_double(sx, sy, sz)
+        k >>= 1
+    if rz == 0:
+        return 0, 0
+    zinv = _inv(rz, _P)
+    z2 = (zinv * zinv) % _P
+    return (rx * z2) % _P, (rx * z2 * zinv) % _P
+
+
+def _i2b32(v):
+    if v < 0 or v >= (1 << 256):
+        raise ValueError("ECDSA 整数超出 32 字节")
+    if sys.version_info[0] >= 3:
+        return v.to_bytes(32, "big")
+    return binascii.unhexlify("%064x" % v)
+
+
+def ecdsa_sign_msg(priv, msg):
+    import hashlib
+    h = hashlib.sha256(msg).digest()
+    z = _int_be(h) % _N
+    while True:
+        k = _int_be(os.urandom(32)) % _N
+        if k == 0:
+            continue
+        x, _y = _jp_mul(k, _GX, _GY)
+        r = x % _N
+        if r == 0:
+            continue
+        s = (_inv(k, _N) * (z + r * priv)) % _N
+        if s == 0:
+            continue
+        return _i2b32(r) + _i2b32(s)
+
+
+def _collect_octet32(buf, out, start, end):
+    i = start
+    while i < end:
+        tag = buf[i]
+        i += 1
+        try:
+            ln, i = _der_len(buf, i, end)
+        except Exception:
+            break
+        if i + ln > end:
+            break
+        if tag == 0x04:
+            if ln == 32:
+                out.append(buf[i:i + 32])
+            else:
+                _collect_octet32(buf, out, i, i + ln)
+        elif tag in (0x30, 0x31, 0xA0, 0xA1):
+            _collect_octet32(buf, out, i, i + ln)
+        i += ln
+
+
+def _der_len(buf, i, end):
+    if i >= end:
+        raise ValueError("DER truncated")
+    first = buf[i]
+    i += 1
+    if first < 0x80:
+        return first, i
+    n = first & 0x7F
+    if n == 0 or n > 4 or i + n > end:
+        raise ValueError("DER length")
+    ln = 0
+    for _k in range(n):
+        ln = (ln << 8) | buf[i]
+        i += 1
+    return ln, i
+
+
+def load_ec_private_key(path):
+    raw = open(path, "rb").read()
+    if len(raw) == 32:
+        priv = _int_be(raw)
+        if 0 < priv < _N:
+            return priv
+    text = raw.decode("ascii", "ignore") if sys.version_info[0] >= 3 else raw
+    if "BEGIN" in text:
+        lines = []
+        take = False
+        for line in text.splitlines():
+            s = line.strip()
+            if "BEGIN" in s:
+                take = True
+                continue
+            if "END" in s:
+                break
+            if take:
+                lines.append(s)
+        import base64
+        der = base64.b64decode("".join(lines))
+    else:
+        der = raw
+    cands = []
+    _collect_octet32(der, cands, 0, len(der))
+    for key in cands:
+        if len(key) != 32:
+            continue
+        priv = _int_be(key)
+        if 0 < priv < _N:
+            return priv
+    raise ValueError("无法解析私钥: " + path)
+
+
+# ======== UDS 通信 ========
+
+def uds_init():
+    zcanpro.uds_init({
+        "response_timeout_ms": 3000,
+        "use_canfd": 0,
+        "canfd_brs": 0,
+        "trans_ver": 0,
+        "fill_byte": 0xCC,
+        "frame_type": 1,
+        "trans_stmin_valid": 1,
+        "trans_stmin": 1,
+        "enhanced_timeout_ms": 30000,
+    })
+    _log("UDS 就绪 0x%08X / 0x%08X 扩展帧" % (UDS_REQ_ID, UDS_RESP_ID))
+
+
+def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
+    if stopTask:
+        raise RuntimeError("用户停止脚本")
+    req = {
+        "src_addr": UDS_REQ_ID,
+        "dst_addr": UDS_RESP_ID,
+        "suppress_response": 1 if suppress else 0,
+        "sid": sid,
+        "data": list(payload),
+    }
+    t_end = time.time() + float(wait_pending_s)
+    logged_tx = False
+    while True:
+        if stopTask:
+            raise RuntimeError("用户停止脚本")
+        if not logged_tx:
+            _log("[Tx] %02X %s" % (sid, _hex(payload[:16])))
+            logged_tx = True
+        resp = zcanpro.uds_request(bus_id, req)
+        if suppress:
+            return None
+        data = list((resp or {}).get("data") or [])
+        if data:
+            _log("[Rx] " + _hex(data[:24]))
+        if len(data) >= 3 and data[0] == SID_NRC:
+            if data[2] == NRC_RCRRP:
+                if wait_pending_s <= 0 or time.time() >= t_end:
+                    raise RuntimeError("SID=0x%02X NRC 0x78 超时" % sid)
+                _log("NRC 0x78，MCU 忙，继续等待")
+                time.sleep(1.0)
+                continue
+            raise UdsNrcError(data[1], data[2])
+        if not resp or not resp.get("result"):
+            raise RuntimeError("无应答 SID=0x%02X" % sid)
+        if len(data) < 1 or data[0] != (sid + SID_PR):
+            raise RuntimeError("非正响应 SID=0x%02X %s" % (sid, _hex(data)))
+        return data
+
+
+def uds_try(bus_id, sid, payload, suppress=0):
+    try:
+        return uds_req(bus_id, sid, payload, suppress=suppress)
+    except Exception as e:
+        _log("可忽略: " + str(e))
+        return None
+
+
+def _s3_keepalive_wait(bus_id, total_s=SA_LOCKOUT_WAIT_S, interval_s=S3_KEEPALIVE_INTERVAL_S):
+    """S3 会话超时防护：SA 锁定等待期间周期发送 3E 80 keepalive。
+
+    固件验证（can_protocol.c）：uds_process_message 对任何诊断请求（含
+    3E suppress 帧）在派发前刷新 last_tester_present_tick（:1770）；
+    handle_tester_present 对 suppress 帧同样刷新计时且不回响应（:1509）
+    → 3E 80 与 3E 00 同样续期 S3，优先 3E 80（无响应帧干扰，库立即返回）。
+    周期 3s < SESSION_TIMEOUT_MS 5s（can_protocol.h:167）；总等待时长 >30s
+    锁定期。走既有 uds_try 通道，不碰探测/raw 路径；keepalive 失败只记录，
+    不中断等待。
+
+    本测试脚本增强：逐次打印 keepalive 序号+累计时间（核心观察点，
+    用户日志可直观看到约 11 次发送）。
+    """
+    t_start = time.time()
+    t_end = t_start + float(total_s)
+    sent = 0
+    _log("S3 keepalive 等待 %.0fs（每 %.0fs 发 3E 80 suppress，防会话超时回 default+清 security）"
+         % (total_s, interval_s))
+    while True:
+        remain = t_end - time.time()
+        if remain <= 0:
+            break
+        time.sleep(interval_s if remain > interval_s else remain)
+        if stopTask:
+            raise RuntimeError("用户停止脚本")
+        uds_try(bus_id, SID_TP, [0x80], suppress=1)
+        sent += 1
+        elapsed = time.time() - t_start
+        _log("  keepalive #%d（累计 %.1fs）3E 80 已发送" % (sent, elapsed))
+    total_elapsed = time.time() - t_start
+    _log("S3 keepalive 等待结束：%.1fs 内共发 %d 次 3E 80" % (total_elapsed, sent))
+    return sent
+
+
+# ======== SA 辅助函数 ========
+
+def _sa_fetch_seed(bus_id):
+    """27 01 取 seed。固件自 d64e8c2 起 seed 为 32 字节（67 01 + 32B）。
+    固件每次 27 01 都刷新 seed 并清空签名缓冲。"""
+    rx = uds_req(bus_id, SID_SA, [0x01])
+    if len(rx) < 34:
+        raise RuntimeError("seed 响应过短: %d 字节, 期望 67 01 + 32 字节 seed（≥34）" % len(rx))
+    return rx
+
+
+def _sa_send_sig(bus_id, sig):
+    """27 03 分片发送 64 字节签名：4 字节/帧 × 16 帧，blockSeq 0x01 起递增。"""
+    sig = _to_bytes(sig)
+    if len(sig) != 64:
+        raise RuntimeError("ECDSA 签名须 64 字节，实际 %d" % len(sig))
+    seq = 1
+    off = 0
+    while off < 64:
+        piece = sig[off:off + SA_SIG_CHUNK]
+        uds_req(bus_id, SID_SA, [0x03, seq] + _to_list(piece))
+        off += len(piece)
+        seq += 1
+    _log("  27 03 已送 64 字节 / %d 帧" % (seq - 1))
+    time.sleep(0.15)
+
+
+def _sa_wrong_key_attempt(bus_id, attempt_num):
+    """故意错 key 一次完整流程：27 01 → 假签名（全 0x00）→ 27 03×16 → 27 02。
+
+    返回 (expected_nrc, actual_nrc, seed_hex)：
+      expected_nrc = 预期 NRC（0x35/0x35/0x36），actual_nrc = 实际 NRC 或 None。
+    实际 NRC 与预期不符时由调用方日志警告但继续。
+    """
+    # 预期 NRC 序列：第 1、2 次 0x35（invalidKey，fail_count 计数），
+    # 第 WRONG_KEY_ATTEMPTS 次 0x36（exceededNumberOfAttempts，触发锁定）
+    if attempt_num < WRONG_KEY_ATTEMPTS:
+        expected_nrc = NRC_INVALID_KEY
+    else:
+        expected_nrc = NRC_EXCEEDED_ATTEMPTS
+
+    _log("  [错 key 第 %d/%d 次] 27 01 取 seed..." % (attempt_num, WRONG_KEY_ATTEMPTS))
+    rx = _sa_fetch_seed(bus_id)
+    seed_hex = _hex(rx[2:34])
+    _log("  seed(32B) " + seed_hex)
+
+    # 假签名 = 64 字节全 0x00（日志明示）
+    fake_sig = b"\x00" * 64
+    _log("  故意错误签名（全 0x00）→ 27 03 分片发送")
+    _sa_send_sig(bus_id, fake_sig)
+
+    _log("  27 02 验签（假签名）...")
+    try:
+        rx2 = uds_req(bus_id, SID_SA, [0x02], wait_pending_s=5)
+        # 不应到达这里——全 0x00 签名不应验签成功
+        _log("  警告：假签名 27 02 返回正响应 %s（固件验签逻辑异常？）" % _hex(rx2[:4]))
+        return (expected_nrc, None, seed_hex)
+    except UdsNrcError as e:
+        return (expected_nrc, e.nrc, seed_hex)
+
+
+def _sa_real_unlock(bus_id, priv):
+    """真 SA 解锁（单次完整流程）：27 01 → seed → ECDSA 真签 → 27 03×16 → 27 02。
+
+    返回 rx（27 02 应答，预期 67 02）。
+    已解锁时 27 01 返回 67 01+32×0x00，直接返回正响应。
+    """
+    _log("  27 01 取 seed...")
+    rx = _sa_fetch_seed(bus_id)
+    seed = _to_bytes(rx[2:34])
+    if seed == b"\x00" * 32:
+        _log("  seed=0（32 字节全 0），已解锁，跳过签名")
+        return rx
+    _log("  seed(32B) " + _hex(rx[2:34]))
+
+    # S3 防护：签名前后计时，距上次 UDS 交换 >3s 则先发 3E 80
+    t_sign = time.time()
+    sig = ecdsa_sign_msg(priv, seed)
+    sign_gap = time.time() - t_sign
+    if sign_gap > S3_SIGN_GAP_GUARD_S:
+        _log("  ECDSA 签名耗时 %.1fs（>%.1fs）：先发 3E 80 刷新 S3 计时"
+             % (sign_gap, S3_SIGN_GAP_GUARD_S))
+        uds_try(bus_id, SID_TP, [0x80], suppress=1)
+
+    _log("  ECDSA 真签名完成，27 03 分片发送...")
+    _sa_send_sig(bus_id, sig)
+
+    _log("  27 02 验签（真签名）...")
+    rx2 = uds_req(bus_id, SID_SA, [0x02], wait_pending_s=5)
+    return rx2
+
+
+# ======== 运行侧探测 / Standby 唤醒收敛（判定只按正证据）========
+# 与 zcanpro_charge_start.py / zcanpro_sn_write.py probe_location 同构
+# （固件依据文件:行号见脚本头部与提交报告）：绝不按 NRC 值分叉定位——
+# 0x34/22 2113 的任何应答（正响应或任意 NRC，且非 0xFE 标记）= 在 APP；
+# 22 2113 应答中 62 21 13 后字节为 0xFE = Boot safe mode（APP 的
+# DID 0x2113 也正响应，slot 字节 0x00/0x01 永不 0xFE）；无应答 ≠ 不在 APP，
+# 先 Standby 唤醒收敛（3E 80 burst）+ 释放 UDS 通道监听 0x18FF260D
+# 生命周期帧再判。
+
+LIFE_ANNOUNCE_ID    = 0x18FF260D
+LIFE_ANNOUNCE_MAGIC = (0x01, 0x41, 0x57, 0x4B)  # AWK：Standby 唤醒标识
+LIFE_BOOTUP_MAGIC   = (0x01, 0x41, 0x00)        # BOOTUP：上电/复位/Boot 跳转标识
+LIFE_ABT_MAGIC      = (0x01, 0x41, 0x42, 0x54)  # ABT：Boot safe mode 心跳
+SAFE_MODE_RESP_ID   = UDS_RESP_ID               # 0x18DA030D
+SAFE_MODE_MARKER    = (0x62, 0x21, 0x13, 0xFE)  # Boot safe mode 应答标记（不含 ISO-TP PCI）
+DID_ACTIVE_SLOT     = 0x2113
+PROBE_ROUNDS        = 3
+WAKE_BURST_ROUNDS   = 3      # （3E 80 ×3 + 0.2s）×3
+WAKE_BURST_COUNT    = 3
+WAKE_BURST_GAP_S    = 0.2
+LIFE_LISTEN_S       = 2.0
+VERDICT_CN = {"APP": "APP", "BOOT_SM": "Boot safe mode", "UNKNOWN": "UNKNOWN"}
+
+FAIL_STEP_DESC = {
+    0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
+    1: "镜像 magic 校验失败",
+    2: "image_length 为 0 或超出槽范围",
+    3: "镜像 CRC32 校验失败",
+    4: "Reset handler 不在槽内（跨槽链接镜像）",
+    5: "ECDSA 公钥缺失/无效（Device Info 与内置公钥均不可用）",
+    6: "ECDSA P-256 验签失败",
+}
+
+
+def _safe_mode_step(dat):
+    """识别 Boot safe mode 应答：ISO-TP SF 05 62 21 13 FE <step> 或历史裸帧
+    62 21 13 FE <step>（双格式兼容，与 zcanpro_ext_ota_auto.py 同构）。"""
+    if (len(dat) >= 6 and dat[0] == 0x05 and dat[1] == 0x62 and dat[2] == 0x21
+            and dat[3] == 0x13 and dat[4] == 0xFE):
+        return int(dat[5])
+    if (len(dat) >= 5 and dat[0] == 0x62 and dat[1] == 0x21
+            and dat[2] == 0x13 and dat[3] == 0xFE):
+        return int(dat[4])
+    return None
+
+
+def _safe_mode_detail(step):
+    desc = FAIL_STEP_DESC.get(step, "未知 fail_step（Boot 固件可能早于标记帧版本）")
+    return "22 2113 应答 0xFE 标记 = Boot safe mode，fail_step=%d（%s）" % (step, desc)
+
+
+def _parse_can_frame(f):
+    """与 zcanpro_ext_ota_auto.py 同构：兼容 dict / (id,data) 元组 / 属性对象；
+    CAN ID 取 & 0x1FFFFFFF（bit31 为 ZLG 扩展帧标志）。"""
+    cid = None
+    dat = None
+    if isinstance(f, dict):
+        cid = f.get("can_id", f.get("id", f.get("ID")))
+        dat = f.get("data", f.get("Data"))
+    elif isinstance(f, (tuple, list)) and len(f) >= 2:
+        cid, dat = f[0], f[1]
+    else:
+        cid = getattr(f, "can_id", getattr(f, "id", None))
+        dat = getattr(f, "data", None)
+    if cid is None:
+        return None
+    if not isinstance(dat, (list, tuple, bytes, bytearray)):
+        dat = []
+    try:
+        return (int(cid) & 0x1FFFFFFF, [int(x) & 0xFF for x in list(dat)])
+    except (TypeError, ValueError):
+        return None
+
+
+def _unwrap_receive(raw):
+    """与 zcanpro_ext_ota_auto.py / zcanpro_read_app_version.py 同构：
+    receive 常见返回 (status, [frames])。"""
+    if raw is None:
+        return []
+    if isinstance(raw, tuple) or (isinstance(raw, list) and len(raw) == 2
+                                  and not isinstance(raw[0], dict)
+                                  and isinstance(raw[1], (list, tuple))):
+        a, b = raw[0], raw[1]
+        if isinstance(b, (list, tuple)):
+            return list(b)
+        if isinstance(a, (list, tuple)):
+            return list(a)
+    if isinstance(raw, dict) or (not isinstance(raw, (list, tuple))):
+        return [raw]
+    return list(raw)
+
+
+def _recv_frames(bus_id):
+    try:
+        raw = zcanpro.receive(bus_id)
+    except TypeError:
+        try:
+            raw = zcanpro.receive()
+        except Exception:
+            return []
+    except Exception:
+        return []
+    out = []
+    for f in _unwrap_receive(raw):
+        p = _parse_can_frame(f)
+        if p is not None:
+            out.append(p)
+    return out
+
+
+def _lifecycle_check(cid, dat):
+    """0x18FF260D 生命周期帧分类：awk / bootup / abt / shutdown / None。
+    ABT（01 41 42 54）只有 Boot safe mode 发；AWK/BOOTUP 只有 APP 发。"""
+    if cid != LIFE_ANNOUNCE_ID or len(dat) < 3:
+        return None
+    if len(dat) >= 4 and tuple(dat[:4]) == LIFE_ANNOUNCE_MAGIC:
+        return "awk"
+    if len(dat) >= 4 and tuple(dat[:4]) == LIFE_ABT_MAGIC:
+        return "abt"
+    if dat[0] == 0x01 and dat[1] == 0x41 and dat[2] == 0x00:
+        return "bootup"
+    if dat[0] == 0x06 and dat[1] == 0x41:
+        return "shutdown"
+    return None
+
+
+def _listen_lifecycle(bus_id, listen_s=LIFE_LISTEN_S):
+    """释放 UDS 通道后 raw 收帧监听生命周期帧（UDS 占用通道时 raw receive
+    不可靠，必须先 uds_deinit，finally 恢复）。
+    返回 ([(类型,data)...], [(cid,data)...全部收帧])。"""
+    found = []
+    all_frames = []
+    try:
+        zcanpro.uds_deinit()
+    except Exception as e:
+        _log("UDS 通道释放失败（继续监听）: " + str(e))
+    try:
+        t_end = time.time() + float(listen_s)
+        while time.time() < t_end:
+            if stopTask:
+                raise RuntimeError("用户停止脚本")
+            for cid, dat in _recv_frames(bus_id):
+                all_frames.append((cid, dat))
+                lt = _lifecycle_check(cid, dat)
+                if lt is not None:
+                    _log("生命周期帧 [%s] 0x%08X %s" % (lt.upper(), cid, _hex(dat[:8])))
+                    found.append((lt, dat))
+            time.sleep(0.02)
+    finally:
+        try:
+            uds_init()
+        except Exception as e:
+            _log("UDS 通道恢复失败: " + str(e))
+    return found, all_frames
+
+
+def wake_bus(bus_id, listen_s=LIFE_LISTEN_S):
+    """Standby 唤醒收敛：（3E 80 suppress ×3 + 0.2s）×3 后释放 UDS 通道
+    监听生命周期帧。返回 (证据列表, 全部收帧)。证据 (类型,data)：
+    AWK/BOOTUP=APP 启动正证据；ABT=Boot safe mode 正证据（500ms 心跳，
+    无需再发 UDS 探测）。"""
+    if stopTask:
+        raise RuntimeError("用户停止脚本")
+    for _b in range(WAKE_BURST_ROUNDS):
+        for _i in range(WAKE_BURST_COUNT):
+            uds_try(bus_id, SID_TP, [0x80], suppress=1)
+            time.sleep(WAKE_BURST_GAP_S)
+    return _listen_lifecycle(bus_id, listen_s=listen_s)
+
+
+def _probe_once(bus_id, sid, payload):
+    """单次探测：直接调库并按【应答字节】分类，绝不按 NRC 值推断运行侧。
+    返回 (tag, detail)：
+      ("silent",  None)  无应答——不能据此定位（Standby/Boot 静默/链路问题）
+      ("boot_sm", str)   22 2113 应答带 0xFE 标记 = Boot safe mode
+      ("app",     str)   有应答且非 Boot safe mode 标记 = 在 APP（含任意 NRC）
+      ("other",   data)  未识别应答字节，仅取证，不参与定位
+    """
+    if stopTask:
+        raise RuntimeError("用户停止脚本")
+    req = {"src_addr": UDS_REQ_ID, "dst_addr": UDS_RESP_ID,
+           "suppress_response": 0, "sid": sid, "data": list(payload)}
+    _log("[Tx-probe] %02X %s" % (sid, _hex(payload[:16])))
+    try:
+        resp = zcanpro.uds_request(bus_id, req)
+    except Exception as e:
+        _log("[Rx-probe] 探测异常（按无应答处理，不据此定位）: %s" % e)
+        return ("silent", None)
+    data = list((resp or {}).get("data") or [])
+    if data:
+        _log("[Rx-probe] " + _hex(data[:24]))
+    else:
+        _log("[Rx-probe] 无应答 (result=%s)" % ((resp or {}).get("result"),))
+    if not data:
+        return ("silent", None)
+    step = _safe_mode_step(data)
+    if step is not None:
+        return ("boot_sm", _safe_mode_detail(step))
+    if len(data) >= 3 and data[0] == SID_NRC and data[1] == sid:
+        return ("app", "NRC 0x%02X（对 %02X 的应答 = APP 实现该服务）" % (data[2], sid))
+    if data[0] == (sid + SID_PR):
+        if sid == SID_RDBI:
+            return ("app", "22 2113 正响应 slot=%s（APP DID_ACTIVE_SLOT，记录字节非 0xFE）"
+                    % _hex(data[3:4]))
+        return ("app", "0x34 正响应 %s（APP 实现下载服务）" % _hex(data[:8]))
+    if len(data) >= 3 and data[0] in (0x03, 0x07) and data[1] == 0x01 and data[2] == 0x41:
+        return ("app", "生命周期双发帧（UDS 响应 ID）%s = APP 正证据" % _hex(data[:8]))
+    return ("other", data)
+
+
+def probe_location(bus_id):
+    """运行侧探测：只按正证据判定，绝不按 NRC 值分叉。
+    返回 (verdict, detail)，verdict ∈ ("APP", "BOOT_SM", "UNKNOWN")：
+      22 2113 应答带 0xFE 标记 → BOOT_SM；22 2113 / 0x34 任何其他应答 → APP；
+      无应答 → wake_bus 唤醒收敛 + 生命周期帧监听（ABT→BOOT_SM，
+      AWK/BOOTUP→APP 正证据）后重试，≤3 轮；全部无证据 → UNKNOWN +
+      完整取证日志（burst 轮次 / 监听时长 / 收到的所有帧）。"""
+    life_evidence = []
+    forensics = []
+    for attempt in range(1, PROBE_ROUNDS + 1):
+        if stopTask:
+            raise RuntimeError("用户停止脚本")
+        _log("---- 探测运行侧 第 %d/%d 轮 ----" % (attempt, PROBE_ROUNDS))
+        tag, detail = _probe_once(bus_id, SID_RDBI,
+                                  [(DID_ACTIVE_SLOT >> 8) & 0xFF, DID_ACTIVE_SLOT & 0xFF])
+        if tag == "boot_sm":
+            return ("BOOT_SM", detail)
+        if tag == "app":
+            return ("APP", detail)
+        if tag == "other":
+            _log("22 2113 未识别应答（仅取证，不参与定位）: %s" % _hex(detail))
+            forensics.append(("round%d 22 2113" % attempt, detail))
+        tag, detail = _probe_once(bus_id, SID_RD, [0x00])
+        if tag == "boot_sm":
+            return ("BOOT_SM", detail)
+        if tag == "app":
+            return ("APP", detail)
+        if tag == "other":
+            _log("0x34 未识别应答（仅取证，不参与定位）: %s" % _hex(detail))
+            forensics.append(("round%d 0x34" % attempt, detail))
+        _log("两探无应答 → 唤醒 burst（3E 80 ×%d + %.1fs）×%d + 生命周期监听 %.1fs"
+             % (WAKE_BURST_COUNT, WAKE_BURST_GAP_S, WAKE_BURST_ROUNDS, LIFE_LISTEN_S))
+        found, all_frames = wake_bus(bus_id)
+        forensics.append(("round%d listen %.1fs" % (attempt, LIFE_LISTEN_S), all_frames))
+        for lt, dat in found:
+            life_evidence.append((lt, dat))
+            if lt == "abt":
+                step = dat[5] if len(dat) > 5 else None
+                desc = FAIL_STEP_DESC.get(step, "未知 fail_step") if step is not None else "无 step 字节"
+                return ("BOOT_SM", "生命周期 ABT 心跳 %s = Boot safe mode，fail_step=%s（%s）"
+                        % (_hex(dat[:8]), step, desc))
+        if found:
+            _log("生命周期帧证据 %d 个（%s）→ 重试 UDS 探测"
+                 % (len(found), ",".join(lt for lt, _d in found)))
+        else:
+            _log("监听 %.1fs 未见 0x%08X 生命周期帧" % (LIFE_LISTEN_S, LIFE_ANNOUNCE_ID))
+    awk_or_bootup = [e for e in life_evidence if e[0] in ("awk", "bootup")]
+    if awk_or_bootup:
+        lt, dat = awk_or_bootup[0]
+        return ("APP", "生命周期帧 [%s] %s 正证据：APP 已启动"
+                "（UDS 探测无应答，链路/会话异常；后续 UDS 步骤若失败请检查链路）"
+                % (lt.upper(), _hex(dat[:8])))
+    _log("探测取证：共 %d 轮，每轮唤醒 burst（3E 80 ×%d + %.1fs）×%d + 监听 %.1fs；"
+         "UDS 探测与生命周期帧均无证据"
+         % (PROBE_ROUNDS, WAKE_BURST_COUNT, WAKE_BURST_GAP_S,
+            WAKE_BURST_ROUNDS, LIFE_LISTEN_S))
+    for tag, frames in forensics:
+        if isinstance(frames, list):
+            _log("取证[%s] 收帧 %d 个:" % (tag, len(frames)))
+            for cid, dat in frames[:40]:
+                _log("  0x%08X %s" % (cid, _hex(dat[:8])))
+        else:
+            _log("取证[%s] %s" % (tag, _hex(frames)))
+    return ("UNKNOWN", "设备无应答（已排除 Standby），无法确定运行侧")
+
+
+# ======== SA 锁定恢复测试主流程 ========
+
+def run_sa_lockout_test(bus_id):
+    """SA 锁定恢复测试主流程（Step 0~6 + 结束判定）。"""
+    _log("======== SA 锁定恢复测试 ========")
+    _log("测试目的：故意错 key 触发 SA 锁定 → S3 keepalive 等待 → 恢复解锁 → "
+         "验证会话+安全态在 31s 锁定等待期间是否被 keepalive 保住")
+    _log("错 key 次数: %d（= SECURITY_MAX_FAILURES，触发锁定）" % WRONG_KEY_ATTEMPTS)
+    _log("私钥: " + PRIVATE_KEY_PATH)
+
+    if not os.path.isfile(PRIVATE_KEY_PATH):
+        raise RuntimeError("找不到私钥: " + PRIVATE_KEY_PATH)
+    priv = load_ec_private_key(PRIVATE_KEY_PATH)
+
+    uds_init()
+
+    # 测试结果收集（每步 pass/fail + 详情）
+    results = []  # [(step_name, passed, expected, actual, note)]
+
+    def _record(step, passed, expected, actual, note=""):
+        results.append((step, passed, expected, actual, note))
+        status = "PASS" if passed else "FAIL"
+        _log("  [%s] %s | 预期=%s 实际=%s%s"
+             % (status, step, expected, actual, (" | " + note) if note else ""))
+
+    # ---- Step 0: 探测运行侧 ----
+    _log("---- Step 0: 探测运行侧（唤醒收敛 + 正证据判定）----")
+    _log("固件侧解读：SA 锁定测试需正常 APP（Boot safe mode 不实现完整 SA 流程）")
+    verdict, detail = probe_location(bus_id)
+    _log("[判定结论] %s（依据: %s）" % (VERDICT_CN[verdict], detail))
+    if verdict == "BOOT_SM":
+        raise RuntimeError("设备在 Boot safe mode，SA 锁定测试需 APP——%s。"
+                           "请先用 merge_prod_bin 烧录器重刷或确认 APP 槽有效后再试" % detail)
+    if verdict == "UNKNOWN":
+        raise RuntimeError("设备无应答（已排除 Standby），无法确定运行侧。"
+                           "取证见上方日志（burst 轮次 / 监听时长 / 收帧明细）")
+    _record("Step0-探测", True, "APP", verdict, detail[:60])
+
+    # ---- Step 1: 进入编程会话 ----
+    _log("---- Step 1: 进入编程会话 10 02 ----")
+    _log("固件侧解读：与 zcanpro_sn_write.py 一致（后续 Step 6b 验证写 F18C 需 "
+         "SESSION_PROGRAMMING 门禁，can_protocol.c:1051-1062）")
+    try:
+        rx = uds_req(bus_id, SID_DSC, [0x02])
+        dsc_ok = (len(rx) >= 2 and rx[0] == 0x50 and rx[1] == 0x02)
+        _record("Step1-10 02", dsc_ok, "50 02 00 32 01 F4", _hex(rx[:6]),
+                "" if dsc_ok else "会话切换应答异常")
+    except (UdsNrcError, RuntimeError) as e:
+        _record("Step1-10 02", False, "50 02", str(e), "会话切换失败，后续步骤门禁将不满足")
+        _log("[判定结论] SA 锁定恢复测试 FAIL（Step 1 会话切换失败）")
+        return False
+
+    # ---- Step 2: 故意错 key ×WRONG_KEY_ATTEMPTS ----
+    _log("---- Step 2: 故意错 key ×%d（假签名=全 0x00）----" % WRONG_KEY_ATTEMPTS)
+    _log("固件侧解读：验签失败 fail_count++（can_protocol.c:1465）；fail_count≥3"
+         "（SECURITY_MAX_FAILURES=3 :71）→ 锁定 30s + 第 3 次 27 02 回 NRC 0x36（:1472）；"
+         "前两次 fail_count<3 → NRC 0x35 invalidKey")
+    expected_nrc_seq = []
+    actual_nrc_seq = []
+    for i in range(1, WRONG_KEY_ATTEMPTS + 1):
+        try:
+            exp_nrc, act_nrc, _seed_h = _sa_wrong_key_attempt(bus_id, i)
+        except (UdsNrcError, RuntimeError) as e:
+            _log("  警告：错 key 第 %d 次异常: %s（继续后续步骤）" % (i, e))
+            exp_nrc = NRC_INVALID_KEY if i < WRONG_KEY_ATTEMPTS else NRC_EXCEEDED_ATTEMPTS
+            act_nrc = "exception:%s" % e
+        expected_nrc_seq.append(exp_nrc)
+        actual_nrc_seq.append(act_nrc)
+        if act_nrc is None:
+            _log("  警告：第 %d 次假签名收到正响应（预期 NRC 0x%02X），固件验签逻辑异常？"
+                 % (i, exp_nrc))
+        elif isinstance(act_nrc, int) and act_nrc != exp_nrc:
+            _log("  警告：第 %d 次 NRC 不符——预期 0x%02X（%s），实际 0x%02X（%s）"
+                 % (i, exp_nrc, NRC_DESC.get(exp_nrc, ""), act_nrc,
+                    NRC_DESC.get(act_nrc, "未知")))
+        else:
+            _log("  第 %d 次 NRC 0x%02X 符合预期（%s）"
+                 % (i, act_nrc, NRC_DESC.get(act_nrc, "")))
+
+    exp_str = "/".join("0x%02X" % n for n in expected_nrc_seq)
+    act_str = "/".join(
+        ("0x%02X" % n if isinstance(n, int) else str(n)) for n in actual_nrc_seq)
+    wrong_key_ok = all(
+        isinstance(a, int) and a == e
+        for a, e in zip(actual_nrc_seq, expected_nrc_seq))
+    _record("Step2-错key×%d" % WRONG_KEY_ATTEMPTS, wrong_key_ok,
+            exp_str, act_str,
+            "" if wrong_key_ok else "实际 NRC 与预期不符（日志警告，继续后续步骤）")
+
+    # ---- Step 3: 锁定确认 ----
+    _log("---- Step 3: 锁定确认（27 01 → 预期 NRC 0x37）----")
+    _log("固件侧解读：锁定期内 27 01 回 NRC 0x37 requiredTimeDelay"
+         "（can_protocol.c:1333-1341）；设备已进入锁定（fail_count≥3，约 30s）")
+    try:
+        rx = uds_req(bus_id, SID_SA, [0x01])
+        _log("  警告：锁定期内 27 01 返回正响应 %s（预期 NRC 0x37）" % _hex(rx[:4]))
+        _record("Step3-锁定确认", False, "NRC 0x37", "正响应 " + _hex(rx[:4]),
+                "设备未按预期进入锁定？")
+    except UdsNrcError as e:
+        if e.nrc == NRC_REQUIRED_TIME_DELAY:
+            _log("  设备已进入锁定（fail_count≥3，约 30s）——NRC 0x37 requiredTimeDelay ✓")
+            _record("Step3-锁定确认", True, "NRC 0x37", "NRC 0x37",
+                    "设备 SecurityAccess 锁定生效")
+        else:
+            _log("  警告：27 01 NRC 0x%02X（预期 0x37），设备锁定状态异常"
+                 % e.nrc)
+            _record("Step3-锁定确认", False, "NRC 0x37", "NRC 0x%02X" % e.nrc,
+                    NRC_DESC.get(e.nrc, "未知 NRC"))
+    except RuntimeError as e:
+        _log("  警告：27 01 异常 %s（预期 NRC 0x37）" % e)
+        _record("Step3-锁定确认", False, "NRC 0x37", str(e), "无应答/通信异常")
+
+    # ---- Step 4: S3 keepalive 等待 ----
+    _log("---- Step 4: S3 keepalive 等待 %.0fs（核心观察点）----" % SA_LOCKOUT_WAIT_S)
+    _log("固件侧解读：S3=5s（can_protocol.h:167），任何诊断请求刷新计时（:1770+:1509）；"
+         "锁定等待 31s 若无 keepalive，固件 poll（:2094-2098）会复位会话+清安全态→"
+         "恢复后写步撞 NRC 0x22/0x33——keepalive 正是本测试的核心验证对象")
+    keepalive_count = _s3_keepalive_wait(bus_id)
+    _log("keepalive 发送 %d 次 / %.0fs" % (keepalive_count, SA_LOCKOUT_WAIT_S))
+    keepalive_ok = keepalive_count >= 9  # 31s/3s ≈ 10.3，至少 9 次为合理下限
+    _record("Step4-keepalive", keepalive_ok,
+            "≥9 次（31s/3s≈10-11）", "%d 次" % keepalive_count,
+            "" if keepalive_ok else "keepalive 次数偏少，S3 防护可能不充分")
+
+    # ---- Step 5: 恢复解锁（真 private.pem → 完整 SA） ----
+    _log("---- Step 5: 恢复解锁（真 private.pem → 完整 SA）----")
+    _log("固件侧解读：锁定期过→fail_count=0（can_protocol.c:1340）；"
+         "真签名 ECDSA 验签通过 → security_unlocked=1（:1454）")
+    try:
+        rx = _sa_real_unlock(bus_id, priv)
+        if len(rx) >= 2 and rx[0] == 0x67 and rx[1] == 0x02:
+            _log("  解锁成功：67 02 ✓")
+            _record("Step5-恢复解锁", True, "67 02", "67 02", "ECDSA 真签验签通过")
+        elif len(rx) >= 34 and rx[0] == 0x67 and rx[1] == 0x01 and _to_bytes(rx[2:34]) == b"\x00" * 32:
+            _log("  已解锁（seed 全 0），无需签名")
+            _record("Step5-恢复解锁", True, "67 02", "67 01+32×00", "已解锁状态")
+        else:
+            _log("  恢复解锁异常：应答 %s" % _hex(rx[:6]))
+            _record("Step5-恢复解锁", False, "67 02", _hex(rx[:6]),
+                    "应答格式不符（设备可能仍在锁定/会话复位）")
+    except UdsNrcError as e:
+        _log("  恢复解锁失败：NRC 0x%02X（%s）" % (e.nrc, NRC_DESC.get(e.nrc, "未知")))
+        hint = ""
+        if e.nrc in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
+            hint = "设备可能仍在锁定中——建议断电重启后重跑"
+        elif e.nrc == 0x24:
+            hint = "g_seed_generated 已被清（裸发 27 02 撞序检查），流程异常"
+        _record("Step5-恢复解锁", False, "67 02", "NRC 0x%02X" % e.nrc, hint)
+    except RuntimeError as e:
+        _log("  恢复解锁失败: %s" % e)
+        _record("Step5-恢复解锁", False, "67 02", str(e),
+                "设备可能仍在锁定/会话复位，建议断电重启后重跑")
+
+    # ---- Step 6a: 解锁态确认 ----
+    _log("---- Step 6a: 解锁态确认（27 01 → 预期 67 01 + 32×0x00）----")
+    _log("固件侧解读：已解锁时 27 01 返回 67 01 + 32×0x00（can_protocol.c:1343-1352）")
+    try:
+        rx = uds_req(bus_id, SID_SA, [0x01])
+        if len(rx) >= 34 and rx[0] == 0x67 and rx[1] == 0x01:
+            seed_check = _to_bytes(rx[2:34])
+            if seed_check == b"\x00" * 32:
+                _log("  已解锁确认：67 01 + 32×0x00 ✓")
+                _record("Step6a-解锁确认", True, "67 01+32×00", "67 01+32×00",
+                        "security_unlocked=1 确认")
+            else:
+                _log("  27 01 返回 67 01 但 seed 非全 0（设备未解锁？）")
+                _record("Step6a-解锁确认", False, "67 01+32×00", "67 01+seed非全0",
+                        "设备 security_unlocked=0")
+        else:
+            _log("  27 01 应答异常: %s" % _hex(rx[:6]))
+            _record("Step6a-解锁确认", False, "67 01+32×00", _hex(rx[:6]),
+                    "应答格式不符")
+    except UdsNrcError as e:
+        _log("  27 01 NRC 0x%02X（%s）" % (e.nrc, NRC_DESC.get(e.nrc, "未知")))
+        _record("Step6a-解锁确认", False, "67 01+32×00", "NRC 0x%02X" % e.nrc,
+                NRC_DESC.get(e.nrc, "未知"))
+    except RuntimeError as e:
+        _log("  27 01 异常: %s" % e)
+        _record("Step6a-解锁确认", False, "67 01+32×00", str(e), "通信异常")
+
+    # ---- Step 6b: 幂等写验证（S3 防护实机验证点） ----
+    _log("---- Step 6b: 幂等写验证（2E F1 8C + 相同 SN → 预期 6E F1 8C）----")
+    _log("固件侧解读：写门禁 0xF18C = SESSION_PROGRAMMING + security_unlocked"
+         "（can_protocol.c:1051-1062）；相同值重写=幂等无副作用；"
+         "S3 防护失效时此处必撞 NRC 0x22（会话回 default）/ 0x33（安全态被清）")
+    if sys.version_info[0] >= 3:
+        sn_bytes = SN_CODE.encode("ascii")
+    else:
+        sn_bytes = str(SN_CODE)
+    sn32 = _to_list(sn_bytes) + [0x20] * (32 - len(sn_bytes))
+    _log("  写入数据（相同 SN，幂等）: " + _hex(sn32))
+
+    try:
+        rx = uds_req(bus_id, SID_WDBI, [0xF1, 0x8C] + sn32, wait_pending_s=10)
+        if len(rx) >= 3 and rx[0] == 0x6E and rx[1] == 0xF1 and rx[2] == 0x8C:
+            _log("  写入成功：6E F1 8C ✓——S3 keepalive 防护有效！"
+                 "31s 锁定等待期间会话+安全态保持")
+            _record("Step6b-幂等写", True, "6E F1 8C", "6E F1 8C",
+                    "S3 keepalive 防护实机验证通过：会话+安全态在 31s 等待期间保持")
+        else:
+            _log("  写入应答异常: %s" % _hex(rx[:6]))
+            _record("Step6b-幂等写", False, "6E F1 8C", _hex(rx[:6]),
+                    "应答格式不符")
+    except UdsNrcError as e:
+        _log("  写入失败：NRC 0x%02X（%s）" % (e.nrc, NRC_DESC.get(e.nrc, "未知")))
+        if e.nrc == NRC_CONDITIONS_NOT_CORRECT:
+            hint = ("NRC 0x22 conditionsNotCorrect——S3 防护失效：31s 等待期间"
+                    "无 keepalive（或间隔>5s），固件 poll（:2094-2098）已将会话"
+                    "回 default → 写门禁 SESSION_PROGRAMMING 不满足")
+        elif e.nrc == NRC_SECURITY_ACCESS_DENIED:
+            hint = ("NRC 0x33 securityAccessDenied——S3 防护失效：会话切换/"
+                    "超时清了 security_unlocked → 写门禁 security_unlocked 不满足")
+        else:
+            hint = NRC_DESC.get(e.nrc, "未知 NRC")
+        _record("Step6b-幂等写", False, "6E F1 8C", "NRC 0x%02X" % e.nrc, hint)
+    except RuntimeError as e:
+        _log("  写入失败: %s" % e)
+        _record("Step6b-幂等写", False, "6E F1 8C", str(e), "通信异常")
+
+    # ---- 结束判定 ----
+    _log("======== 测试结束判定 ========")
+    all_pass = all(r[1] for r in results)
+    fail_items = [r for r in results if not r[1]]
+
+    if all_pass:
+        _log("[判定结论] SA 锁定恢复测试 PASS（keepalive %d 次/%.0fs，会话保持有效，写步通过）"
+             % (keepalive_count, SA_LOCKOUT_WAIT_S))
+        _log("验证结论：S3 keepalive 防护在 SA 锁定等待场景实机有效——"
+             "31s 等待期间会话+安全态未被复位，恢复解锁后幂等写通过")
+    else:
+        _log("[判定结论] SA 锁定恢复测试 FAIL（%d/%d 步未命中预期）"
+             % (len(fail_items), len(results)))
+        _log("---- 逐项差异明细 ----")
+        for step, _p, expected, actual, note in fail_items:
+            _log("  ✗ %s: 预期=%s 实际=%s%s"
+                 % (step, expected, actual, (" | " + note) if note else ""))
+        _log("---- 固件侧解释 ----")
+        for step, _p, _e, _a, note in fail_items:
+            if note:
+                _log("  %s: %s" % (step, note))
+        _log("---- 处置建议 ----")
+        if any("Step5" in r[0] for r in fail_items):
+            _log("  恢复解锁失败→设备可能仍在锁定/会话复位，建议断电重启后重跑")
+        if any("Step6b" in r[0] for r in fail_items):
+            _log("  写步失败→S3 keepalive 防护可能未生效，检查 keepalive 日志"
+                 "（Step 4）确认发送次数与间隔")
+        if any("Step2" in r[0] for r in fail_items):
+            _log("  错 key NRC 不符→固件 SA 锁定逻辑可能与预期不同，"
+                 "请核对 can_protocol.c 锁定分支（:1333-1341/:1465-1472）")
+        _log("  建议与其他测试错开执行（避免 fail_count 残留干扰其他 SA 流程）")
+
+    return all_pass
+
+
+# ======== 入口 ========
+
+def z_main():
+    global stopTask
+    stopTask = False
+    _log("======== Qi Charger SA 锁定恢复测试工具 ========")
+    _log("测试项：P1 — SA 锁定恢复（d770e86 S3 keepalive 防护实机验证）")
+    _log("错 key 次数: %d | 锁定等待: %.0fs | keepalive 间隔: %.0fs"
+         % (WRONG_KEY_ATTEMPTS, SA_LOCKOUT_WAIT_S, S3_KEEPALIVE_INTERVAL_S))
+    buses = zcanpro.get_buses()
+    if not buses:
+        _log("请先打开 CAN 通道 250kbps 扩展帧")
+        return
+    try:
+        ok = run_sa_lockout_test(buses[0]["busID"])
+        if not ok:
+            _log("SA 锁定恢复测试未通过（详见上方判定结论）")
+    except Exception as e:
+        _log("SA 锁定恢复测试异常: " + str(e))
+    finally:
+        try:
+            zcanpro.uds_deinit()
+        except Exception:
+            pass
