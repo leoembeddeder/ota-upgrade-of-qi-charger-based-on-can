@@ -171,7 +171,10 @@ uint8_t ota_running_slot(void);
 uint32_t ota_running_slot_base(void);
 
 /**
- * @brief  copy version string from this slot's image header
+ * @brief  copy version string from this slot's XATO image header
+ * @note   镜像头 version 字段由打包脚本 IMAGE_VERSION 写入，仅作镜像标识/
+ *         打包校验用途。运行版本报告（UDS DID 0xF195）以 can_protocol.c
+ *         的 SW_VERSION_STR 编译常量为唯一真相源，不经过本函数。
  * @param  out: destination buffer
  * @param  out_len: capacity including NUL
  * @retval 0 on success, -1 if header magic is invalid

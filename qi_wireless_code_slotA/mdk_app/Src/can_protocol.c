@@ -43,9 +43,15 @@
 
 /* ========================================================================== */
 /*  Version string constants (UTF-8, max 16 bytes including null terminator)  */
+/*                                                                            */
+/*  SW_VERSION_STR 是运行软件版本的【唯一真相源】：UDS DID 0xF195 应答直接  */
+/*  取此 APP 编译时常量，不再从 OTA metadata / XATO 镜像头 version 字段读取  */
+/*  （metadata 会被 trial/rollback/defaults 重建改写，异常场景下会说谎；     */
+/*  镜像头 version 由打包脚本 IMAGE_VERSION 写入，仅作镜像标识/打包校验）。  */
+/*  改版本号须同步：打包脚本 IMAGE_VERSION + docs 文档两处联动。             */
 /* ========================================================================== */
 
-static const char SW_VERSION_STR[]     = "QC_JYF_FW_1.1.1";
+static const char SW_VERSION_STR[]     = "QC_JYF_FW_1.1.1";   /*!< 运行版本唯一真相源 */
 static const char BOOTLOADER_VER_STR[] = "QC_JYF_BL_1.0.0";
 static const char HW_VERSION_STR[]     = "QC_JYF_HW_1.1.5";
 
@@ -650,15 +656,11 @@ static int8_t fill_did_payload(uint16_t did, uint8_t *out, uint8_t *olen)
   {
     case DID_SW_VERSION:
     {
-      char img_ver[16];
-      if (ota_get_image_version(img_ver, (uint8_t)sizeof(img_ver)) == 0)
-      {
-        device_info_pad32(out, img_ver);
-      }
-      else
-      {
-        device_info_pad32(out, SW_VERSION_STR);
-      }
+      /* 版本唯一真相源 = APP 编译时常量 SW_VERSION_STR（本文件顶部）。
+       * 不再从 OTA metadata / XATO 镜像头 version 字段取值：metadata 会被
+       * trial/rollback/defaults 重建改写，双副本全坏时会被默认值破坏性覆盖；
+       * 镜像头 version 仅保留镜像标识/打包校验用途，不代表运行代码版本。 */
+      device_info_pad32(out, SW_VERSION_STR);
       *olen = 32U;
       return 0;
     }

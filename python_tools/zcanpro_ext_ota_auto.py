@@ -452,6 +452,10 @@ def relocate_image_to_slot(image, dest, priv):
 
 
 def pack_image_if_needed(fw_path, priv, version="1.0.0"):
+    """必要时为裸 bin 补 XATO 头。version 写入镜像头 0x4C，仅作镜像标识/
+    打包校验；运行版本报告（DID 0xF195）以固件 SW_VERSION_STR 编译常量
+    为准，与此字段无关。正式打包的版本以 pack_image_slotA_1_1_1.py 的
+    IMAGE_VERSION 常量为准，本函数默认值 "1.0.0" 仅为历史兜底。"""
     data = open(fw_path, "rb").read()
     if len(data) >= IMAGE_HEADER_SIZE and struct.unpack_from("<I", data, 0)[0] == IMAGE_MAGIC:
         _log("固件已带 XATO 头, 总长 %d" % len(data))
@@ -844,6 +848,20 @@ def confirm_app_after_reset(bus_id):
         _log("DID 0x2010 fw_type=" + _hex(fw[3:4]))
     except UdsNrcError as e:
         _log("DID 0x2010 NRC 0x%02X（Boot 无此 DID）" % e.nrc)
+    # 运行版本确认：DID 0xF195 应答 = APP 编译时常量 SW_VERSION_STR
+    # （can_protocol.c 唯一真相源），不读 OTA metadata / XATO 镜像头；
+    # 解析方式与 zcanpro_read_app_version.py 一致（rx[3:35] 32B ASCII rstrip）。
+    try:
+        ver = uds_req(bus_id, SID_RDBI, [0xF1, 0x95])
+        if len(ver) >= 35 and ver[0] == (SID_RDBI + SID_PR):
+            sw = "".join(chr(b) if 0x20 <= b < 0x7F else "?" for b in ver[3:35]).rstrip()
+            _log("DID 0xF195 APP编译版本=" + sw + "（来源=固件 SW_VERSION_STR 编译常量）")
+        else:
+            _log("DID 0xF195 响应异常: " + _hex(ver[:8]))
+    except UdsNrcError as e:
+        _log("DID 0xF195 NRC 0x%02X（不影响判定）" % e.nrc)
+    except Exception as e:
+        _log("DID 0xF195 读取失败（不影响判定）: %s" % e)
     try:
         uds_req(bus_id, SID_RD, [0x00])
         _log("复位后 0x34 正响应，已在 APP")

@@ -248,6 +248,12 @@ uint8_t ota_running_slot(void)
   return OTA_SLOT_A;
 }
 
+/**
+ * @brief  copy version string from this slot's XATO image header
+ * @note   镜像头 version 字段由打包脚本 IMAGE_VERSION 写入，仅作镜像标识/
+ *         打包校验用途。运行版本报告（UDS DID 0xF195）以 can_protocol.c
+ *         的 SW_VERSION_STR 编译常量为唯一真相源，不经过本函数。
+ */
 int8_t ota_get_image_version(char *out, uint8_t out_len)
 {
   const ota_image_header_t *hdr;

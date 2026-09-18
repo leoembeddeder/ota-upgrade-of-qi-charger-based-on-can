@@ -2,6 +2,12 @@
 """
 ZCANPRO 脚本 — 读取 APP 侧版本号 DID 0xF195 / 0xF180 / 0xF193
 
+版本数据源（2026-09-18 改造）：
+  DID 0xF195 应答 = APP 固件编译时常量 SW_VERSION_STR（can_protocol.c），
+  不再从 OTA metadata / XATO 镜像头 version 字段读取（镜像头字段仅作
+  镜像标识/打包校验）。应答格式不变：32 字节 ASCII 右补空格。
+  本脚本期望值必须与固件编译常量一致。
+
 流程：
   1. TesterPresent 0x3E 00 连发两次（第一帧可能只唤醒 SIT1145 Standby）
   2. 原始 CAN 发 03 22 F1xx，收 ISO-TP 多帧并按 SN 组包
@@ -25,6 +31,8 @@ SID_TP   = 0x3E
 SID_NRC  = 0x7F
 SID_PR   = 0x40
 
+# 期望值 = 固件编译常量：SW_VERSION_STR / BOOTLOADER_VER_STR / HW_VERSION_STR
+# （can_protocol.c）。DID 0xF195 数据源为 APP 编译常量，非 metadata/镜像头。
 DID_LIST = [
     (0xF195, "APP 软件版本", "QC_JYF_FW_1.1.1"),
     (0xF180, "Bootloader 版本", "QC_JYF_BL_1.0.0"),
