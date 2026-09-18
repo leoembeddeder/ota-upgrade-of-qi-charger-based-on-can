@@ -37,7 +37,46 @@
 #include "boot_trial.h"
 #include "boot_verify.h"
 #include "can_driver.h"
+#include "sit1145.h"
+#include "timer_drv.h"
 #include "at32f422_426.h"
+#include "at32f422_426_can.h"
+
+static void safe_send_sf(const uint8_t *uds, uint8_t n)
+{
+  uint8_t sf[8];
+  uint8_t i;
+
+  if ((uds == (const uint8_t *)0) || (n == 0U) || (n > 7U))
+  {
+    return;
+  }
+  sf[0] = n;
+  for (i = 0U; i < n; i++)
+  {
+    sf[1U + i] = uds[i];
+  }
+  for (i = (uint8_t)(1U + n); i < 8U; i++)
+  {
+    sf[i] = 0xCCU;
+  }
+  (void)can_driver_send(CAN_ID_UDS_RESPONSE, sf, 8U);
+}
+
+static void safe_heartbeat(uint8_t cause, uint8_t step)
+{
+  uint8_t d[8];
+
+  d[0] = 0x01U;
+  d[1] = 0x41U;
+  d[2] = 0x42U; /* 'B' */
+  d[3] = 0x54U; /* 'T' */
+  d[4] = cause;
+  d[5] = step;
+  d[6] = 0xA5U;
+  d[7] = 0x00U;
+  (void)can_driver_send(CAN_ID_LIFECYCLE_BROADCAST, d, 8U);
+}
 
 void enter_safe_mode(uint8_t cause)
 {
@@ -45,54 +84,79 @@ void enter_safe_mode(uint8_t cause)
   uint8_t  data[CAN_DRIVER_MAX_DATA_LEN];
   uint8_t  len;
   uint8_t  step = g_verify_fail_step;
+  uint32_t last_hb;
 
-  /* 现场落盘：只写 reserved 字段，ota_metadata_t 仍 272B、META_VERSION=1
-   * 不变（version 严格相等校验，结构/版本改动会失效双副本并要求两工程
-   * 联烧；reserved 字段 APP 侧写 0/不读，零漂移）。
-   *   reserved1      = [cause(高字节) | fail_step(低字节)]
-   *   reserved2[0]   = last_boot_reason 进 safe mode 前快照
-   *   reserved2[1]   = 0xA5 safe-mode-entered 标记
-   * boot_metadata_save 内部已关中断（boot_metadata.c 咽喉点），CRC 重算。 */
   g_meta.reserved1    = (uint16_t)(((uint16_t)cause << 8) | step);
   g_meta.reserved2[0] = g_meta.last_boot_reason;
   g_meta.reserved2[1] = 0xA5U;
   (void)boot_metadata_save(&g_meta);
 
-  /* CAN 复用工程内已链接的 can_driver（md_k_can，含 0x18DA0D03 精确
-   * 过滤器）。Boot 上电路径此前从未初始化 CAN，此处属上电初始化语义，
-   * can_driver_init 合法；运行期/恢复路径仍禁止调用（固件运行时规则 1）。
-   * 16KB Boot 区约束：不新增驱动，仅本文件新增轮询逻辑（约 0.4KB，
-   * CAN 驱动链首次带入另占约 3~6KB，编译后须核对 .map 剩余空间）。 */
   can_driver_init();
+  (void)sit1145_normal_mode_set();
+  last_hb = timer_get_tick();
+  safe_heartbeat(cause, step);
 
   while (1)
   {
+    if (can_flag_get(CAN1, CAN_RIF_FLAG) != RESET)
+    {
+      can_driver_rx_irq_handler();
+    }
+
     while (can_driver_recv(&id, data, &len) == 0)
     {
+      uint8_t *u = data;
+      uint8_t  un = len;
+
       if (id != CAN_ID_UDS_REQUEST)
       {
         continue;
       }
-
-      /* 探测帧匹配：ISO-TP SF (03 22 21 13) 或裸 UDS (22 21 13) */
-      if (((len >= 4U) && (data[0] == 0x03U) && (data[1] == 0x22U) &&
-           (data[2] == 0x21U) && (data[3] == 0x13U)) ||
-          ((len >= 3U) && (data[0] == 0x22U) && (data[1] == 0x21U) &&
-           (data[2] == 0x13U)))
+      if ((len >= 2U) && ((data[0] & 0xF0U) == 0x00U))
       {
-        /* ISO-TP SF: ZCANPRO uds_request 认 PCI，不能发裸 62 21 13 FE */
-        uint8_t sf[8];
-
-        sf[0] = 0x05U;
-        sf[1] = 0x62U;
-        sf[2] = 0x21U;
-        sf[3] = 0x13U;
-        sf[4] = 0xFEU;
-        sf[5] = step;
-        sf[6] = 0xCCU;
-        sf[7] = 0xCCU;
-        (void)can_driver_send(CAN_ID_UDS_RESPONSE, sf, 8U);
+        uint8_t pci_n = data[0] & 0x0FU;
+        if ((pci_n >= 1U) && ((uint8_t)(1U + pci_n) <= len))
+        {
+          u = &data[1];
+          un = pci_n;
+        }
       }
+
+      if ((un >= 2U) && (u[0] == 0x3EU))
+      {
+        uint8_t r[2];
+        r[0] = 0x7EU;
+        r[1] = (uint8_t)(u[1] & 0x7FU);
+        if ((u[1] & 0x80U) == 0U)
+        {
+          safe_send_sf(r, 2U);
+        }
+      }
+      else if ((un >= 3U) && (u[0] == 0x22U) && (u[1] == 0x21U) && (u[2] == 0x13U))
+      {
+        uint8_t r[5];
+        r[0] = 0x62U;
+        r[1] = 0x21U;
+        r[2] = 0x13U;
+        r[3] = 0xFEU;
+        r[4] = step;
+        safe_send_sf(r, 5U);
+      }
+      else if ((un >= 1U) && (u[0] == 0x22U))
+      {
+        uint8_t r[3];
+        r[0] = 0x7FU;
+        r[1] = 0x22U;
+        r[2] = 0x11U;
+        safe_send_sf(r, 3U);
+      }
+    }
+
+    if ((timer_get_tick() - last_hb) >= 500U)
+    {
+      last_hb = timer_get_tick();
+      (void)sit1145_normal_mode_set();
+      safe_heartbeat(cause, step);
     }
   }
 }
