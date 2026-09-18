@@ -199,6 +199,7 @@ python merge_prod_bin.py
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-09-18 | **打包产物 XATO 镜像头不再携带版本号**：头 version 区（0x4C，16B）打包固定填 `0x00`；删打包脚本 `IMAGE_VERSION` 常量及 pack/verify/OTA/relocate 全链路对头 version 字段的写入/解析/日志；固件删 `ota_get_image_version()`（Boot/APP 校验均不依赖该字段）；版本号唯一定义在固件 `SW_VERSION_STR`，发版只改固件常量 + 文档；头总长 256B/magic/长度/CRC/签名偏移全部不变，旧 bin 兼容 |
 | 2026-09-18 | **软件版本读取源改造**：DID 0xF195 应答改取 APP 编译常量 `SW_VERSION_STR`（`can_protocol.c` 唯一真相源），不再读 OTA metadata / XATO 镜像头；镜像头 version 字段保留镜像标识/打包校验用途；`zcanpro_ext_ota_auto.py` 复位确认增加 0xF195 编译版本日志 |
 | 2026-09-17 | 删除冗余 `qi_wireless_code_slotB/` 源码工程（固件位置无关，一份 bin 可跑 A/B 槽）；仓库治理：新增 `.gitattributes` 换行符规范化、移除误跟踪构建产物 |
 | 2026-09-17 | APP 版本号回正为 QC_JYF_FW_1.1.1（与打包脚本 `IMAGE_VERSION` 一致） |
@@ -226,7 +227,7 @@ python merge_prod_bin.py
 - 选槽 + 镜像验签 (ECDSA P-256, uECC 库) + 跳转（无 UDS 服务，Safe Mode = 挂起）
 - Trial Boot 试运行管理 (PENDING → ACTIVE → CONFIRMED, 10s 窗口)
 - Metadata 双备份掉电保护（先写备、后写主）
-- 防回滚：XATO 头版本号校验
+- 回滚保护：Trial Boot 试运行（metadata pending→confirm）+ metadata 双副本掉电保护；Boot 校验（magic/长度/CRC32/Reset Handler/ECDSA）不依赖镜像头 version 字段（该区自 2026-09-18 起固定 `0x00`，不携带版本号，无基于版本号的防回滚比较）
 - CAN 采样点 75% (BTS1=54, BTS2=18, 18MHz÷72Tq)
 
 **APP 侧**

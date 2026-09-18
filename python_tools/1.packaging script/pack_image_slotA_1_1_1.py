@@ -3,6 +3,9 @@
 
 只编一份 Slot A（IROM1=0x08004100）。OTA 写入 B 时由 zcanpro_ext_ota_auto.py 重定位。
 产线：merge_prod_bin.py 把本输出烧到 0x08004000。
+
+镜像头 version 区（0x4C，16B）固定填 0x00，打包产物不携带版本号；
+版本号唯一定义在固件 SW_VERSION_STR（can_protocol.c），发版只改固件常量 + 文档。
 """
 
 from __future__ import print_function
@@ -34,15 +37,13 @@ APP_BIN_DIR = os.path.join(PARENT, "app bin")
 DEFAULT_BIN_A = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project", "Objects", "qi_wireless.bin")
 DEFAULT_KEY = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 
-IMAGE_VERSION = "QC_JYF_FW_1.1.1"
 
-
-def pack_one(bin_path, priv, version):
+def pack_one(bin_path, priv):
     """打包单个槽的固件，返回 0=成功，1=失败。"""
     if not os.path.isfile(bin_path):
         print("跳过（找不到）: %s" % bin_path)
         return 1
-    image = pack_image_if_needed(bin_path, priv, version=version)
+    image = pack_image_if_needed(bin_path, priv)
     linked = validate_image(image)
 
     if not os.path.isdir(APP_BIN_DIR):
@@ -56,13 +57,14 @@ def pack_one(bin_path, priv, version):
     print("输出: %s" % os.path.abspath(out_path))
     print("总长: %d  (头 %d + 固件 %d)" % (len(image), IMAGE_HEADER_SIZE, len(image) - IMAGE_HEADER_SIZE))
     print("链接: Slot %s  → 产线烧录地址 %s" % (slot_name(linked), burn_addr))
+    print("版本号不在镜像头（version 区固定 0x00），见固件 SW_VERSION_STR")
     print("")
     return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Pack Keil APP .bin with XATO header (CRC32 + ECDSA P-256) [v%s]" % IMAGE_VERSION
+        description="Pack Keil APP .bin with XATO header (CRC32 + ECDSA P-256); 镜像头不携带版本号"
     )
     parser.add_argument("--bin", default=DEFAULT_BIN_A, help="Slot A Keil bin（IROM1=0x08004100）")
     parser.add_argument("--key", default=DEFAULT_KEY, help="ECDSA P-256 私钥 PEM（须与 Bootloader 公钥成对）")
@@ -76,7 +78,7 @@ def main(argv=None):
     priv = load_ec_private_key(args.key)
 
     if args.out is not None:
-        image = pack_image_if_needed(args.bin, priv, version=IMAGE_VERSION)
+        image = pack_image_if_needed(args.bin, priv)
         linked = validate_image(image)
         out_dir = os.path.dirname(os.path.abspath(args.out))
         if out_dir and not os.path.isdir(out_dir):
@@ -87,8 +89,9 @@ def main(argv=None):
         print("输出: %s" % os.path.abspath(args.out))
         print("总长: %d  (头 %d + 固件 %d)" % (len(image), IMAGE_HEADER_SIZE, len(image) - IMAGE_HEADER_SIZE))
         print("链接: Slot %s  → 产线烧录地址 %s" % (slot_name(linked), burn_addr))
+        print("版本号不在镜像头（version 区固定 0x00），见固件 SW_VERSION_STR")
         return 0
-    return pack_one(args.bin, priv, IMAGE_VERSION)
+    return pack_one(args.bin, priv)
 
 
 if __name__ == "__main__":

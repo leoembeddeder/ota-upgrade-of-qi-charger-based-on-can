@@ -441,7 +441,10 @@ def relocate_image_to_slot(image, dest, priv):
     payload = bytes(payload)
     crc = zlib.crc32(payload) & 0xFFFFFFFF
     sig = ecdsa_sign_msg(priv, payload)
-    ver = image[76:92]
+    # 镜像头 version 区（0x4C..0x5C，16B）不再携带版本号，重定位重签时固定填 0x00。
+    # 版本号唯一定义在固件 SW_VERSION_STR（can_protocol.c）；签名/CRC 只覆盖头后
+    # payload，此字段取值不影响校验。旧镜像头里的历史版本字节在此被清零。
+    ver = b"\x00" * 16
     ts = image[92:96]
     header = struct.pack("<III", IMAGE_MAGIC, len(payload), crc) + sig + ver + ts
     header += b"\x00" * (IMAGE_HEADER_SIZE - len(header))
@@ -451,11 +454,11 @@ def relocate_image_to_slot(image, dest, priv):
 
 
 
-def pack_image_if_needed(fw_path, priv, version="1.0.0"):
-    """必要时为裸 bin 补 XATO 头。version 写入镜像头 0x4C，仅作镜像标识/
-    打包校验；运行版本报告（DID 0xF195）以固件 SW_VERSION_STR 编译常量
-    为准，与此字段无关。正式打包的版本以 pack_image_slotA_1_1_1.py 的
-    IMAGE_VERSION 常量为准，本函数默认值 "1.0.0" 仅为历史兜底。"""
+def pack_image_if_needed(fw_path, priv):
+    """必要时为裸 bin 补 XATO 头。镜像头 version 区（0x4C）固定填 0x00，
+    打包产物不携带版本号；版本号唯一定义在固件 SW_VERSION_STR
+    （can_protocol.c），发版只改固件常量 + 文档。CRC32/ECDSA 签名只覆盖
+    头后 payload，version 字段不参与任何校验。"""
     data = open(fw_path, "rb").read()
     if len(data) >= IMAGE_HEADER_SIZE and struct.unpack_from("<I", data, 0)[0] == IMAGE_MAGIC:
         _log("固件已带 XATO 头, 总长 %d" % len(data))
@@ -466,14 +469,11 @@ def pack_image_if_needed(fw_path, priv, version="1.0.0"):
     _log("固件无头，现场打包 %d 字节" % len(data))
     crc = zlib.crc32(data) & 0xFFFFFFFF
     sig = ecdsa_sign_msg(priv, data)
-    ver_s = version if version is not None else "1.0.0"
-    if sys.version_info[0] >= 3:
-        ver = (ver_s.encode("ascii", "replace") + b"\x00" * 16)[:16]
-    else:
-        ver = (str(ver_s) + ("\x00" * 16))[:16]
+    # 镜像头 version 区固定 0x00：打包产物不携带版本号
+    ver = b"\x00" * 16
     header = struct.pack("<III", IMAGE_MAGIC, len(data), crc) + sig + ver + struct.pack("<I", int(time.time()) & 0xFFFFFFFF)
     header += b"\x00" * (IMAGE_HEADER_SIZE - len(header))
-    _log("打包完成 crc=0x%08X version=%s" % (crc, ver_s))
+    _log("打包完成 crc=0x%08X（版本号不在镜像头，见固件 SW_VERSION_STR）" % crc)
     return header + data
 
 

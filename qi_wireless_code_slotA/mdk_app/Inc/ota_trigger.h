@@ -90,7 +90,7 @@ typedef struct
   uint32_t image_length;       /*!< firmware size excluding this header */
   uint32_t crc32;              /*!< CRC32 of firmware (excluding header) */
   uint8_t  signature[64];      /*!< ECDSA P-256 R||S */
-  char     version[16];        /*!< "MAJOR.MINOR.PATCH\0" */
+  char     version[16];        /*!< 保留：打包固定填 0x00，不携带版本号 */
   uint32_t build_timestamp;    /*!< Unix timestamp */
   uint8_t  reserved[160];      /*!< pad to 256 bytes */
 } ota_image_header_t;
@@ -170,16 +170,9 @@ uint8_t ota_running_slot(void);
  */
 uint32_t ota_running_slot_base(void);
 
-/**
- * @brief  copy version string from this slot's XATO image header
- * @note   镜像头 version 字段由打包脚本 IMAGE_VERSION 写入，仅作镜像标识/
- *         打包校验用途。运行版本报告（UDS DID 0xF195）以 can_protocol.c
- *         的 SW_VERSION_STR 编译常量为唯一真相源，不经过本函数。
- * @param  out: destination buffer
- * @param  out_len: capacity including NUL
- * @retval 0 on success, -1 if header magic is invalid
- */
-int8_t ota_get_image_version(char *out, uint8_t out_len);
+/* 2026-09-18：ota_get_image_version() 已删除（镜像头 version 区打包固定
+   0x00，不携带版本号；DID 0xF195 取 can_protocol.c 的 SW_VERSION_STR）。
+   version[16] 字段在 ota_image_header_t 中保留占位，头布局/偏移不变。*/
 
 #ifdef __cplusplus
 }

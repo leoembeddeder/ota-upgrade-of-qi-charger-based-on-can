@@ -76,12 +76,10 @@ def verify_crc32(header, firmware):
     return True, "CRC32 正确: 0x{:08X}".format(stored_crc)
 
 
-def verify_version(header):
-    """Check 4: version string."""
-    version = header[0x4C:0x5C].rstrip(b"\x00").decode("ascii", errors="replace")
-    if not version:
-        return True, "Version: (空)"
-    return True, "Version: {}".format(version)
+# 镜像头 version 区（0x4C..0x5C，16B）自 2026-09-18 起打包固定 0x00，
+# 不携带版本号（版本号唯一定义在固件 SW_VERSION_STR）。校验忽略该字段：
+# CRC32 只覆盖头后 payload、ECDSA 签名只签 payload，version 区不在任何
+# 校验范围内，历史镜像中残留的版本字节同样不影响校验结果。
 
 
 def verify_build_timestamp(header):
@@ -143,21 +141,27 @@ def pem_to_sec1(public_key_path):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def verify_reset_handler(header, slot_base, slot_size):
-    """Check 7: Reset Handler must point inside the target slot.
+def verify_reset_handler(image, slot_base, slot_size):
+    """Check 4: Reset Handler must point inside the target slot.
 
-    MCU checks (boot_verify.c):
+    MCU checks (boot_verify.c check 3b) read the vector table AFTER the
+    256-byte XATO header:
       vec = (uint32_t *)(base_addr + IMAGE_HEADER_SIZE)
       reset = vec[1] & 0xFFFFFFFE  (clear thumb bit)
       entry = base_addr + IMAGE_HEADER_SIZE
       end   = base_addr + slot_size
       if (reset < entry || reset >= end) => FAIL
+
+    历史缺陷修正（2026-09-18）：本函数旧实现 unpack(header[:8])，读到的是
+    XATO 头的 magic/image_length 而非固件向量表，任何合法镜像都会误报
+    FAIL；现按 MCU 逻辑从整镜像偏移 IMAGE_HEADER_SIZE 处取 word[1]。
     """
-    if len(header) < IMAGE_HEADER_SIZE:
-        return False, "Header 不完整"
+    if len(image) < IMAGE_HEADER_SIZE + 8:
+        return False, "镜像太短：不足头 256B + 向量表 8B"
     firmware_base = slot_base + IMAGE_HEADER_SIZE
-    # Vector table: word[0] = initial SP, word[1] = Reset Handler
-    vec = struct.unpack("<II", header[:8])
+    # Vector table sits right after the header:
+    # word[0] = initial SP, word[1] = Reset Handler
+    vec = struct.unpack("<II", image[IMAGE_HEADER_SIZE:IMAGE_HEADER_SIZE + 8])
     if vec[1] == 0xFFFFFFFF or vec[1] == 0:
         return False, "Reset Handler 无效: 0x{:08X}".format(vec[1])
     reset = vec[1] & 0xFFFFFFFE
@@ -306,7 +310,7 @@ def main(argv=None):
         ("Magic", lambda: verify_magic(header)),
         ("Image Length", lambda: verify_image_length(header, len(firmware))),
         ("CRC32", lambda: verify_crc32(header, firmware_for_verify)),
-        ("Reset Handler", lambda: verify_reset_handler(header, slot_base, APP_SLOT_SIZE)),
+        ("Reset Handler", lambda: verify_reset_handler(data, slot_base, APP_SLOT_SIZE)),
         ("Public Key", lambda: verify_public_key_match(key_path)),
         ("ECDSA P-256", lambda: verify_ecdsa(
             firmware_for_verify,

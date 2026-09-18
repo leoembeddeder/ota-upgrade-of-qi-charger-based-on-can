@@ -248,40 +248,11 @@ uint8_t ota_running_slot(void)
   return OTA_SLOT_A;
 }
 
-/**
- * @brief  copy version string from this slot's XATO image header
- * @note   镜像头 version 字段由打包脚本 IMAGE_VERSION 写入，仅作镜像标识/
- *         打包校验用途。运行版本报告（UDS DID 0xF195）以 can_protocol.c
- *         的 SW_VERSION_STR 编译常量为唯一真相源，不经过本函数。
- */
-int8_t ota_get_image_version(char *out, uint8_t out_len)
-{
-  const ota_image_header_t *hdr;
-  uint8_t i;
-
-  if ((out == (char *)0) || (out_len == 0U))
-  {
-    return -1;
-  }
-
-  hdr = (const ota_image_header_t *)(uintptr_t)ota_running_slot_base();
-  if (hdr->magic != OTA_IMAGE_MAGIC)
-  {
-    return -1;
-  }
-
-  for (i = 0U; (i < 15U) && (i < (out_len - 1U)); i++)
-  {
-    char c = hdr->version[i];
-    if (c == '\0')
-    {
-      break;
-    }
-    out[i] = c;
-  }
-  out[i] = '\0';
-  return 0;
-}
+/* 2026-09-18：ota_get_image_version() 已删除——XATO 镜像头 version 区打包
+   固定填 0x00，不携带版本号（版本号唯一真相源=can_protocol.c 的
+   SW_VERSION_STR 编译常量，DID 0xF195 直接取该常量）。51e52cf 改造后本
+   函数已无调用者，镜像头中亦不再存在可读的版本字节。头布局不变，
+   ota_image_header_t.version[16] 字段保留占位以维持 256B 布局与偏移。*/
 
 #define TRIAL_HEALTH_DELAY_MS   100U
 

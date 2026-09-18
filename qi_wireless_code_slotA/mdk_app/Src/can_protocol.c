@@ -45,10 +45,9 @@
 /*  Version string constants (UTF-8, max 16 bytes including null terminator)  */
 /*                                                                            */
 /*  SW_VERSION_STR 是运行软件版本的【唯一真相源】：UDS DID 0xF195 应答直接  */
-/*  取此 APP 编译时常量，不再从 OTA metadata / XATO 镜像头 version 字段读取  */
-/*  （metadata 会被 trial/rollback/defaults 重建改写，异常场景下会说谎；     */
-/*  镜像头 version 由打包脚本 IMAGE_VERSION 写入，仅作镜像标识/打包校验）。  */
-/*  改版本号须同步：打包脚本 IMAGE_VERSION + docs 文档两处联动。             */
+/*  取此 APP 编译时常量，不读 OTA metadata / XATO 镜像头（2026-09-18 起：   */
+/*  镜像头 version 区打包固定 0x00，不携带版本号；metadata 无软件版本字段）。 */
+/*  改版本号只改本常量 + docs 文档，无打包脚本联动环节。                     */
 /* ========================================================================== */
 
 static const char SW_VERSION_STR[]     = "QC_JYF_FW_1.1.1";   /*!< 运行版本唯一真相源 */
