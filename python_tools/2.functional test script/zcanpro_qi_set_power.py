@@ -51,6 +51,18 @@ SID_NRC  = 0x7F
 SID_PR   = 0x40
 
 NRC_RCRRP = 0x78
+NRC_EXCEEDED_ATTEMPTS   = 0x36  # 27 02 验签失败次数超限（fail_count≥3，固件随即锁定约30s）
+NRC_REQUIRED_TIME_DELAY = 0x37  # 锁定期内 27 01/27 02 应答（requiredTimeDelay）
+
+
+class UdsNrcError(RuntimeError):
+    """带 NRC 码的 UDS 异常；SecurityAccess 重试分支按 e.nrc 判别设备锁定等场景。"""
+
+    def __init__(self, sid, nrc):
+        RuntimeError.__init__(self, "NRC SID=0x%02X NRC=0x%02X" % (sid, nrc))
+        self.sid = sid
+        self.nrc = nrc
+
 
 DID_POWER_LIMIT = 0x210D
 SA_SIG_CHUNK = 4
@@ -250,7 +262,7 @@ def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
                 _log("NRC 0x78，等待中...")
                 time.sleep(1.0)
                 continue
-            raise RuntimeError("NRC 0x%02X" % data[2])
+            raise UdsNrcError(data[1], data[2])
         if not resp or not resp.get("result"):
             raise RuntimeError("无应答")
         if data[0] != (sid + SID_PR):
@@ -258,24 +270,69 @@ def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
         return data
 
 
-def send_security_key(bus_id, sig):
+def _sa_fetch_seed(bus_id):
+    """27 01 取 seed。固件自 d64e8c2 起 seed 为 32 字节（67 01 + 32B）。
+    固件每次 27 01 都刷新 seed 并清空签名缓冲。"""
+    rx = uds_req(bus_id, SID_SA, [0x01])
+    if len(rx) < 34:
+        raise RuntimeError("seed 响应过短: %d 字节, 期望 67 01 + 32 字节 seed（≥34）" % len(rx))
+    return rx
+
+
+def _sa_send_sig(bus_id, sig):
+    """27 03 分片发送 64 字节签名：4 字节/帧 × 16 帧，blockSeq 0x01 起递增。"""
     sig = _to_list(sig)
+    if len(sig) != 64:
+        raise RuntimeError("ECDSA 签名须 64 字节")
     seq, off = 1, 0
     while off < 64:
         piece = sig[off:off + SA_SIG_CHUNK]
         uds_req(bus_id, SID_SA, [0x03, seq] + piece)
         off += len(piece)
         seq += 1
-    _log("签名已发送 (%d 帧)" % (seq - 1))
+    _log("27 03 已送 64 字节 / %d 帧" % (seq - 1))
     time.sleep(0.15)
-    for i in range(5):
+
+
+def send_security_key(bus_id, priv):
+    """SecurityAccess 解锁：每次尝试都是完整流程——
+    27 01 取 32 字节 seed（全 0 = 已解锁，直接返回正响应）→
+    ecdsa_sign_msg(priv, seed) 重签 → 重发 16 帧 27 03 分片 → 27 02 验签。
+
+    固件每次 27 01 都刷新 seed 并清空签名缓冲，27 02 失败后只重发 27 02
+    或沿用旧 seed 签名必失败，故重试必须完整重做。最多 5 次完整尝试；
+    NRC 0x36/0x37 = 设备 SecurityAccess 锁定（fail_count≥3，约 30s）：
+    0x36 是 27 02 失败超限当次应答，0x37 是锁定期内 27 01/27 02 应答，
+    两者都日志明确提示并 sleep 31s 后继续完整流程。
+    """
+    last = None
+    for attempt in range(1, 6):
         if stopTask:
             raise RuntimeError("用户停止")
         try:
+            _log("SecurityAccess 第 %d/5 次：27 01 → 重签 → 27 03 → 27 02" % attempt)
+            rx = _sa_fetch_seed(bus_id)
+            seed = _to_bytes(rx[2:34])
+            if seed == b"\x00" * 32:
+                _log("27 01 seed=0（32 字节全 0），已解锁，直接返回正响应")
+                return rx
+            _log("seed(32B) " + _hex(rx[2:34]))
+            sig = ecdsa_sign_msg(priv, seed)
+            _sa_send_sig(bus_id, sig)
             return uds_req(bus_id, SID_SA, [0x02], wait_pending_s=45)
-        except Exception as e:
-            _log("27 02 重试 %d/5: %s" % (i + 1, e))
+        except UdsNrcError as e:
+            last = e
+            if e.nrc in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
+                _log("NRC 0x%02X：设备 SecurityAccess 锁定（fail_count≥3，固件锁定约30s），等待 31s 后完整重试" % e.nrc)
+                time.sleep(31)
+                continue
+            _log("SecurityAccess 第 %d/5 次失败: %s（重试将重新取 seed 重签重发分片）" % (attempt, e))
             time.sleep(0.5)
+        except RuntimeError as e:
+            last = e
+            _log("SecurityAccess 第 %d/5 次失败: %s" % (attempt, e))
+            time.sleep(0.5)
+    raise last
 
 
 # ======== 主流程 ========
@@ -298,16 +355,26 @@ def run(bus_id):
     _log("---- 进入编程会话 ----")
     uds_req(bus_id, SID_DSC, [0x02])
 
-    # 2. 安全解锁
+    # 2. 安全解锁（seed 32 字节，d64e8c2 起；失败重试为完整重签重发流程）
     _log("---- 安全解锁 ----")
-    rx = uds_req(bus_id, SID_SA, [0x01])
-    seed = rx[2:6]
-    if seed == [0, 0, 0, 0]:
-        _log("已解锁 (seed=0)")
-    else:
-        _log("seed: " + _hex(seed))
-        sig = ecdsa_sign_msg(priv, bytes(seed))
-        send_security_key(bus_id, sig)
+    unlocked = False
+    try:
+        rx = uds_req(bus_id, SID_SA, [0x01])
+        if len(rx) < 34:
+            raise RuntimeError("seed 响应过短: %d 字节, 期望 67 01 + 32 字节 seed（≥34）" % len(rx))
+        seed = _to_bytes(rx[2:34])
+        _log("seed(32B) " + _hex(rx[2:34]))
+        if seed == b"\x00" * 32:
+            unlocked = True
+            _log("已解锁 (seed=0，32 字节全 0)")
+    except UdsNrcError as e:
+        if e.nrc not in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
+            raise
+        _log("27 01 NRC 0x%02X：设备 SecurityAccess 锁定（fail_count≥3，约30s），等待 31s 后完整解锁" % e.nrc)
+        time.sleep(31)
+    if not unlocked:
+        _log("SecurityAccess 解锁中（每次尝试完整重做：27 01 → 重签 → 27 03 → 27 02）...")
+        send_security_key(bus_id, priv)
     _log("安全解锁成功")
 
     # 3. 写功率 (DID 0x210D, uint16 LE mW)

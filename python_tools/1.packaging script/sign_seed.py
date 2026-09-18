@@ -6,8 +6,9 @@ output the hex CAN frames ready for ZCANPRO / manual send.
 
 Usage:
     python sign_seed.py <seed_hex> [--key <private_key.pem>]
-    python sign_seed.py A1B2C3D4
-    python sign_seed.py A1B2C3D4 --key docs/keys/private.pem
+    python sign_seed.py 00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF
+    python sign_seed.py 00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF \
+        --key docs/keys/private.pem
 
 Prerequisites:
     Python 3.6+, OpenSSL CLI (default) or pip install ecdsa (fallback)
@@ -272,7 +273,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "seed",
-        help="4-byte seed in hex (e.g. A1B2C3D4), from MCU 67 01 response",
+        help="32-byte seed in hex (64 hex chars), from MCU 67 01 response",
     )
     parser.add_argument(
         "--key", default=DEFAULT_KEY,
@@ -282,8 +283,8 @@ def main(argv=None):
 
     # ---- validate seed ----
     seed_hex = args.seed.replace(" ", "").replace(":", "")
-    if len(seed_hex) != 8:
-        sys.stderr.write("ERROR: Seed must be 8 hex chars (4 bytes), got {}\n".format(len(seed_hex)))
+    if len(seed_hex) != 64:
+        sys.stderr.write("ERROR: Seed must be 64 hex chars (32 bytes), got {}\n".format(len(seed_hex)))
         return 1
     try:
         seed_bytes = bytes.fromhex(seed_hex)

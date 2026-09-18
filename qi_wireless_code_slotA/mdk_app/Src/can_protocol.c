@@ -1301,8 +1301,14 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
 
 /**
  * @brief  SecurityAccess (0x27)
- * @note   APP side does not support SecurityAccess (done in bootloader safe mode).
- *         Return NRC 0x11 to indicate this service is not available in APP.
+ * @note   APP side implements SecurityAccess fully (Boot safe mode does not):
+ *         27 01 -> 67 01 + 32-byte seed (g_seed[32], refreshed on every 27 01,
+ *         signature buffer cleared with it); unlocked 27 01 -> 67 01 + 32x0x00.
+ *         27 03 -> chunked signature transfer (4B/frame x 16, blockSeq 0x01..0x10,
+ *         blockSeq 0x01 resets the buffer); 27 02 -> sha256_hash(g_seed, 32U) +
+ *         uECC_verify on the accumulated 64-byte signature.
+ *         Verify fail: NRC 0x35 (invalidKey, fail_count+1); fail_count >= 3 arms
+ *         the ~30s lockout: 27 02 -> NRC 0x36, 27 01 inside lockout -> NRC 0x37.
  * @param  data: UDS payload
  * @param  len:  payload length
  * @retval none
