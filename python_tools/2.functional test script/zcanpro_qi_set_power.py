@@ -5,7 +5,9 @@ ZCANPRO 脚本 — 设置 Qi 芯片功率
 写 DID 0x210D（uint16 LE, 单位 mW）：
   0x01 = 5W (500mW), 0x02 = 10W (1000mW), 0x03 = 15W (1500mW)
 
-需要：编程会话 + SecurityAccess
+需要：扩展会话（10 03）+ SecurityAccess
+固件门禁（can_protocol.c:1035-1045）：写 0x210D DID_POWER_LIMIT 要求
+  current_session==SESSION_EXTENDED 且 security_unlocked，否则 NRC 0x22/0x33
 
 运行前先探测运行侧（唤醒收敛 + 正证据判定）：设备在 Boot safe mode 或
 无应答（已排除 Standby）时直接退出，绝不猜测继续。
@@ -60,6 +62,20 @@ NRC_RCRRP = 0x78
 NRC_EXCEEDED_ATTEMPTS   = 0x36  # 27 02 验签失败次数超限当次应答（fail_count≥3，固件随即锁定约30s）
 NRC_REQUIRED_TIME_DELAY = 0x37  # 锁定期内 27 01 的应答（requiredTimeDelay）；锁定期内
                                 # 27 02 因固件已清 seed/签名缓冲回 0x24，非 0x37
+NRC_CONDITIONS_NOT_CORRECT = 0x22  # 固件写门禁：会话不满足（S3 超时后会话回 default 的典型表现）
+NRC_SECURITY_ACCESS_DENIED = 0x33  # 固件写门禁：security_unlocked=0（S3 超时/会话切换被清）
+
+# ======== S3 会话超时防护参数（三脚本同构）========
+# 固件：SESSION_TIMEOUT_MS=5000（can_protocol.h:167）；UDS 交换间隙>5s 时
+# isotp_message_received / can_protocol_poll 会把会话回 default+清 security
+# （can_protocol.c:1844-1853 / 2094-2096），后续 2E 写撞 NRC 0x22/0x33。
+# 固件验证结论：3E 80（suppress）与 3E 00 均刷新 S3 计时——uds_process_message
+# 派发前对任何诊断请求统一刷新 last_tester_present_tick（can_protocol.c:1770），
+# handle_tester_present 对 suppress 帧同样刷新计时且不回响应（:1509）→
+# keepalive 优先 3E 80（无响应帧干扰，ZCANPRO suppress 请求立即返回）。
+S3_KEEPALIVE_INTERVAL_S = 3.0      # keepalive 周期：3s < 5s 超时窗，留 2s 余量
+S3_SIGN_GAP_GUARD_S     = 3.0      # 签名耗时超过该值：先发 3E 再进 27 03 分片
+SA_LOCKOUT_WAIT_S       = 31.0     # SA 锁定等待总时长（与原 sleep(31) 一致）
 
 
 class UdsNrcError(RuntimeError):
@@ -313,7 +329,8 @@ def send_security_key(bus_id, priv):
     （requiredTimeDelay）。锁定期内的 27 02 固件因验签失败已清
     g_seed_generated，先撞序检查回 NRC 0x24（can_protocol.c:1430-1433,
     1469），不是 0x37——脚本每轮先发 27 01，锁定仍由 0x37 捕获，重试逻辑
-    不变：两者都日志明确提示并 sleep 31s 后继续完整流程。
+    不变：两者都日志明确提示并经 _s3_keepalive_wait（每 3s 发 3E 80 suppress
+    刷新 S3 计时，总等待 31s，防等待期会话超时）后继续完整流程。
     """
     last = None
     for attempt in range(1, 6):
@@ -327,14 +344,25 @@ def send_security_key(bus_id, priv):
                 _log("27 01 seed=0（32 字节全 0），已解锁，直接返回正响应")
                 return rx
             _log("seed(32B) " + _hex(rx[2:34]))
+            # S3 防护：ecdsa_sign_msg 为 Python 纯软件实现，在 ZCANPRO 解释器
+            # 可能耗时秒级；签名期间无总线流量，距上次 UDS 交换（27 01 应答）
+            # 超过阈值则先发 3E 80 刷新 S3 计时再进 27 03 分片（>5s 时固件
+            # poll 已将会话回 default，3E 救不回，最终由写步 NRC 0x22/0x33
+            # 兜底 _wdbi_with_s3_guard 恢复）
+            t_sign = time.time()
             sig = ecdsa_sign_msg(priv, seed)
+            sign_gap = time.time() - t_sign
+            if sign_gap > S3_SIGN_GAP_GUARD_S:
+                _log("ECDSA 签名耗时 %.1fs（>%.1fs）：先发 3E 80 刷新 S3 计时再进 27 03 分片"
+                     % (sign_gap, S3_SIGN_GAP_GUARD_S))
+                uds_try(bus_id, SID_TP, [0x80], suppress=1)
             _sa_send_sig(bus_id, sig)
             return uds_req(bus_id, SID_SA, [0x02], wait_pending_s=45)
         except UdsNrcError as e:
             last = e
             if e.nrc in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
-                _log("NRC 0x%02X：设备 SecurityAccess 锁定（fail_count≥3，固件锁定约30s），等待 31s 后完整重试" % e.nrc)
-                time.sleep(31)
+                _log("NRC 0x%02X：设备 SecurityAccess 锁定（fail_count≥3，固件锁定约30s），S3 keepalive 等待 %.0fs 后完整重试" % (e.nrc, SA_LOCKOUT_WAIT_S))
+                _s3_keepalive_wait(bus_id)
                 continue
             _log("SecurityAccess 第 %d/5 次失败: %s（重试将重新取 seed 重签重发分片）" % (attempt, e))
             time.sleep(0.5)
@@ -351,6 +379,57 @@ def uds_try(bus_id, sid, payload, suppress=0):
     except Exception as e:
         _log("可忽略: " + str(e))
         return None
+
+
+def _s3_keepalive_wait(bus_id, total_s=SA_LOCKOUT_WAIT_S, interval_s=S3_KEEPALIVE_INTERVAL_S):
+    """S3 会话超时防护：SA 锁定等待期间周期发送 3E 80 keepalive。
+
+    固件验证（can_protocol.c）：uds_process_message 对任何诊断请求（含
+    3E suppress 帧）在派发前刷新 last_tester_present_tick（:1770）；
+    handle_tester_present 对 suppress 帧同样刷新计时且不回响应（:1509）
+    → 3E 80 与 3E 00 同样续期 S3，优先 3E 80（无响应帧干扰，库立即返回）。
+    周期 3s < SESSION_TIMEOUT_MS 5s（can_protocol.h:167）；总等待时长与原
+    sleep(31) 一致。走既有 uds_try 通道，不碰探测/raw 路径；keepalive
+    失败只记录，不中断等待。
+    """
+    t_end = time.time() + float(total_s)
+    sent = 0
+    _log("S3 keepalive 等待 %.0fs（每 %.0fs 发 3E 80 suppress，防会话超时回 default+清 security）"
+         % (total_s, interval_s))
+    while True:
+        remain = t_end - time.time()
+        if remain <= 0:
+            break
+        time.sleep(interval_s if remain > interval_s else remain)
+        if stopTask:
+            raise RuntimeError("用户停止")
+        uds_try(bus_id, SID_TP, [0x80], suppress=1)
+        sent += 1
+    _log("S3 keepalive 等待结束：%.0fs 内共发 %d 次 3E 80" % (total_s, sent))
+
+
+def _wdbi_with_s3_guard(bus_id, payload, priv, wait_pending_s=0):
+    """2E 写步 S3 超时兜底（三脚本同构）：写收到 NRC 0x22/0x33 →
+    重发本脚本会话控制 10 03 + 既有 send_security_key 完整重解锁 + 重试写一次。
+
+    固件门禁（can_protocol.c:1035-1045）：写 0x210D DID_POWER_LIMIT 要求
+    SESSION_EXTENDED+security_unlocked——NRC 0x22=会话不满足（S3 超时回
+    default 的典型表现），0x33=安全态被清。0x210D 值域校验失败回 0x31、
+    长度不足回 0x13（:1261-1275），不会误入本兜底。会话字节与本脚本业务链
+    一致（10 03 扩展会话，blocking#2 修复后）。日志注明「S3 超时恢复」。
+    """
+    try:
+        uds_req(bus_id, SID_WDBI, payload, wait_pending_s=wait_pending_s)
+        return
+    except UdsNrcError as e:
+        if e.nrc not in (NRC_CONDITIONS_NOT_CORRECT, NRC_SECURITY_ACCESS_DENIED):
+            raise
+        _log("2E 写 NRC 0x%02X：疑似 S3 会话超时（会话回 default / 安全态被清）——"
+             "S3 超时恢复：重发 10 03 扩展会话 + 完整重解锁 + 重试写一次" % e.nrc)
+    uds_req(bus_id, SID_DSC, [0x03])
+    send_security_key(bus_id, priv)
+    uds_req(bus_id, SID_WDBI, payload, wait_pending_s=wait_pending_s)
+    _log("S3 超时恢复：会话+安全态重建后重试写成功")
 
 
 # ======== 运行侧探测 / Standby 唤醒收敛（判定只按正证据）========
@@ -638,7 +717,7 @@ def probe_location(bus_id):
 # ======== 主流程 ========
 
 def run(bus_id):
-    global stopTask
+    # stopTask 在本函数只读不写，无需 global 声明（pyflakes 清零；预存在死声明）
     power_name = {500: "5W", 1000: "10W", 1500: "15W"}
     if POWER_MW not in power_name:
         raise RuntimeError("无效功率: %d mW (可选 500/1000/1500)" % POWER_MW)
@@ -662,9 +741,14 @@ def run(bus_id):
         raise RuntimeError("设备无应答（已排除 Standby），无法确定运行侧。"
                            "取证见上方日志（burst 轮次 / 监听时长 / 收帧明细）")
 
-    # 1. 编程会话
-    _log("---- 进入编程会话 ----")
-    uds_req(bus_id, SID_DSC, [0x02])
+    # 1. 扩展会话（blocking#2 修复）：固件门禁 can_protocol.c:1035-1045 写
+    #    0x210D DID_POWER_LIMIT 要求 SESSION_EXTENDED+security_unlocked——
+    #    10 02 编程会话写此 DID 必撞 NRC 0x22；10 02 另有副作用
+    #    board_5v_set(0)（can_protocol.c:895，编程会话关 5V）。顺序保持
+    #    会话→SA→写：session_switch（:575-591）默认→非默认不清 security，
+    #    重复发相同非默认会话也不清，SA 在会话切换之后不受影响。
+    _log("---- 进入扩展会话（10 03）----")
+    uds_req(bus_id, SID_DSC, [0x03])
 
     # 2. 安全解锁（seed 32 字节，d64e8c2 起；失败重试为完整重签重发流程）
     _log("---- 安全解锁 ----")
@@ -681,16 +765,17 @@ def run(bus_id):
     except UdsNrcError as e:
         if e.nrc not in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
             raise
-        _log("27 01 NRC 0x%02X：设备 SecurityAccess 锁定（fail_count≥3，约30s），等待 31s 后完整解锁" % e.nrc)
-        time.sleep(31)
+        _log("27 01 NRC 0x%02X：设备 SecurityAccess 锁定（fail_count≥3，约30s），S3 keepalive 等待 %.0fs 后完整解锁" % (e.nrc, SA_LOCKOUT_WAIT_S))
+        _s3_keepalive_wait(bus_id)
     if not unlocked:
         _log("SecurityAccess 解锁中（每次尝试完整重做：27 01 → 重签 → 27 03 → 27 02）...")
         send_security_key(bus_id, priv)
     _log("安全解锁成功")
 
-    # 3. 写功率 (DID 0x210D, uint16 LE mW)
+    # 3. 写功率 (DID 0x210D, uint16 LE mW)——经 S3 兜底包装：写撞 NRC 0x22/0x33
+    #    （会话回 default/安全态被清）时重发 10 03 + 完整重解锁 + 重试一次
     _log("---- 写入功率 %d mW ----" % POWER_MW)
-    uds_req(bus_id, SID_WDBI, [0x21, 0x0D, POWER_MW & 0xFF, (POWER_MW >> 8) & 0xFF])
+    _wdbi_with_s3_guard(bus_id, [0x21, 0x0D, POWER_MW & 0xFF, (POWER_MW >> 8) & 0xFF], priv)
     _log("功率已设置: %s" % power_name[POWER_MW])
 
 
