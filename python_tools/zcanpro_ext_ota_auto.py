@@ -33,11 +33,16 @@ except ImportError:
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # EXPECTED_SW_VERSION：升级目标版本（判定闭环第③条件）。
-#   留空 "" = 缺省从被刷镜像 payload 的 strings 提取（QC_JYF_FW_x.y.z，
-#   即固件 can_protocol.c SW_VERSION_STR 编译常量，版本唯一真相源）；
-#   设置后：选中 bin 内版本串 ≠ 本值 → 拒闪（构建链检查指引），
+#   当前固化 = "QC_JYF_FW_1.1.2"（用户 2026-09-19 指令：预期版本固定 1.1.2）。
+#   期望版本如何切换 = 只改本常量即可；留空 "" 则恢复缺省行为——从被刷
+#   镜像 payload 的 strings 提取（QC_JYF_FW_x.y.z，即固件 can_protocol.c
+#   SW_VERSION_STR 编译常量，版本唯一真相源；空串提取回退逻辑保留）。
+#   设置后：选中 bin 内版本串 ≠ 本值 → 拒闪（构建链检查指引）；
 #   升级后 0xF195 ≠ 本值 → OTA 判定 FAIL（差异明细+判别矩阵指引）。
-EXPECTED_SW_VERSION = ""
+#   载荷构建前提：用户侧 Keil 把 SW_VERSION_STR 改为 QC_JYF_FW_1.1.2 后
+#   Rebuild APP → pack（新 bin strings 含 1.1.2 才能过拒闪门）；仓库固件
+#   SW_VERSION_STR 保持 QC_JYF_FW_1.1.1 零触碰（铁律，本脚本不改固件）。
+EXPECTED_SW_VERSION = "QC_JYF_FW_1.1.2"
 
 
 def _find_repo_root(start):
@@ -1448,11 +1453,15 @@ def run_ota(bus_id):
         if EXPECTED_SW_VERSION:
             if bin_ver != EXPECTED_SW_VERSION:
                 raise RuntimeError(
-                    "拒闪：选中 bin 版本 %s ≠ EXPECTED_SW_VERSION %s。构建链检查："
+                    "拒闪：选中 bin 版本 %s ≠ EXPECTED_SW_VERSION %s（零业务流量"
+                    "退出，fail-closed）。构建链检查："
                     "① can_protocol.c SW_VERSION_STR 是否已改为目标版本（唯一真相源）；"
                     "② MDK 是否 Rebuild（禁 Incremental Build）；"
                     "③ pack/OTA 输入是否为本次构建产物；"
-                    "④ python_tools/app bin/ 是否残留旧镜像（清理或确保 Keil bin 更新）"
+                    "④ python_tools/app bin/ 是否残留旧镜像（清理或确保 Keil bin 更新）。"
+                    "期望版本切换：改脚本头部 EXPECTED_SW_VERSION 常量即可（留空则缺省"
+                    "从镜像 strings 提取）；载荷前提=用户侧 Keil SW_VERSION_STR="
+                    "QC_JYF_FW_1.1.2 后 Rebuild APP→pack（仓库固件保持 1.1.1 零触碰）"
                     % (bin_ver or "未找到", EXPECTED_SW_VERSION))
             _log("版本感知：bin 版本与 EXPECTED_SW_VERSION=%s 一致，允许刷写"
                  % EXPECTED_SW_VERSION)
