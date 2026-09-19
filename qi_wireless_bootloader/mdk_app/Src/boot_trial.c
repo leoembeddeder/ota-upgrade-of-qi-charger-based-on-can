@@ -27,6 +27,7 @@
 #include "boot_trial.h"
 #include "boot_verify.h"
 #include "boot_jump.h"
+#include "boot_safe_mode.h"   /* Boot 诊断标记 M2/M3（观察不干预） */
 #include "at32f422_426_conf.h"
 
 /* private variables ---------------------------------------------------------*/
@@ -92,9 +93,11 @@ int8_t select_boot_slot(const ota_metadata_t *meta, uint8_t *slot)
 
   if ((s != SLOT_A) && (s != SLOT_B))
   {
+    boot_diag_m2(-1, s);   /* 诊断 M2：失败路径，slot=metadata 实际槽字节 */
     return -1;
   }
   *slot = s;
+  boot_diag_m2(0, s);      /* 诊断 M2：选中槽（观察不干预） */
   return 0;
 }
 
@@ -200,6 +203,7 @@ int8_t try_boot_slot(uint8_t slot, ota_metadata_t *meta)
       *valid_flag = 0U;
       (void)boot_metadata_save(meta);
     }
+    boot_diag_m3(0U, g_verify_fail_step, slot); /* 诊断 M3：验签/向量失败 */
     return -1;
   }
 
@@ -209,6 +213,7 @@ int8_t try_boot_slot(uint8_t slot, ota_metadata_t *meta)
     (void)boot_metadata_save(meta);
   }
 
+  boot_diag_m3(1U, g_verify_fail_step, slot);   /* 诊断 M3：过验（观察不干预） */
   /* caller jumps after it has saved any trial/rollback metadata */
   return 0;
 }

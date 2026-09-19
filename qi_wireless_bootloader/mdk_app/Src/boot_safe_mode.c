@@ -92,6 +92,104 @@ static void safe_heartbeat(uint8_t cause, uint8_t step)
   (void)can_driver_send(CAN_ID_LIFECYCLE_BROADCAST, d, 8U);
 }
 
+/* ===== Boot 诊断标记帧实现（观察不干预，2026-09-20 用户授权诊断版）=====
+ * 帧格式/CAN ID 见 boot_safe_mode.h BOOT_DIAG 注释；实现纪律：
+ * ① 只报信不改决策——本节函数不写 metadata/不改任何选择逻辑；
+ * ② 发送有界——can_driver_send 缓冲满直接 -1 返回，成功才等
+ *    can_driver_wait_tx_idle(BOOT_DIAG_TX_TIMEOUT_MS)，总线挂死即弃帧；
+ * ③ polling 发送，不依赖中断；safe mode 既有帧零触碰。 */
+#define BOOT_DIAG_TX_TIMEOUT_MS  3U
+
+uint8_t g_diag_meta_src = 0xFFU;
+
+static void boot_diag_frame_send(const uint8_t *payload, uint8_t n)
+{
+  uint8_t f[8];
+  uint8_t i;
+
+  if ((payload == (const uint8_t *)0) || (n == 0U) || (n > 7U))
+  {
+    return;
+  }
+  f[0] = payload[0];
+  for (i = 1U; i < 8U; i++)
+  {
+    f[i] = (uint8_t)((i < n) ? payload[i] : 0xCCU);
+  }
+  if (can_driver_send(BOOT_DIAG_CAN_ID, f, 8U) == 0)
+  {
+    (void)can_driver_wait_tx_idle(BOOT_DIAG_TX_TIMEOUT_MS);
+  }
+}
+
+void boot_diag_can_init(void)
+{
+  /* 初始化语义同 enter_safe_mode 既有调用（can_driver_init 自含
+   * sit1145_init→Normal）；提前到 main.c step2 仅为 M1~M4 可发帧。
+   * 影响面：仅 CAN1/GPIOA/GPIOB/SPI1 时钟引脚+收发器 Normal，与
+   * 决策链（flash 读写/CRC/ECDSA）零交集；enter_safe_mode 内原调用
+   * 保留（路径语义不变，重复 init 幂等复位）。 */
+  can_driver_init();
+  (void)sit1145_normal_mode_set();
+}
+
+void boot_diag_m1(const void *meta)
+{
+  const ota_metadata_t *m = (const ota_metadata_t *)meta;
+  uint8_t p[6];
+
+  p[0] = 0xA1U;
+  p[1] = (m != (const ota_metadata_t *)0) ? m->active_slot : 0xFFU;
+  p[2] = g_diag_meta_src;
+  if (m != (const ota_metadata_t *)0)
+  {
+    p[3] = (uint8_t)((m->magic == META_MAGIC) ? 1U : 0U);
+    p[4] = (uint8_t)((m->version == META_VERSION) ? 1U : 0U);
+    p[5] = (uint8_t)((boot_crc32((const void *)m,
+                                 sizeof(ota_metadata_t) - 4U) == m->crc32) ? 1U : 0U);
+  }
+  else
+  {
+    p[3] = 0U;
+    p[4] = 0U;
+    p[5] = 0U;
+  }
+  boot_diag_frame_send(p, 6U);
+}
+
+void boot_diag_m2(int8_t ret, uint8_t slot)
+{
+  uint8_t p[3];
+
+  p[0] = 0xA2U;
+  p[1] = slot;
+  p[2] = (uint8_t)ret;   /* 0=成功；0xFF=-1 失败（safe mode 0x01 路径） */
+  boot_diag_frame_send(p, 3U);
+}
+
+void boot_diag_m3(uint8_t pass, uint8_t fail_step, uint8_t slot)
+{
+  uint8_t p[4];
+
+  p[0] = 0xA3U;
+  p[1] = pass;
+  p[2] = fail_step;
+  p[3] = slot;
+  boot_diag_frame_send(p, 4U);
+}
+
+void boot_diag_m4(uint32_t app_addr)
+{
+  uint8_t p[5];
+
+  p[0] = 0xA4U;
+  p[1] = (uint8_t)(app_addr & 0xFFU);
+  p[2] = (uint8_t)((app_addr >> 8) & 0xFFU);
+  p[3] = (uint8_t)((app_addr >> 16) & 0xFFU);
+  p[4] = (uint8_t)((app_addr >> 24) & 0xFFU);
+  boot_diag_frame_send(p, 5U);
+}
+
 void enter_safe_mode(uint8_t cause)
 {
   uint32_t id;

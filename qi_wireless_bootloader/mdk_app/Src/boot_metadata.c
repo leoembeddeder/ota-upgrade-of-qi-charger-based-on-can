@@ -25,6 +25,7 @@
 
 /* includes ------------------------------------------------------------------*/
 #include "boot_metadata.h"
+#include "boot_safe_mode.h"   /* Boot 诊断标记：g_diag_meta_src 记录（观察不干预） */
 #include "at32f422_426_conf.h"
 #include <string.h>
 
@@ -248,6 +249,8 @@ int8_t boot_metadata_init(ota_metadata_t *meta)
   if (meta_validate(primary) == 0)
   {
     memcpy((void *)meta, (const void *)primary, sizeof(ota_metadata_t));
+    g_diag_meta_src = 0U;  /* 诊断记录：主区生效（观察不干预） */
+    boot_diag_m1(meta);
     return 0;
   }
 
@@ -258,6 +261,8 @@ int8_t boot_metadata_init(ota_metadata_t *meta)
     /* restore primary from backup */
     memcpy((void *)meta, (const void *)backup, sizeof(ota_metadata_t));
     boot_metadata_save(meta);
+    g_diag_meta_src = 1U;  /* 诊断记录：备区恢复生效（观察不干预） */
+    boot_diag_m1(meta);
     return 0;
   }
 
@@ -265,6 +270,8 @@ int8_t boot_metadata_init(ota_metadata_t *meta)
   meta_fill_defaults(meta);
   meta->crc32 = boot_crc32((const void *)meta, META_CRC32_OFFSET);
   boot_metadata_save(meta);
+  g_diag_meta_src = 2U;  /* 诊断记录：defaults 兜底（观察不干预） */
+  boot_diag_m1(meta);
 
   return -1;
 }

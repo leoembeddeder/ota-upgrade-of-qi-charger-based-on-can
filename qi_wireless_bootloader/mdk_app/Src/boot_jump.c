@@ -26,6 +26,7 @@
 /* includes ------------------------------------------------------------------*/
 #include "boot_jump.h"
 #include "boot_metadata.h"
+#include "boot_safe_mode.h"   /* Boot 诊断标记 M4（观察不干预） */
 #include "core_cm4.h"
 #include "at32f422_426_conf.h"
 
@@ -70,6 +71,10 @@ void boot_jump_to_app(uint32_t app_addr)
   {
     return;
   }
+
+  /* Boot 诊断标记 M4（观察不干预）：跳转目标 app_addr（LE 4B）；
+   * 发送于 CAN/SPI 关闭与 __disable_irq 之前，polling 有界（≤3ms） */
+  boot_diag_m4(app_addr);
 
   /* snapshot from Flash before MSP switches to the APP stack */
   msp   = *(volatile uint32_t *)(app_addr);

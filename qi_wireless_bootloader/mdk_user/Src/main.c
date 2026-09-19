@@ -60,6 +60,13 @@ int main(void)
   /* step 2: initialize drivers */
   timer_drv_init();
 
+  /* Boot 诊断版（观察不干预）：CAN 标记帧能力提前初始化——原首次调用在
+   * enter_safe_mode 内，M1~M4 在此之前发不出去。影响面：仅 CAN1/GPIOA/
+   * GPIOB/SPI1 时钟引脚+SIT1145 Normal（can_driver_init 自含 sit1145_init），
+   * 与决策链（flash 读写/CRC/ECDSA）零交集；发送 polling 有界（每帧 ≤3ms，
+   * 总线挂死即弃帧，不影响开机）。enter_safe_mode 内既有调用保留不变。 */
+  boot_diag_can_init();
+
   /* step 3: load and validate OTA metadata */
   boot_metadata_init(&g_meta);
 
