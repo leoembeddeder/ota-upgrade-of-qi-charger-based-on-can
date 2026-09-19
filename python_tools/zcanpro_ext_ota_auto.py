@@ -1,6 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA
+ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA（用户实测流程对齐版）
+
+用户五步流程（脚本严丝合缝支持，2026-09-20 对齐）：
+  ① 设备烧录 boot+slotA 完整固件（QC_JYF_FW_1.1.1）作为基线；
+  ② 手动改代码 SW_VERSION_STR → QC_JYF_FW_1.1.2（用户侧 Keil 工程）；
+  ③ Keil Rebuild APP 工程（禁 Incremental Build）；
+  ④ 运行 pack_image.py 打包生成载荷（落 app bin/；Keil 新 bin 亦可，
+     脚本会现场打包）；
+  ⑤ 运行本脚本升级到 B 槽。
+载荷构建前提：仓库固件 SW_VERSION_STR 保持 QC_JYF_FW_1.1.1 零触碰
+（铁律），1.1.2 版本串只存在于用户侧构建产物；EXPECTED_SW_VERSION
+固化 "QC_JYF_FW_1.1.2"，选 bin 版本匹配优先/mtime 次序（旧 1.1.1
+残留绝不被选中），不符→拒闪（fail-closed 零业务流量）。
 
 在 APP 内擦写非活跃槽（31/34/36/37）。新版固件 0x37 收尾在验签+
 commit_trial 成功后自行复位（ota_download.c ota_dl_poll），Boot 按
@@ -13,7 +25,6 @@ trial PENDING 切槽；主机 11 01（非 suppress）保留为旧 APP 兼容与
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
 需要: Python 3.8 32 位（ZCANPRO 扩展脚本要求）
-固件: app bin/app_slot_a.bin，或 Slot A 的 qi_wireless.bin（现场打包）
 """
 
 import os
@@ -43,6 +54,11 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 #   Rebuild APP → pack（新 bin strings 含 1.1.2 才能过拒闪门）；仓库固件
 #   SW_VERSION_STR 保持 QC_JYF_FW_1.1.1 零触碰（铁律，本脚本不改固件）。
 EXPECTED_SW_VERSION = "QC_JYF_FW_1.1.2"
+
+# BASELINE_SW_VERSION：升级前基线版本（用户五步流程第①步烧录的 1.1.1
+# 基线）。仅用于升级前基线确认打印（异常时醒目提醒，不拦截流程），
+# 与判定闭环三条件无关。
+BASELINE_SW_VERSION = "QC_JYF_FW_1.1.1"
 
 
 def _find_repo_root(start):
@@ -109,8 +125,61 @@ def _extract_sw_version(blob):
 
 
 def _pick_firmware():
-    """Keil 新 bin 优先于过期的 app_slot_a.bin，避免把 1.1.1 又刷回对面槽。"""
+    """载荷选择：版本匹配优先、mtime 次序（用户五步流程对齐，2026-09-20）。
+
+    候选=Keil Slot A 构建产物(qi_wireless.bin) + app bin/ 下全部 .bin
+    （含 pack_image.py 产物）。EXPECTED_SW_VERSION 非空时：仅在
+    strings 版本==EXPECTED 的候选中取 mtime 最新者；无匹配候选→
+    直接报错（旧版本残留绝不被选中，与 run_ota 内拒闪门 fail-closed
+    双保险，拒闪门本身保持不动）。EXPECTED 为空时：维持旧语义
+    （Keil 新 bin 优先/app_slot_a.bin 兜底）。"""
+    candidates = []
+    seen = set()
+
+    def _add(path, tag):
+        ap = os.path.abspath(path)
+        if ap in seen or not os.path.isfile(path):
+            return
+        try:
+            if os.path.getsize(path) < IMAGE_HEADER_SIZE + 8:
+                return
+        except Exception:
+            return
+        seen.add(ap)
+        candidates.append((path, tag))
+
+    _add(KEIL_BIN_A, "Keil bin")
     packed = os.path.join(FIRMWARE_DIR, "app_slot_a.bin")
+    _add(packed, "app bin/app_slot_a.bin")
+    if os.path.isdir(FIRMWARE_DIR):
+        for _name in sorted(os.listdir(FIRMWARE_DIR)):
+            if _name.endswith(".bin"):
+                _add(os.path.join(FIRMWARE_DIR, _name), "app bin/" + _name)
+    if not candidates:
+        raise RuntimeError("找不到固件。请按脚本头部五步流程构建载荷："
+                           "SW_VERSION_STR→1.1.2→Keil Rebuild APP→pack_image.py")
+    if EXPECTED_SW_VERSION:
+        matched = []
+        for path, tag in candidates:
+            try:
+                ver = _extract_sw_version(open(path, "rb").read())
+            except Exception:
+                ver = None
+            _log("候选载荷 %s（%s）strings 版本=%s" % (path, tag, ver or "未找到"))
+            if ver == EXPECTED_SW_VERSION:
+                matched.append((os.path.getmtime(path), path, tag))
+        if not matched:
+            raise RuntimeError(
+                "载荷选择 fail-closed：无任何候选 bin 版本==EXPECTED_SW_VERSION=%s"
+                "（旧版本残留绝不被选中）。请按脚本头部五步流程构建 1.1.2 载荷："
+                "用户侧 SW_VERSION_STR→QC_JYF_FW_1.1.2→Keil Rebuild APP→"
+                "pack_image.py（仓库固件保持 1.1.1 零触碰）" % EXPECTED_SW_VERSION)
+        matched.sort(key=lambda t: t[0], reverse=True)
+        _mt, path, tag = matched[0]
+        _log("载荷选择：版本匹配 %s → %s（%s，mtime 最新）"
+             % (EXPECTED_SW_VERSION, path, tag))
+        return path
+    # EXPECTED 为空：维持旧语义（Keil 新 bin 优先，mtime 次序兜底）
     keil = KEIL_BIN_A
     if os.path.isfile(keil):
         if (not os.path.isfile(packed)) or (os.path.getmtime(keil) >= os.path.getmtime(packed) - 1.0):
@@ -1477,8 +1546,26 @@ def run_ota(bus_id):
                                "跳转后试运行确认会擦 metadata，CAN 可能 bus-off；"
                                "请烧录含 bus-off 恢复的 APP 后再连升。"
                                "空片用 merge_prod_bin.py。" % PROBE_ROUNDS)
+        _log("[人话] 设备应答正常，CAN 探测通过")
         from_slot = read_did_u8(bus_id, 0x2113)
         _log("升级前运行槽 DID 0x2113=%s" % slot_name(from_slot))
+        # ---- B. 升级前基线确认（用户五步流程：基线=A 槽/1.1.1；提醒不拦截）----
+        base_ver = None
+        try:
+            rxv = uds_req(bus_id, SID_RDBI, [0xF1, 0x95])
+            vb = _to_bytes(rxv[3:]) if len(rxv) > 3 else b""
+            base_ver = vb.split(b"\x00")[0].decode("ascii", "ignore").strip() or None
+        except Exception as e:
+            _log("[基线] 0xF195 读取失败（不拦截流程）: %s" % e)
+        if (from_slot == SLOT_A) and (base_ver == BASELINE_SW_VERSION):
+            _log("[基线] 设备基线：%s 槽 / %s，起点正确，开始升级"
+                 % (slot_name(from_slot), base_ver))
+        else:
+            _log("[基线] ！！！！！ 基线异常提醒 ！！！！！ 设备当前：%s 槽 / %s"
+                 % (slot_name(from_slot), base_ver or "未读到"))
+            _log("[基线] 用户流程预期起点=%s 槽 / %s（①烧录 boot+slotA 1.1.1 "
+                 "基线后再跑升级）；基线不符不拦截执行（升级仍写非活跃槽），"
+                 "请自行确认烧录基线是否正确" % (slot_name(SLOT_A), BASELINE_SW_VERSION))
         _log("镜像链接 Slot %s；将写入非活跃槽（必要时重定位）" % slot_name(linked))
         _log("在 APP 内升级（31/34/36/37）；新固件 0x37 成功后自复位切槽，"
              "11 01 为旧 APP 兼容与补发手段")
@@ -1622,8 +1709,15 @@ def run_ota(bus_id):
                 otx_anomaly = True
                 _log("0x37 五次均无最终应答（%s）。新固件 0x37 收尾 77 后即自复位，"
                      "应答丢失属可能形态；切槽/版本三条件闭环将给出最终判定" % last_err)
+        if last_err is None:
+            _log("[人话] 固件数据已全部写入 %s 槽，设备校验提交成功（0x37 已确认），"
+                 "即将自动重启切换" % slot_name(dest))
+        else:
+            _log("[人话] 数据传输结束但 0x37 应答异常（详见上方技术日志）；"
+                 "是否提交成功以重启后三条件判定为准")
         _log("---- Reset ----")
         uds_ecu_reset(bus_id)
+        _log("[人话] 已发送重启指令，等待设备重启后回报槽位与版本…")
         t0 = time.time()
         while time.time() - t0 < 2.0:
             if stopTask:
@@ -1655,6 +1749,8 @@ def run_ota(bus_id):
                     time.sleep(0.05)
                 to_slot, got_ver = confirm_app_after_reset(bus_id)
 
+        _log("[人话] 重启后设备回报：运行槽=%s，版本=%s；开始最终判定…"
+             % (slot_name(to_slot), got_ver or "未读到"))
         # ---- 判定闭环（P1）：三条件缺一不可 ----
         # ① 复位后 APP 应答（confirm_app_after_reset 不抛异常即满足）
         # ② 0x2113 == 目标槽 dest
@@ -1679,6 +1775,8 @@ def run_ota(bus_id):
         _log("判定闭环三条件全部满足：① 复位后 APP 应答（22 2113/0x34 正常）；"
              "② 0x2113=%s==目标槽 %s；③ 0xF195=%s==预期版本 %s" % (
                  slot_name(to_slot), slot_name(dest), got_ver, expect_ver))
+        _log("[人话] 升级成功：设备已运行 %s 槽 / %s（三条件全部满足）"
+             % (slot_name(to_slot), got_ver))
         _log("======== OTA 成功 ========")
     finally:
         zcanpro.uds_deinit()
