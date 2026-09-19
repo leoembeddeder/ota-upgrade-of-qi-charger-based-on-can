@@ -1,7 +1,10 @@
 /**
   **************************************************************************
   * @file     ota_download.c
-  * @brief    Write the inactive APP slot via UDS 0x31/0x34/0x36/0x37
+  * @brief    Write the inactive APP slot via UDS 0x31/0x34/0x36/0x37.
+  *           0x37 验签并 commit_trial 成功后自行 NVIC_SystemReset，
+  *           Boot 按 trial PENDING 切槽；主机 11 01 保留为旧 APP
+  *           兼容与复位未生效时的补发手段。
   **************************************************************************
   */
 
@@ -11,6 +14,7 @@
 #include "can_driver.h"
 #include "sit1145.h"
 #include "timer_drv.h"
+#include "lifecycle.h"
 #include "device_info.h"
 #include "sha256.h"
 #include "uECC.h"
@@ -20,6 +24,35 @@
 
 #define FLASH_PHYSICAL_END  0x08020000U
 #define VERIFY_CHUNK        256U
+
+/* 擦除路径有界等待预算（TC-1307 擦除挂死加固，Branch-B）：
+ * 库 flash_sector_erase 内部 ERASE_TIMEOUT=0x40000000 次轮询≈无界
+ * （at32f422_426_flash.h:152）——flash BUSY 楔死时关中断窗口内
+ * SysTick 停走、全树无看门狗，整机挂死只能断电恢复
+ * （取证报告 /mnt/k/ota_erase_forensics_0919.md §2c）。
+ * 预算推导：flash_operation_wait_for 单次轮询为数十 ns 量级（对照库
+ * PROGRAMMING_TIMEOUT=0x100000 次覆盖字编程 µs 级典型耗时的配比），
+ * 单扇区典型擦除 ~25ms ≈ 1M 次轮询，4M ≈ 4× 余量（≈单扇区典型耗时
+ * ×4 的设计目标；关中断窗口内 tick 停走，只能用迭代上限）。健康路径
+ * 擦完即返回，不受预算影响；楔死路径从"无界挂死"变为有界超时→
+ * NRC 0x72 可观测失败。 */
+#define OTA_ERASE_POLLS_MAX  4000000U
+
+/* 擦除路径局部有界擦除：与库 flash_sector_erase 相同的寄存器序列，
+ * 仅把无界 ERASE_TIMEOUT 换成调用方给定的轮询上限。库函数本身不动，
+ * 其他调用路径语义不变。 */
+static flash_status_type flash_sector_erase_bounded(uint32_t sector_address,
+                                                    uint32_t max_polls)
+{
+  flash_status_type status;
+
+  FLASH->ctrl_bit.secers = TRUE;
+  FLASH->addr = sector_address;
+  FLASH->ctrl_bit.erstr = TRUE;
+  status = flash_operation_wait_for(max_polls);
+  FLASH->ctrl_bit.secers = FALSE;
+  return status;
+}
 
 static uint8_t  g_erased;
 static uint8_t  g_active;
@@ -335,11 +368,16 @@ void ota_dl_handle_erase(uint8_t *data, uint16_t len)
     /* Single-bank: IRQ fetch during sector erase hardfaults / wedges CAN. */
     __disable_irq();
     flash_unlock();
-    st = flash_sector_erase(addr);
+    st = flash_sector_erase_bounded(addr, OTA_ERASE_POLLS_MAX);
     flash_lock();
     __enable_irq();
     if (st != FLASH_OPERATE_DONE)
     {
+      /* 有界超时/擦除错误路径：flash_lock+__enable_irq 已在上方无条件
+       * 完成；can_proto_end_long_op 做 CAN offline/online 恢复（不清
+       * 回调）后回 NRC 0x72 generalProgrammingFailure，可观测失败。
+       * 幂等不变：脚本 _erase_with_retry 重试重擦已擦槽安全；活跃槽
+       * 防护（上方 g_base==ota_running_slot_base() → NRC 0x22）不动。 */
       can_proto_end_long_op();
       can_proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
       return;
@@ -594,5 +632,19 @@ void ota_dl_poll(void)
   can_proto_end_long_op();
   resp[0] = (uint8_t)(UDS_SID_TRANSFER_EXIT + UDS_POSITIVE_RESPONSE_OFFSET);
   can_proto_send_response(resp, 1);
+  /* 切槽激活设计：0x37 收尾在 verify_slot_image + commit_trial 全部成功
+   * 之后 APP 自行复位——commit_trial 已把 trial PENDING metadata 先备
+   * 后主落盘（ota_trigger.c meta_write_to_flash 咽喉点），Boot 复位后按
+   * trial PENDING 选槽跳转新 APP。主机 11 01 保留：旧 APP（无自复位
+   * 逻辑）兼容 + 应答丢失/复位未生效时脚本补发手段
+   * （can_protocol.c handle_ecu_reset）。
+   * 响应必须先落总线再复位：wait_tx_idle 等 0x77 发送完成，SHUTDOWN
+   * 生命周期帧同理等 TX 空闲后才 NVIC_SystemReset。
+   * 0x37 重试幂等性：复位后重试帧落在重启后的新 APP（默认会话，
+   * handler 回 NRC 0x22）；g_trial_ready 分支仍保护复位前窗口内的重复
+   * 0x37（直接回正响应，不重复 commit）。 */
   (void)can_driver_wait_tx_idle(50U);
+  lifecycle_set_state(LIFECYCLE_SHUTDOWN);
+  (void)can_driver_wait_tx_idle(20U);
+  NVIC_SystemReset();
 }
