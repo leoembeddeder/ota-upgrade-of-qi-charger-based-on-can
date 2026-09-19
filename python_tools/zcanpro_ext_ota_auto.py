@@ -60,21 +60,32 @@ def _scan_firmware():
     return result
 
 
-def _pick_firmware():
-    """优先 app_slot_a.bin，其次 Slot A Keil 裸 bin，再扫 app bin/ 里任意 XATO。"""
-    ordered = [os.path.join(FIRMWARE_DIR, "app_slot_a.bin"), KEIL_BIN_A]
-    slots = {}
+def _extract_sw_version(blob):
+    """从 payload 里抠 QC_JYF_FW_...（编译进 APP 的 SW_VERSION_STR）。"""
+    marker = b"QC_JYF_FW_"
+    i = blob.find(marker)
+    if i < 0:
+        return None
+    s = blob[i:i + 32].split(b"\x00")[0]
     try:
-        slots = _scan_firmware()
-    except RuntimeError:
-        slots = {}
-    for p in slots.values():
-        if p not in ordered:
-            ordered.append(p)
-    for path in ordered:
-        if os.path.isfile(path):
-            _log("固件 " + path)
-            return path
+        return s.decode("ascii").strip()
+    except Exception:
+        return None
+
+
+def _pick_firmware():
+    """Keil 新 bin 优先于过期的 app_slot_a.bin，避免把 1.1.1 又刷回对面槽。"""
+    packed = os.path.join(FIRMWARE_DIR, "app_slot_a.bin")
+    keil = KEIL_BIN_A
+    if os.path.isfile(keil):
+        if (not os.path.isfile(packed)) or (os.path.getmtime(keil) >= os.path.getmtime(packed) - 1.0):
+            _log("使用 Keil bin: " + keil)
+            return keil
+        _log("app_slot_a.bin 比 Keil bin 新，使用 " + packed)
+        return packed
+    if os.path.isfile(packed):
+        _log("固件 " + packed)
+        return packed
     raise RuntimeError("找不到固件。请编 Slot A 或运行 pack_image.py")
 
 FIRMWARE_PATH = ""
@@ -1131,11 +1142,15 @@ def run_ota(bus_id):
         FIRMWARE_PATH = _pick_firmware()
         image = pack_image_if_needed(FIRMWARE_PATH, priv)
         linked = validate_image(image)
+        want_ver = _extract_sw_version(image)
+        _log("镜像内 SW_VERSION_STR=%s（刷完对面槽后 0xF195 应等于它）" % (want_ver or "未找到"))
         if not probe_in_app(bus_id):
             raise RuntimeError("UDS 无应答（已重试 %d 轮）。"
                                "跳转后试运行确认会擦 metadata，CAN 可能 bus-off；"
                                "请烧录含 bus-off 恢复的 APP 后再连升。"
                                "空片用 merge_prod_bin.py。" % PROBE_ROUNDS)
+        from_slot = read_did_u8(bus_id, 0x2113)
+        _log("升级前运行槽 DID 0x2113=%s" % slot_name(from_slot))
         _log("镜像链接 Slot %s；将写入非活跃槽（必要时重定位）" % slot_name(linked))
         _log("在 APP 内升级（31/34/36/37），完成后 11 01 由 Boot 切槽")
         _log("---- Programming ----")
@@ -1235,6 +1250,25 @@ def run_ota(bus_id):
                 raise RuntimeError("用户停止脚本")
             time.sleep(0.05)
         confirm_app_after_reset(bus_id)
+        to_slot = read_did_u8(bus_id, 0x2113)
+        _log("升级后运行槽 DID 0x2113=%s（应对面槽，升级前=%s）" % (
+            slot_name(to_slot), slot_name(from_slot)))
+        if to_slot == from_slot:
+            raise RuntimeError(
+                "切槽失败：复位后仍在 Slot %s。Boot 可能验签失败回滚了旧槽。"
+                % slot_name(from_slot))
+        try:
+            ver = uds_req(bus_id, SID_RDBI, [0xF1, 0x95])
+            got = ""
+            if len(ver) >= 35 and ver[0] == (SID_RDBI + SID_PR):
+                got = "".join(chr(b) if 0x20 <= b < 0x7F else "?" for b in ver[3:35]).rstrip()
+            _log("升级后 DID 0xF195=%s" % got)
+            if want_ver and got and got != want_ver:
+                raise RuntimeError("版本未更新：期望 %s，实际 %s（仍在跑旧镜像）" % (want_ver, got))
+        except RuntimeError:
+            raise
+        except Exception as e:
+            _log("升级后读 0xF195 失败: %s" % e)
         _log("======== OTA 成功 ========")
     finally:
         zcanpro.uds_deinit()

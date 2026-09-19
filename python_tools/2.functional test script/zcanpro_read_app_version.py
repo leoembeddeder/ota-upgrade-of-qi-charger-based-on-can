@@ -34,7 +34,7 @@ SID_PR   = 0x40
 # 期望值 = 固件编译常量：SW_VERSION_STR / BOOTLOADER_VER_STR / HW_VERSION_STR
 # （can_protocol.c）。镜像头不携带版本号，版本号唯一定义在固件编译常量。
 DID_LIST = [
-    (0xF195, "APP 软件版本", "QC_JYF_FW_1.1.1"),
+    (0xF195, "APP 软件版本", "QC_JYF_FW_1.1.2"),
     (0xF180, "Bootloader 版本", "QC_JYF_BL_1.0.0"),
     (0xF193, "硬件版本",     "QC_JYF_HW_1.1.5"),
 ]
@@ -439,7 +439,7 @@ def z_main():
     global stopTask
     stopTask = False
     _log("======== APP 版本读取工具 ========")
-    _log("预期版本: SW=QC_JYF_FW_1.1.1 / BL=QC_JYF_BL_1.0.0 / HW=QC_JYF_HW_1.1.5")
+    _log("预期版本: SW=QC_JYF_FW_1.1.2 / BL=QC_JYF_BL_1.0.0 / HW=QC_JYF_HW_1.1.5")
     _log("DID: 0xF195(SW) / 0xF180(BL) / 0xF193(HW)")
     _log("")
     buses = zcanpro.get_buses()
