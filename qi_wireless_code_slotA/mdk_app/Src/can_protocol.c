@@ -50,7 +50,7 @@
 /*  改版本号只改本常量 + docs 文档，无打包脚本联动环节。                     */
 /* ========================================================================== */
 
-static const char SW_VERSION_STR[]     = "QC_JYF_FW_1.1.2";   /*!< 运行版本唯一真相源 */
+static const char SW_VERSION_STR[]     = "QC_JYF_FW_1.1.1";   /*!< 运行版本唯一真相源 */
 static const char BOOTLOADER_VER_STR[] = "QC_JYF_BL_1.0.0";
 static const char HW_VERSION_STR[]     = "QC_JYF_HW_1.1.5";
 
@@ -948,13 +948,8 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
     return;
   }
 
-  /* 切槽激活现状（与 ota_download.c ota_dl_poll 同步）：新版 APP 在
-   * 0x37 收尾 verify+commit_trial 成功后已自行复位（77 先落总线再
-   * SHUTDOWN+NVIC_SystemReset），Boot 按 trial PENDING 切槽，不再依赖
-   * 主机复位。本 handler 保留：①旧 APP（无自复位逻辑）兼容；②应答
-   * 丢失/复位未生效时主机补发（OTA 脚本判定闭环检测到 2113 未变且
-   * 2114==目标槽时自动补发一次）。无论谁触发复位，metadata 均已在
-   * commit_trial 先备后主落盘，Boot 选槽不受影响。 */
+  /* After 0x37, metadata is already trial PENDING. 11 01 only resets;
+   * Bootloader jumps the new slot. */
 
   if (!suppress)
   {
@@ -1014,12 +1009,7 @@ static void handle_read_data_by_id(uint8_t *data, uint16_t len)
 
 /**
  * @brief  WriteDataByIdentifier (0x2E)
- * @note   逐 DID 门禁（本文件 WDBI case 表，同值 NRC 判读以 case 块内
- *         检查顺序为准）：0x2101/0x210D 需 EXTENDED 会话（10 03）；
- *         0x2010/0xF18C/0x2120/0x2130/0x2131 需 PROGRAMMING 会话
- *         （10 02）；全部可写 DID 均需 SecurityAccess 解锁；其他 DID
- *         回 NRC 0x31。同一 case 内会话检查先于安全检查（NRC 0x22 在
- *         0x33 之前——写步拿 0x33=会话存活证据，拿 0x22 才是会话丢失）。
+ * @note   requires programming session + SecurityAccess Level 1
  * @param  data: UDS payload
  * @param  len:  payload length
  * @retval none
@@ -1311,14 +1301,8 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
 
 /**
  * @brief  SecurityAccess (0x27)
- * @note   APP side implements SecurityAccess fully (Boot safe mode does not):
- *         27 01 -> 67 01 + 32-byte seed (g_seed[32], refreshed on every 27 01,
- *         signature buffer cleared with it); unlocked 27 01 -> 67 01 + 32x0x00.
- *         27 03 -> chunked signature transfer (4B/frame x 16, blockSeq 0x01..0x10,
- *         blockSeq 0x01 resets the buffer); 27 02 -> sha256_hash(g_seed, 32U) +
- *         uECC_verify on the accumulated 64-byte signature.
- *         Verify fail: NRC 0x35 (invalidKey, fail_count+1); fail_count >= 3 arms
- *         the ~30s lockout: 27 02 -> NRC 0x36, 27 01 inside lockout -> NRC 0x37.
+ * @note   APP side does not support SecurityAccess (done in bootloader safe mode).
+ *         Return NRC 0x11 to indicate this service is not available in APP.
  * @param  data: UDS payload
  * @param  len:  payload length
  * @retval none
@@ -1495,11 +1479,8 @@ static void handle_security_access(uint8_t *data, uint16_t len)
 
 /**
  * @brief  RoutineControl (0x31)
- * @note   APP 实现槽擦写全链（ota_download.c）：0x31 擦除非活跃槽 →
- *         0x34/0x36 下载编程 → 0x37 验签+commit_trial 后自复位切槽；
- *         门禁=PROGRAMMING 会话+SecurityAccess（handler 内逐项检查）。
- *         Boot 仅在复位后按 trial metadata 选槽/回滚/进 safe mode，
- *         不承担下载编程（旧"Boot safe mode only"架构已废弃）。
+ * @note   APP does not erase or program slots. Host must 10 02 + 27 + 11 01
+ *         into Bootloader Safe Mode; 0x31/0x34/0x36 live there only.
  */
 static void handle_routine_control(uint8_t *data, uint16_t len)
 {

@@ -73,9 +73,9 @@ extern "C" {
 #define UDS_SID_SECURITY_ACCESS      0x27U        /*!< SecurityAccess */
 #define UDS_SID_ROUTINE_CONTROL      0x31U        /*!< RoutineControl */
 #define UDS_SID_REQUEST_DOWNLOAD     0x34U        /*!< RequestDownload */
-#define UDS_SID_TRANSFER_DATA        0x36U        /*!< TransferData (APP 槽下载编程，ota_download.c) */
-#define UDS_SID_TRANSFER_EXIT        0x37U        /*!< RequestTransferExit (APP 验签+commit_trial 后自复位切槽) */
-#define UDS_SID_TRANSFER_SIGNATURE   0x38U        /*!< TransferSignature (当前 APP 未实现，回 NRC 0x11；签名在 XATO 镜像头内随 0x37 校验) */
+#define UDS_SID_TRANSFER_DATA        0x36U        /*!< TransferData (boot safe mode only) */
+#define UDS_SID_TRANSFER_EXIT        0x37U        /*!< RequestTransferExit (boot safe mode only) */
+#define UDS_SID_TRANSFER_SIGNATURE   0x38U        /*!< TransferSignature (boot safe mode only) */
 #define UDS_SID_TESTER_KEEPALIVE     0x3EU        /*!< TesterPresent (keepalive) */
 
 /* ========================================================================== */

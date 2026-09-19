@@ -3,7 +3,6 @@
 ZCANPRO 扩展脚本 — 启动 Qi 无线充电
 
 流程：
-  0. 运行侧探测（22 2113 / 0x34 正证据判定 + Standby 唤醒收敛，仅 APP 可充电）
   1. 进入扩展会话 (0x10 0x03)
   2. 安全解锁 (0x27 01 → 0x27 03 分片 → 0x27 02)
   3. 设置功率 (0x2E 21 0D，默认15W)
@@ -65,33 +64,9 @@ SID_TP  = 0x3E
 SID_NRC  = 0x7F
 SID_PR   = 0x40
 
+NRC_SNS = 0x11
+NRC_CNC = 0x22
 NRC_RCRRP = 0x78
-NRC_EXCEEDED_ATTEMPTS   = 0x36  # 27 02 验签失败次数超限当次应答（fail_count≥3，固件随即锁定约30s）
-NRC_REQUIRED_TIME_DELAY = 0x37  # 锁定期内 27 01 的应答（requiredTimeDelay）；锁定期内
-                                # 27 02 因固件已清 seed/签名缓冲回 0x24，非 0x37
-NRC_CONDITIONS_NOT_CORRECT = 0x22  # 固件写门禁：会话不满足（S3 超时后会话回 default 的典型表现）
-NRC_SECURITY_ACCESS_DENIED = 0x33  # 固件写门禁：security_unlocked=0（S3 超时/会话切换被清）
-
-# ======== S3 会话超时防护参数（三脚本同构）========
-# 固件：SESSION_TIMEOUT_MS=5000（can_protocol.h:167）；UDS 交换间隙>5s 时
-# isotp_message_received / can_protocol_poll 会把会话回 default+清 security
-# （can_protocol.c:1844-1853 / 2094-2096），后续 2E 写撞 NRC 0x22/0x33。
-# 固件验证结论：3E 80（suppress）与 3E 00 均刷新 S3 计时——uds_process_message
-# 派发前对任何诊断请求统一刷新 last_tester_present_tick（can_protocol.c:1770），
-# handle_tester_present 对 suppress 帧同样刷新计时且不回响应（:1509）→
-# keepalive 优先 3E 80（无响应帧干扰，ZCANPRO suppress 请求立即返回）。
-S3_KEEPALIVE_INTERVAL_S = 3.0      # keepalive 周期：3s < 5s 超时窗，留 2s 余量
-S3_SIGN_GAP_GUARD_S     = 3.0      # 签名耗时超过该值：先发 3E 再进 27 03 分片
-SA_LOCKOUT_WAIT_S       = 31.0     # SA 锁定等待总时长（与原 sleep(31) 一致）
-
-
-class UdsNrcError(RuntimeError):
-    """带 NRC 码的 UDS 异常；SecurityAccess 重试分支按 e.nrc 判别设备锁定等场景。"""
-
-    def __init__(self, sid, nrc):
-        RuntimeError.__init__(self, "NRC SID=0x%02X NRC=0x%02X" % (sid, nrc))
-        self.sid = sid
-        self.nrc = nrc
 
 DID_CHARGER_ENABLE = 0x2101
 DID_CHARGE_STATE   = 0x2102
@@ -362,7 +337,7 @@ def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
                 _log("NRC 0x78，MCU 忙，继续等待")
                 time.sleep(1.0)
                 continue
-            raise UdsNrcError(data[1], data[2])
+            raise RuntimeError("NRC SID=0x%02X NRC=0x%02X" % (data[1], data[2]))
         if not resp or not resp.get("result"):
             raise RuntimeError("无应答 SID=0x%02X" % sid)
         if len(data) < 1 or data[0] != (sid + SID_PR):
@@ -378,59 +353,6 @@ def uds_try(bus_id, sid, payload, suppress=0):
         return None
 
 
-def _s3_keepalive_wait(bus_id, total_s=SA_LOCKOUT_WAIT_S, interval_s=S3_KEEPALIVE_INTERVAL_S):
-    """S3 会话超时防护：SA 锁定等待期间周期发送 3E 80 keepalive。
-
-    固件验证（can_protocol.c）：uds_process_message 对任何诊断请求（含
-    3E suppress 帧）在派发前刷新 last_tester_present_tick（:1770）；
-    handle_tester_present 对 suppress 帧同样刷新计时且不回响应（:1509）
-    → 3E 80 与 3E 00 同样续期 S3，优先 3E 80（无响应帧干扰，库立即返回）。
-    周期 3s < SESSION_TIMEOUT_MS 5s（can_protocol.h:167）；总等待时长与原
-    sleep(31) 一致。走既有 uds_try 通道，不碰探测/raw 路径；keepalive
-    失败只记录，不中断等待。
-    """
-    t_end = time.time() + float(total_s)
-    sent = 0
-    _log("S3 keepalive 等待 %.0fs（每 %.0fs 发 3E 80 suppress，防会话超时回 default+清 security）"
-         % (total_s, interval_s))
-    while True:
-        remain = t_end - time.time()
-        if remain <= 0:
-            break
-        time.sleep(interval_s if remain > interval_s else remain)
-        if stopTask:
-            raise RuntimeError("用户停止脚本")
-        uds_try(bus_id, SID_TP, [0x80], suppress=1)
-        sent += 1
-    _log("S3 keepalive 等待结束：%.0fs 内共发 %d 次 3E 80" % (total_s, sent))
-
-
-def _wdbi_with_s3_guard(bus_id, payload, priv):
-    """2E 写步 S3 超时兜底（三脚本同构）：写收到 NRC 0x22/0x33 →
-    重发本脚本会话控制 10 03 + 既有 send_security_key 完整重解锁 + 重试写一次。
-
-    固件门禁（can_protocol.c:1035-1045）：写 0x210D DID_POWER_LIMIT /
-    0x2101 DID_CHARGER_ENABLE 均要求 SESSION_EXTENDED+security_unlocked——
-    NRC 0x22=会话不满足（S3 超时回 default 的典型表现），0x33=安全态被清。
-    注意：2E 21 01 01 使能写在充电故障激活（g_qi_fault_code!=0）时固件
-    业务层也回 NRC 0x22（can_protocol.c:1245-1250），兜底重试后若仍 0x22
-    将以 NRC 抛出（失败响亮、无误写面）。会话字节与本脚本业务链一致
-    （10 03 扩展会话）。日志注明「S3 超时恢复」。
-    """
-    try:
-        uds_req(bus_id, SID_WDBI, payload)
-        return
-    except UdsNrcError as e:
-        if e.nrc not in (NRC_CONDITIONS_NOT_CORRECT, NRC_SECURITY_ACCESS_DENIED):
-            raise
-        _log("2E 写 NRC 0x%02X：疑似 S3 会话超时（会话回 default / 安全态被清）——"
-             "S3 超时恢复：重发 10 03 扩展会话 + 完整重解锁 + 重试写一次" % e.nrc)
-    uds_req(bus_id, SID_DSC, [0x03])
-    send_security_key(bus_id, priv)
-    uds_req(bus_id, SID_WDBI, payload)
-    _log("S3 超时恢复：会话+安全态重建后重试写成功")
-
-
 def read_did(bus_id, did):
     rx = uds_req(bus_id, SID_RDBI, [(did >> 8) & 0xFF, did & 0xFF])
     if len(rx) < 4:
@@ -438,17 +360,7 @@ def read_did(bus_id, did):
     return rx[3:]
 
 
-def _sa_fetch_seed(bus_id):
-    """27 01 取 seed。固件自 d64e8c2 起 seed 为 32 字节（67 01 + 32B）。
-    固件每次 27 01 都刷新 seed 并清空签名缓冲。"""
-    rx = uds_req(bus_id, SID_SA, [0x01])
-    if len(rx) < 34:
-        raise RuntimeError("seed 响应过短: %d 字节, 期望 67 01 + 32 字节 seed（≥34）" % len(rx))
-    return rx
-
-
-def _sa_send_sig(bus_id, sig):
-    """27 03 分片发送 64 字节签名：4 字节/帧 × 16 帧，blockSeq 0x01 起递增。"""
+def send_security_key(bus_id, sig):
     sig = _to_bytes(sig)
     if len(sig) != 64:
         raise RuntimeError("ECDSA 签名须 64 字节")
@@ -461,61 +373,20 @@ def _sa_send_sig(bus_id, sig):
         seq += 1
     _log("27 03 已送 64 字节 / %d 帧" % (seq - 1))
     time.sleep(0.15)
-
-
-def send_security_key(bus_id, priv):
-    """SecurityAccess 解锁：每次尝试都是完整流程——
-    27 01 取 32 字节 seed（全 0 = 已解锁，直接返回正响应）→
-    ecdsa_sign_msg(priv, seed) 重签 → 重发 16 帧 27 03 分片 → 27 02 验签。
-
-    固件每次 27 01 都刷新 seed 并清空签名缓冲，27 02 失败后只重发 27 02
-    或沿用旧 seed 签名必失败，故重试必须完整重做。最多 5 次完整尝试；
-    NRC 0x36/0x37 = 设备 SecurityAccess 锁定（fail_count≥3，约 30s）：
-    0x36 是 27 02 验签失败超限当次的应答；0x37 是锁定期内 27 01 的应答
-    （requiredTimeDelay）。锁定期内的 27 02 固件因验签失败已清
-    g_seed_generated，先撞序检查回 NRC 0x24（can_protocol.c:1430-1433,
-    1469），不是 0x37——脚本每轮先发 27 01，锁定仍由 0x37 捕获，重试逻辑
-    不变：两者都日志明确提示并经 _s3_keepalive_wait（每 3s 发 3E 80 suppress
-    刷新 S3 计时，总等待 31s，防等待期会话超时）后继续完整流程。
-    """
     last = None
-    for attempt in range(1, 6):
+    for i in range(5):
         if stopTask:
             raise RuntimeError("用户停止脚本")
         try:
-            _log("SecurityAccess 第 %d/5 次：27 01 → 重签 → 27 03 → 27 02" % attempt)
-            rx = _sa_fetch_seed(bus_id)
-            seed = _to_bytes(rx[2:34])
-            if seed == b"\x00" * 32:
-                _log("27 01 seed=0（32 字节全 0），已解锁，直接返回正响应")
-                return rx
-            _log("seed(32B) " + _hex(rx[2:34]))
-            # S3 防护：ecdsa_sign_msg 为 Python 纯软件实现，在 ZCANPRO 解释器
-            # 可能耗时秒级；签名期间无总线流量，距上次 UDS 交换（27 01 应答）
-            # 超过阈值则先发 3E 80 刷新 S3 计时再进 27 03 分片（>5s 时固件
-            # poll 已将会话回 default，3E 救不回，最终由写步 NRC 0x22/0x33
-            # 兜底 _wdbi_with_s3_guard 恢复）
-            t_sign = time.time()
-            sig = ecdsa_sign_msg(priv, seed)
-            sign_gap = time.time() - t_sign
-            if sign_gap > S3_SIGN_GAP_GUARD_S:
-                _log("ECDSA 签名耗时 %.1fs（>%.1fs）：先发 3E 80 刷新 S3 计时再进 27 03 分片"
-                     % (sign_gap, S3_SIGN_GAP_GUARD_S))
-                uds_try(bus_id, SID_TP, [0x80], suppress=1)
-            _sa_send_sig(bus_id, sig)
             return uds_req(bus_id, SID_SA, [0x02], wait_pending_s=45)
-        except UdsNrcError as e:
+        except Exception as e:
             last = e
-            if e.nrc in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
-                _log("NRC 0x%02X：设备 SecurityAccess 锁定（fail_count≥3，固件锁定约30s），S3 keepalive 等待 %.0fs 后完整重试" % (e.nrc, SA_LOCKOUT_WAIT_S))
-                _s3_keepalive_wait(bus_id)
-                continue
-            _log("SecurityAccess 第 %d/5 次失败: %s（重试将重新取 seed 重签重发分片）" % (attempt, e))
+            _log("27 02 第 %d/5 次: %s" % (i + 1, e))
             time.sleep(0.5)
-        except RuntimeError as e:
-            last = e
-            _log("SecurityAccess 第 %d/5 次失败: %s" % (attempt, e))
-            time.sleep(0.5)
+            rx = uds_try(bus_id, SID_SA, [0x01])
+            if rx is not None and len(rx) >= 6 and list(rx[2:6]) == [0, 0, 0, 0]:
+                _log("27 01 seed=0，已解锁")
+                return rx
     raise last
 
 
@@ -533,301 +404,27 @@ def charge_state_name(state):
     }.get(state, "未知(0x%02X)" % state)
 
 
-# ======== 运行侧探测 / Standby 唤醒收敛（判定只按正证据）========
-# 绝不按 NRC 值分叉定位。固件事实（改动前已核实，文件:行号见提交报告）：
-#   - APP 实现全部 UDS（含 0x34）：ota_download.c ota_dl_handle_request_download
-#     首个门禁=会话检查，默认会话对 0x34 回 NRC 0x22，该路径无 0x11 分支
-#     （应答集合：正响应/0x22/0x33/0x24/0x13/0x31）→ 对 0x34 的任何应答=在 APP；
-#   - Boot 无完整 UDS：仅 Boot safe mode 应答 22 2113 与非 suppress 的 3E，
-#     0x34 无分支静默（boot_safe_mode.c）→ 0x34 无应答不能反推“不在 APP”；
-#   - APP 的 DID 0x2113（active slot）同样正响应：62 21 13 <slot>，slot=
-#     ota_running_slot()=0x00/0x01（can_protocol.h:132、can_protocol.c
-#     fill_did_payload case DID_ACTIVE_SLOT、ota_trigger.c:242-248、
-#     ota_trigger.h:55-56），永不 0xFE → Boot safe mode 判据=应答中
-#     62 21 13 后字节为 0xFE（boot_safe_mode.c:155），而非“正响应”本身；
-#   - 无应答 ≠ 不在 APP：SIT1145 空闲 180s（CAN_LP_IDLE_TIMEOUT_MS）进
-#     Standby，首帧只当 ISO 11898-2 WUP 被消耗，MCU 收不到内容。先唤醒
-#     burst（3E 80 suppress ×3 + 0.2s）×3，再释放 UDS 通道 raw 监听生命
-#     周期帧（0x18FF260D）：AWK 01 41 57 4B / BOOTUP 01 41 00 = APP 已启动
-#     正证据；ABT 01 41 42 54 cause step A5 00（500ms）= Boot safe mode。
-#   实现与 python_tools/zcanpro_ext_ota_auto.py wake_bus/probe_in_app 同构。
+# ======== 主流程 ========
 
-LIFE_ANNOUNCE_ID    = 0x18FF260D
-LIFE_ANNOUNCE_MAGIC = (0x01, 0x41, 0x57, 0x4B)  # AWK：Standby 唤醒标识
-LIFE_BOOTUP_MAGIC   = (0x01, 0x41, 0x00)        # BOOTUP：上电/复位/Boot 跳转标识
-LIFE_ABT_MAGIC      = (0x01, 0x41, 0x42, 0x54)  # ABT：Boot safe mode 心跳
-SAFE_MODE_RESP_ID   = UDS_RESP_ID               # 0x18DA030D
-SAFE_MODE_MARKER    = (0x62, 0x21, 0x13, 0xFE)  # Boot safe mode 应答标记（不含 ISO-TP PCI）
-DID_ACTIVE_SLOT     = 0x2113
-PROBE_ROUNDS        = 3
-WAKE_BURST_ROUNDS   = 3      # （3E 80 ×3 + 0.2s）×3
-WAKE_BURST_COUNT    = 3
-WAKE_BURST_GAP_S    = 0.2
-LIFE_LISTEN_S       = 2.0
-VERDICT_CN = {"APP": "APP", "BOOT_SM": "Boot safe mode", "UNKNOWN": "UNKNOWN"}
-
-FAIL_STEP_DESC = {
-    0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
-    1: "镜像 magic 校验失败",
-    2: "image_length 为 0 或超出槽范围",
-    3: "镜像 CRC32 校验失败",
-    4: "Reset handler 不在槽内（跨槽链接镜像）",
-    5: "ECDSA 公钥缺失/无效（Device Info 与内置公钥均不可用）",
-    6: "ECDSA P-256 验签失败",
-}
-
-
-def _safe_mode_step(dat):
-    """识别 Boot safe mode 应答：ISO-TP SF 05 62 21 13 FE <step> 或历史裸帧
-    62 21 13 FE <step>（双格式兼容，与 zcanpro_ext_ota_auto.py 同构）。"""
-    if (len(dat) >= 6 and dat[0] == 0x05 and dat[1] == 0x62 and dat[2] == 0x21
-            and dat[3] == 0x13 and dat[4] == 0xFE):
-        return int(dat[5])
-    if (len(dat) >= 5 and dat[0] == 0x62 and dat[1] == 0x21
-            and dat[2] == 0x13 and dat[3] == 0xFE):
-        return int(dat[4])
-    return None
-
-
-def _safe_mode_detail(step):
-    desc = FAIL_STEP_DESC.get(step, "未知 fail_step（Boot 固件可能早于标记帧版本）")
-    return "22 2113 应答 0xFE 标记 = Boot safe mode，fail_step=%d（%s）" % (step, desc)
-
-
-def _parse_can_frame(f):
-    """与 zcanpro_ext_ota_auto.py 同构：兼容 dict / (id,data) 元组 / 属性对象；
-    CAN ID 取 & 0x1FFFFFFF（bit31 为 ZLG 扩展帧标志）。"""
-    cid = None
-    dat = None
-    if isinstance(f, dict):
-        cid = f.get("can_id", f.get("id", f.get("ID")))
-        dat = f.get("data", f.get("Data"))
-    elif isinstance(f, (tuple, list)) and len(f) >= 2:
-        cid, dat = f[0], f[1]
-    else:
-        cid = getattr(f, "can_id", getattr(f, "id", None))
-        dat = getattr(f, "data", None)
-    if cid is None:
-        return None
-    if not isinstance(dat, (list, tuple, bytes, bytearray)):
-        dat = []
-    try:
-        return (int(cid) & 0x1FFFFFFF, [int(x) & 0xFF for x in list(dat)])
-    except (TypeError, ValueError):
-        return None
-
-
-def _unwrap_receive(raw):
-    """与 zcanpro_ext_ota_auto.py / zcanpro_read_app_version.py 同构：
-    receive 常见返回 (status, [frames])。"""
-    if raw is None:
-        return []
-    if isinstance(raw, tuple) or (isinstance(raw, list) and len(raw) == 2
-                                  and not isinstance(raw[0], dict)
-                                  and isinstance(raw[1], (list, tuple))):
-        a, b = raw[0], raw[1]
-        if isinstance(b, (list, tuple)):
-            return list(b)
-        if isinstance(a, (list, tuple)):
-            return list(a)
-    if isinstance(raw, dict) or (not isinstance(raw, (list, tuple))):
-        return [raw]
-    return list(raw)
-
-
-def _recv_frames(bus_id):
-    try:
-        raw = zcanpro.receive(bus_id)
-    except TypeError:
-        try:
-            raw = zcanpro.receive()
-        except Exception:
-            return []
-    except Exception:
-        return []
-    out = []
-    for f in _unwrap_receive(raw):
-        p = _parse_can_frame(f)
-        if p is not None:
-            out.append(p)
-    return out
-
-
-def _lifecycle_check(cid, dat):
-    """0x18FF260D 生命周期帧分类：awk / bootup / abt / shutdown / None。
-    ABT（01 41 42 54）只有 Boot safe mode 发；AWK/BOOTUP 只有 APP 发
-    （can_protocol.c can_lp_send_ident_bus、lifecycle.c lifecycle_send）。"""
-    if cid != LIFE_ANNOUNCE_ID or len(dat) < 3:
-        return None
-    if len(dat) >= 4 and tuple(dat[:4]) == LIFE_ANNOUNCE_MAGIC:
-        return "awk"
-    if len(dat) >= 4 and tuple(dat[:4]) == LIFE_ABT_MAGIC:
-        return "abt"
-    if dat[0] == 0x01 and dat[1] == 0x41 and dat[2] == 0x00:
-        return "bootup"
-    if dat[0] == 0x06 and dat[1] == 0x41:
-        return "shutdown"
-    return None
-
-
-def _listen_lifecycle(bus_id, listen_s=LIFE_LISTEN_S):
-    """释放 UDS 通道后 raw 收帧监听生命周期帧（UDS 占用通道时 raw receive
-    不可靠，必须先 uds_deinit，finally 恢复）。
-    返回 ([(类型,data)...], [(cid,data)...全部收帧])。"""
-    found = []
-    all_frames = []
-    try:
-        zcanpro.uds_deinit()
-    except Exception as e:
-        _log("UDS 通道释放失败（继续监听）: " + str(e))
-    try:
-        t_end = time.time() + float(listen_s)
-        while time.time() < t_end:
-            if stopTask:
-                raise RuntimeError("用户停止脚本")
-            for cid, dat in _recv_frames(bus_id):
-                all_frames.append((cid, dat))
-                lt = _lifecycle_check(cid, dat)
-                if lt is not None:
-                    _log("生命周期帧 [%s] 0x%08X %s" % (lt.upper(), cid, _hex(dat[:8])))
-                    found.append((lt, dat))
-            time.sleep(0.02)
-    finally:
-        try:
-            uds_init()
-        except Exception as e:
-            _log("UDS 通道恢复失败: " + str(e))
-    return found, all_frames
-
-
-def wake_bus(bus_id, listen_s=LIFE_LISTEN_S):
-    """Standby 唤醒收敛：（3E 80 suppress ×3 + 0.2s）×3 后释放 UDS 通道
-    监听生命周期帧。返回 (证据列表, 全部收帧)。证据 (类型,data)：
-    AWK/BOOTUP=APP 启动正证据；ABT=Boot safe mode 正证据（500ms 心跳，
-    无需再发 UDS 探测）。"""
-    if stopTask:
-        raise RuntimeError("用户停止脚本")
-    for _b in range(WAKE_BURST_ROUNDS):
-        for _i in range(WAKE_BURST_COUNT):
-            uds_try(bus_id, SID_TP, [0x80], suppress=1)
-            time.sleep(WAKE_BURST_GAP_S)
-    return _listen_lifecycle(bus_id, listen_s=listen_s)
-
-
-def _probe_once(bus_id, sid, payload):
-    """单次探测：直接调库并按【应答字节】分类，绝不按 NRC 值推断运行侧。
-    返回 (tag, detail)：
-      ("silent",  None)  无应答——不能据此定位（Standby/Boot 静默/链路问题）
-      ("boot_sm", str)   22 2113 应答带 0xFE 标记 = Boot safe mode
-      ("app",     str)   有应答且非 Boot safe mode 标记 = 在 APP（含任意 NRC）
-      ("other",   data)  未识别应答字节，仅取证，不参与定位
-    """
-    if stopTask:
-        raise RuntimeError("用户停止脚本")
-    req = {"src_addr": UDS_REQ_ID, "dst_addr": UDS_RESP_ID,
-           "suppress_response": 0, "sid": sid, "data": list(payload)}
-    _log("[Tx-probe] %02X %s" % (sid, _hex(payload[:16])))
-    try:
-        resp = zcanpro.uds_request(bus_id, req)
-    except Exception as e:
-        _log("[Rx-probe] 探测异常（按无应答处理，不据此定位）: %s" % e)
-        return ("silent", None)
-    data = list((resp or {}).get("data") or [])
-    if data:
-        _log("[Rx-probe] " + _hex(data[:24]))
-    else:
-        _log("[Rx-probe] 无应答 (result=%s)" % ((resp or {}).get("result"),))
-    if not data:
-        return ("silent", None)
-    step = _safe_mode_step(data)
-    if step is not None:
-        return ("boot_sm", _safe_mode_detail(step))
-    if len(data) >= 3 and data[0] == SID_NRC and data[1] == sid:
-        # 任意 NRC = 对端 UDS 栈应答了该服务 → APP。Boot safe mode 对 22 2113
-        # 只回正响应+0xFE 标记，对 0x34 不应答；仅对非 2113 的 22 DID 才回
-        # 7F 22 11，而本探测的 22 恒为 DID 2113，不会命中该分支。
-        return ("app", "NRC 0x%02X（对 %02X 的应答 = APP 实现该服务）" % (data[2], sid))
-    if data[0] == (sid + SID_PR):
-        if sid == SID_RDBI:
-            return ("app", "22 2113 正响应 slot=%s（APP DID_ACTIVE_SLOT，记录字节非 0xFE）"
-                    % _hex(data[3:4]))
-        return ("app", "0x34 正响应 %s（APP 实现下载服务）" % _hex(data[:8]))
-    # 未识别字节：UDS 响应 ID 上可能出现生命周期双发帧（can_lp_send_ident：
-    # 07/03 01 41 57 4B …，APP 侧发出）→ 也是 APP 正证据
-    if len(data) >= 3 and data[0] in (0x03, 0x07) and data[1] == 0x01 and data[2] == 0x41:
-        return ("app", "生命周期双发帧（UDS 响应 ID）%s = APP 正证据" % _hex(data[:8]))
-    return ("other", data)
-
-
-def probe_location(bus_id):
-    """运行侧探测：只按正证据判定，绝不按 NRC 值分叉。
-    返回 (verdict, detail)，verdict ∈ ("APP", "BOOT_SM", "UNKNOWN")：
-      22 2113 应答带 0xFE 标记 → BOOT_SM；22 2113 / 0x34 任何其他应答 → APP；
-      无应答 → wake_bus 唤醒收敛 + 生命周期帧监听（ABT→BOOT_SM，
-      AWK/BOOTUP→APP 正证据）后重试，≤3 轮；全部无证据 → UNKNOWN +
-      完整取证日志（burst 轮次 / 监听时长 / 收到的所有帧）。"""
-    life_evidence = []
-    forensics = []
-    for attempt in range(1, PROBE_ROUNDS + 1):
+def _probe_side(bus_id):
+    """0x34: APP → NRC 0x11；Boot 默认会话 → NRC 0x22。充电只能在 APP。"""
+    last = None
+    for i in range(3):
         if stopTask:
             raise RuntimeError("用户停止脚本")
-        _log("---- 探测运行侧 第 %d/%d 轮 ----" % (attempt, PROBE_ROUNDS))
-        tag, detail = _probe_once(bus_id, SID_RDBI,
-                                  [(DID_ACTIVE_SLOT >> 8) & 0xFF, DID_ACTIVE_SLOT & 0xFF])
-        if tag == "boot_sm":
-            return ("BOOT_SM", detail)
-        if tag == "app":
-            return ("APP", detail)
-        if tag == "other":
-            _log("22 2113 未识别应答（仅取证，不参与定位）: %s" % _hex(detail))
-            forensics.append(("round%d 22 2113" % attempt, detail))
-        tag, detail = _probe_once(bus_id, SID_RD, [0x00])
-        if tag == "boot_sm":
-            return ("BOOT_SM", detail)
-        if tag == "app":
-            return ("APP", detail)
-        if tag == "other":
-            _log("0x34 未识别应答（仅取证，不参与定位）: %s" % _hex(detail))
-            forensics.append(("round%d 0x34" % attempt, detail))
-        # 本轮两探皆无应答 → 唤醒收敛 + 生命周期监听（Standby 首帧只当 WUP）
-        _log("两探无应答 → 唤醒 burst（3E 80 ×%d + %.1fs）×%d + 生命周期监听 %.1fs"
-             % (WAKE_BURST_COUNT, WAKE_BURST_GAP_S, WAKE_BURST_ROUNDS, LIFE_LISTEN_S))
-        found, all_frames = wake_bus(bus_id)
-        forensics.append(("round%d listen %.1fs" % (attempt, LIFE_LISTEN_S), all_frames))
-        for lt, dat in found:
-            life_evidence.append((lt, dat))
-            if lt == "abt":
-                step = dat[5] if len(dat) > 5 else None
-                desc = FAIL_STEP_DESC.get(step, "未知 fail_step") if step is not None else "无 step 字节"
-                return ("BOOT_SM", "生命周期 ABT 心跳 %s = Boot safe mode，fail_step=%s（%s）"
-                        % (_hex(dat[:8]), step, desc))
-        if found:
-            _log("生命周期帧证据 %d 个（%s）→ 重试 UDS 探测"
-                 % (len(found), ",".join(lt for lt, _d in found)))
-        else:
-            _log("监听 %.1fs 未见 0x%08X 生命周期帧" % (LIFE_LISTEN_S, LIFE_ANNOUNCE_ID))
-    # 全部轮次 UDS 探测无应答
-    awk_or_bootup = [e for e in life_evidence if e[0] in ("awk", "bootup")]
-    if awk_or_bootup:
-        lt, dat = awk_or_bootup[0]
-        return ("APP", "生命周期帧 [%s] %s 正证据：APP 已启动"
-                "（UDS 探测无应答，链路/会话异常；后续 UDS 步骤若失败请检查链路）"
-                % (lt.upper(), _hex(dat[:8])))
-    _log("探测取证：共 %d 轮，每轮唤醒 burst（3E 80 ×%d + %.1fs）×%d + 监听 %.1fs；"
-         "UDS 探测与生命周期帧均无证据"
-         % (PROBE_ROUNDS, WAKE_BURST_COUNT, WAKE_BURST_GAP_S,
-            WAKE_BURST_ROUNDS, LIFE_LISTEN_S))
-    for tag, frames in forensics:
-        if isinstance(frames, list):
-            _log("取证[%s] 收帧 %d 个:" % (tag, len(frames)))
-            for cid, dat in frames[:40]:
-                _log("  0x%08X %s" % (cid, _hex(dat[:8])))
-        else:
-            _log("取证[%s] %s" % (tag, _hex(frames)))
-    return ("UNKNOWN", "设备无应答（已排除 Standby），无法确定运行侧")
-
-
-# ======== 主流程 ========
+        try:
+            uds_req(bus_id, SID_RD, [0x00])
+            return "BOOT"
+        except RuntimeError as e:
+            last = e
+            msg = str(e)
+            if "NRC=0x%02X" % NRC_SNS in msg:
+                return "APP"
+            if "NRC=0x%02X" % NRC_CNC in msg:
+                return "BOOT"
+            _log("探测第 %d/3 次: %s" % (i + 1, e))
+            time.sleep(0.4)
+    raise last
 
 
 def run_charge_start(bus_id):
@@ -843,51 +440,40 @@ def run_charge_start(bus_id):
 
     uds_init()
 
-    _log("---- Step 0: 探测运行侧（唤醒收敛 + 正证据判定）----")
-    verdict, detail = probe_location(bus_id)
-    _log("[判定结论] %s（依据: %s）" % (VERDICT_CN[verdict], detail))
-    if verdict == "BOOT_SM":
-        raise RuntimeError("设备在 Boot safe mode，充电需 APP——%s。"
-                           "请先用 merge_prod_bin 烧录器重刷或确认 APP 槽有效后再试" % detail)
-    if verdict == "UNKNOWN":
-        raise RuntimeError("设备无应答（已排除 Standby），无法确定运行侧。"
-                           "取证见上方日志（burst 轮次 / 监听时长 / 收帧明细）")
+    _log("---- Step 0: 识别 APP / Boot ----")
+    side = _probe_side(bus_id)
+    if side == "BOOT":
+        raise RuntimeError("当前在 Bootloader，无法启动充电。请确认 APP 在跑后再试")
 
     # Step 1: 进入扩展会话（2101/210D 要求 SESSION_EXTENDED + SA）
     _log("---- Step 1: 进入扩展会话 ----")
     uds_req(bus_id, SID_DSC, [0x03])
 
-    # Step 2: 安全解锁（seed 32 字节，d64e8c2 起；失败重试为完整重签重发流程）
+    # Step 2: 安全解锁
     _log("---- Step 2: 安全解锁 ----")
-    unlocked = False
-    try:
-        rx = uds_req(bus_id, SID_SA, [0x01])
-        if len(rx) < 34:
-            raise RuntimeError("seed 响应过短: %d 字节, 期望 67 01 + 32 字节 seed（≥34）" % len(rx))
-        seed = _to_bytes(rx[2:34])
-        _log("seed(32B) " + _hex(rx[2:34]))
-        if seed == b"\x00" * 32:
-            unlocked = True
-            _log("已解锁 (seed=0，32 字节全 0)，跳过签名")
-    except UdsNrcError as e:
-        if e.nrc not in (NRC_EXCEEDED_ATTEMPTS, NRC_REQUIRED_TIME_DELAY):
-            raise
-        _log("27 01 NRC 0x%02X：设备 SecurityAccess 锁定（fail_count≥3，约30s），S3 keepalive 等待 %.0fs 后完整解锁" % (e.nrc, SA_LOCKOUT_WAIT_S))
-        _s3_keepalive_wait(bus_id)
-    if not unlocked:
-        _log("SecurityAccess 解锁中（每次尝试完整重做：27 01 → 重签 → 27 03 → 27 02）...")
-        send_security_key(bus_id, priv)
+    rx = uds_req(bus_id, SID_SA, [0x01])
+    if len(rx) < 6:
+        raise RuntimeError("seed 响应过短")
+    seed = rx[2:6]
+    _log("seed " + _hex(seed))
+
+    if list(seed) == [0, 0, 0, 0]:
+        _log("已解锁 (seed=0)，跳过签名")
+    else:
+        _log("ECDSA P-256 签名中...")
+        sig = ecdsa_sign_msg(priv, _to_bytes(seed))
+        _log("签名完成，发送分片...")
+        send_security_key(bus_id, sig)
     _log("安全解锁成功")
 
     # Step 3: 设置功率（DID 0x210D = uint16 LE mW：500/1000/1500）
-    #         ——经 S3 兜底包装：NRC 0x22/0x33 时重发 10 03 + 重解锁 + 重试一次
     mw = POWER_MW[POWER_LEVEL]
     _log("---- Step 3: 设置功率 %s (%d mW) ----" % (POWER_NAME.get(POWER_LEVEL, "?"), mw))
-    _wdbi_with_s3_guard(bus_id, [0x21, 0x0D, mw & 0xFF, (mw >> 8) & 0xFF], priv)
+    uds_req(bus_id, SID_WDBI, [0x21, 0x0D, mw & 0xFF, (mw >> 8) & 0xFF])
 
-    # Step 4: 使能充电（同样经 S3 兜底包装）
+    # Step 4: 使能充电
     _log("---- Step 4: 使能充电 ----")
-    _wdbi_with_s3_guard(bus_id, [0x21, 0x01, 0x01], priv)
+    uds_req(bus_id, SID_WDBI, [0x21, 0x01, 0x01])
     _log("充电器已使能（g_qi_charger_enable=1）")
     _log("等待 PA0 霍尔检测到手机后 PB2 拉高...")
 

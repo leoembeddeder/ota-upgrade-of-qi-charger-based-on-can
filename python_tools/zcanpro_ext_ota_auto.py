@@ -2,13 +2,8 @@
 """
 ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA
 
-在 APP 内擦写非活跃槽（31/34/36/37）。新版固件 0x37 收尾在验签+
-commit_trial 成功后自行复位（ota_download.c ota_dl_poll），Boot 按
-trial PENDING 切槽；主机 11 01（非 suppress）保留为旧 APP 兼容与
-复位未生效时的补发手段。"OTA 成功"判定为三条件闭环：①复位后 APP
-应答 ②0x2113==目标槽 ③0xF195==预期版本，缺一即 FAIL + 差异明细。
-固件只编 Slot A（IROM1=0x08004100）；写入 B 时脚本自动重定位、重签
-并在进入 0x34 前做宿主自检（Reset 落位/CRC/独立验签）。
+在 APP 内擦写非活跃槽（31/34/36/37），11 01 后由 Boot 切槽。
+固件只编 Slot A（IROM1=0x08004100）；写入 B 时脚本自动重定位并重签。
 
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
@@ -31,34 +26,9 @@ except ImportError:
 
 # ======== 用户配置 ========
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# EXPECTED_SW_VERSION：升级目标版本（判定闭环第③条件）。
-#   留空 "" = 缺省从被刷镜像 payload 的 strings 提取（QC_JYF_FW_x.y.z，
-#   即固件 can_protocol.c SW_VERSION_STR 编译常量，版本唯一真相源）；
-#   设置后：选中 bin 内版本串 ≠ 本值 → 拒闪（构建链检查指引），
-#   升级后 0xF195 ≠ 本值 → OTA 判定 FAIL（差异明细+判别矩阵指引）。
-EXPECTED_SW_VERSION = ""
-
-
-def _find_repo_root(start):
-    """逐级向上探测含 docs/keys 的仓库根（qi-can-uds-ota-scripts §6：
-    禁止固定层级 dirname 拼接——复制粘贴错层曾致密钥路径拼错）。
-    探测失败回退脚本所在目录。"""
-    d = os.path.abspath(start)
-    for _i in range(6):
-        if os.path.isdir(os.path.join(d, "docs", "keys")):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
-    return os.path.abspath(start)
-
-
-REPO_ROOT = _find_repo_root(_TOOLS_DIR)
+REPO_ROOT = os.path.dirname(_TOOLS_DIR)
 FIRMWARE_DIR = os.path.join(_TOOLS_DIR, "app bin")
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
-PUBLIC_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "public.pem")
 KEIL_BIN_A = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project", "Objects", "qi_wireless.bin")
 
 def _scan_firmware():
@@ -90,32 +60,21 @@ def _scan_firmware():
     return result
 
 
-def _extract_sw_version(blob):
-    """从 payload 里抠 QC_JYF_FW_...（编译进 APP 的 SW_VERSION_STR）。"""
-    marker = b"QC_JYF_FW_"
-    i = blob.find(marker)
-    if i < 0:
-        return None
-    s = blob[i:i + 32].split(b"\x00")[0]
-    try:
-        return s.decode("ascii").strip()
-    except Exception:
-        return None
-
-
 def _pick_firmware():
-    """Keil 新 bin 优先于过期的 app_slot_a.bin，避免把 1.1.1 又刷回对面槽。"""
-    packed = os.path.join(FIRMWARE_DIR, "app_slot_a.bin")
-    keil = KEIL_BIN_A
-    if os.path.isfile(keil):
-        if (not os.path.isfile(packed)) or (os.path.getmtime(keil) >= os.path.getmtime(packed) - 1.0):
-            _log("使用 Keil bin: " + keil)
-            return keil
-        _log("app_slot_a.bin 比 Keil bin 新，使用 " + packed)
-        return packed
-    if os.path.isfile(packed):
-        _log("固件 " + packed)
-        return packed
+    """优先 app_slot_a.bin，其次 Slot A Keil 裸 bin，再扫 app bin/ 里任意 XATO。"""
+    ordered = [os.path.join(FIRMWARE_DIR, "app_slot_a.bin"), KEIL_BIN_A]
+    slots = {}
+    try:
+        slots = _scan_firmware()
+    except RuntimeError:
+        slots = {}
+    for p in slots.values():
+        if p not in ordered:
+            ordered.append(p)
+    for path in ordered:
+        if os.path.isfile(path):
+            _log("固件 " + path)
+            return path
     raise RuntimeError("找不到固件。请编 Slot A 或运行 pack_image.py")
 
 FIRMWARE_PATH = ""
@@ -152,27 +111,17 @@ LIFE_ANNOUNCE_MAGIC = (0x01, 0x41, 0x57, 0x4B)  # 01 'A' 'W' 'K'
 LIFE_BOOTUP_MAGIC = (0x01, 0x41, 0x00)  # 01 'A' 00 — 上电/Boot 跳转标识帧
 PROBE_ROUNDS = 3
 
-# ---- Boot safe mode 诊断帧（与 qi_wireless_bootloader/mdk_app/Src/
+# ---- Boot safe mode 诊断标记帧（与 qi_wireless_bootloader/mdk_app/Src/
 # ---- boot_safe_mode.c 头部注释严格一致，两侧勿改其一）----
 # 探测请求: CAN ID 0x18DA0D03 (UDS_REQ_ID)，数据 22 21 13
-#           固件 RX 为自实现兼容解析（不依赖 ISO-TP 协议栈），兼容
-#           ISO-TP SF（03 22 21 13 ...）与裸 UDS（22 21 13）两种写法
-# Boot 应答（现行固件 boot_safe_mode.c safe_send_sf ISO-TP SF 组帧）:
-#   22 2113 → CAN ID 0x18DA030D (UDS_RESP_ID) ISO-TP 单帧，DLC=8:
-#               05 62 21 13 FE <fail_step> CC CC（尾部 0xCC 填充）
-#   3E（sub bit7 suppress 位为 0）→ 同 ID ISO-TP 单帧
-#               02 7E <子功能低 7 位>；suppress 位为 1 不应答
-#   其他 22 DID → NRC 7F 22 11（ISO-TP 单帧）
-# 心跳: 每 500ms 在 0x18FF260D (LIFE_ANNOUNCE_ID) 发
-#           01 41 42 54 cause fail_step A5 00（'ABT' 标记帧），并同周期
-#           重切 SIT1145 收发器 Normal（boot_safe_mode.c enter_safe_mode）
-# 主机侧解析: 本文件 _safe_mode_step —— 双格式兼容：历史裸帧
-#           62 21 13 FE <fail_step> + 现行 ISO-TP SF
-#           05 62 21 13 FE <fail_step>
+#           固件兼容 ISO-TP SF（03 22 21 13 ...）与裸 UDS（22 21 13）
+# Boot safe mode 应答: CAN ID 0x18DA030D (UDS_RESP_ID)，5 字节原始单帧
+#           （非 ISO-TP、无 PCI 字节，仅此一帧）:
+#               62 21 13 FE <fail_step>
 # fail_step 语义提取自 boot_verify.c g_verify_fail_step（1~6 为镜像校验
 # 步骤，0 为 select_boot_slot 无有效槽/未执行校验）。
 SAFE_MODE_RESP_ID = UDS_RESP_ID          # 0x18DA030D
-SAFE_MODE_MARKER = (0x62, 0x21, 0x13, 0xFE)  # UDS 载荷标记（不含 ISO-TP PCI）
+SAFE_MODE_MARKER = (0x62, 0x21, 0x13, 0xFE)
 FAIL_STEP_DESC = {
     0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
     1: "镜像 magic 校验失败",
@@ -201,10 +150,7 @@ class UdsNrcError(RuntimeError):
 
 
 def _safe_mode_step(dat):
-    """识别 Boot safe mode：裸 62 21 13 FE step，或 ISO-TP 05 62 21 13 FE step。"""
-    if (len(dat) >= 6 and dat[0] == 0x05 and dat[1] == 0x62 and dat[2] == 0x21
-            and dat[3] == 0x13 and dat[4] == 0xFE):
-        return int(dat[5])
+    """识别 Boot safe mode 标记帧 62 21 13 FE <fail_step>，返回 step 或 None。"""
     if (len(dat) >= 5 and dat[0] == 0x62 and dat[1] == 0x21
             and dat[2] == 0x13 and dat[3] == 0xFE):
         return int(dat[4])
@@ -355,123 +301,6 @@ def ecdsa_sign_msg(priv, msg):
         return _i2b32(r) + _i2b32(s)
 
 
-# secp256r1 曲线常数 b（验签专用；_A/_P 同上）。
-_P256_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
-
-
-def _load_ec_public_key(path):
-    """解析 docs/keys/public.pem（SPKI PEM/DER）→ (x, y) 仿射坐标。
-
-    仅做字节解析，不触碰任何签名路径数学。解析按 ASN.1 结构走：
-    在 DER 中检索 BIT STRING（tag 0x03），内容须为
-    [unused_bits=0x00, 点标记=0x04, X(32B), Y(32B)]。
-    标准 P-256 SPKI 该 BIT STRING 长度字节=0x42（=1+65）；此前按
-    0x44 硬匹配在本仓库 public.pem 上必失败（2026-09-19 冒烟
-    S1-S5/S7 全红根因），已改为按 DER 结构解析。"""
-    raw = open(path, "rb").read()
-    text = raw.decode("ascii", "ignore") if sys.version_info[0] >= 3 else raw
-    if "BEGIN" in text:
-        lines = []
-        take = False
-        for line in text.splitlines():
-            s = line.strip()
-            if "BEGIN" in s:
-                take = True
-                continue
-            if "END" in s:
-                break
-            if take:
-                lines.append(s)
-        der = binascii.a2b_base64("".join(lines))
-    else:
-        der = raw
-    n = len(der)
-    i = 0
-    while i < n:
-        if _u8(der, i) == 0x03:                 # BIT STRING
-            j = i + 1
-            if j >= n:
-                break
-            ln = _u8(der, j)
-            j += 1
-            if ln & 0x80:                       # 长形式（P-256 SPKI 不会走到）
-                k = ln & 0x7F
-                if k == 0 or k > 4 or (j + k) > n:
-                    i += 1
-                    continue
-                ln = 0
-                for _m in range(k):
-                    ln = (ln << 8) | _u8(der, j)
-                    j += 1
-            # 标准非压缩 P-256 点：1 unused-bits + 1 点标记 + 32 X + 32 Y = 66
-            if (ln == 66 and (j + 66) <= n and
-                    _u8(der, j) == 0x00 and _u8(der, j + 1) == 0x04):
-                pt = der[j + 2:j + 66]
-                x = _int_be(pt[:32])
-                y = _int_be(pt[32:64])
-                if 0 < x < _P and 0 < y < _P:
-                    return x, y
-            i += 1
-            continue
-        i += 1
-    raise ValueError("无法从公钥解析 P-256 非压缩点（期望 DER 内 BIT STRING "
-                     "03 42 00 04 <X 32B> <Y 32B>）: " + path)
-
-
-def _aff_add(p1, p2):
-    """仿射点加（验签专用独立实现；None=无穷远点）。
-
-    与 ecdsa_sign_msg 的 _jp_* 雅可比实现刻意不同源：签名与自检验签
-    共用同一套点运算时，同一失效模式会一起错（c81bb18 _jp_add 损坏
-    实机 0x35 教训；SA 签名自检纪律同源要求）。"""
-    if p1 is None:
-        return p2
-    if p2 is None:
-        return p1
-    x1, y1 = p1
-    x2, y2 = p2
-    if x1 == x2:
-        if (y1 + y2) % _P == 0:
-            return None
-        lam = ((3 * x1 * x1 + _A) * _inv(2 * y1, _P)) % _P
-    else:
-        lam = ((y2 - y1) * _inv(x2 - x1, _P)) % _P
-    x3 = (lam * lam - x1 - x2) % _P
-    y3 = (lam * (x1 - x3) - y1) % _P
-    return x3, y3
-
-
-def _aff_mul(k, p):
-    r = None
-    while k > 0:
-        if k & 1:
-            r = _aff_add(r, p)
-        p = _aff_add(p, p)
-        k >>= 1
-    return r
-
-
-def _ecdsa_verify_affine(pub_xy, msg, sig):
-    """独立仿射 ECDSA 验签（u1*G + u2*Q 仿射坐标，不复用 _jp_* 雅可比）。"""
-    if pub_xy is None or sig is None or len(sig) != 64:
-        return False
-    r = _int_be(sig[:32])
-    s = _int_be(sig[32:])
-    if not (1 <= r < _N and 1 <= s < _N):
-        return False
-    qx, qy = pub_xy
-    if (qy * qy - (qx * qx * qx + _A * qx + _P256_B)) % _P != 0:
-        return False
-    z = _int_be(hashlib.sha256(msg).digest()) % _N
-    w = _inv(s, _N)
-    u1 = (z * w) % _N
-    u2 = (r * w) % _N
-    pt = _aff_add(_aff_mul(u1, (_GX, _GY)), _aff_mul(u2, (qx, qy)))
-    if pt is None:
-        return False
-    return (pt[0] % _N) == r
-
-
 def _der_len(buf, i, end):
     if i >= end:
         raise ValueError("DER truncated")
@@ -590,68 +419,17 @@ def validate_image(image):
     _log("镜像链接 Slot %s, 总长 %d" % (slot_name(linked), len(image)))
     return linked
 
-def _selfcheck_image(image, dest, what):
-    """重定位产物宿主自检（relocate_image_to_slot 返回前强制执行）：
-
-    ① Reset handler 落目标槽窗口 [base+256, base+0xC000)——与 Boot
-       boot_verify.c step 4 同判据（fail_step=4 时 Boot 拒绝并回旧槽）；
-    ② payload CRC 与头 crc32 字段一致——与 Boot step 3 同判据
-       （fail_step=3）；
-    ③ 用 docs/keys/public.pem 对头签名做独立仿射验签——与 Boot step 6
-       同判据（fail_step=6）；验签实现刻意不复用 ecdsa_sign_msg 点运算
-       路径（SA 签名自检纪律，同一失效模式不能让签名与自检一起错）。
-
-    任一 FAIL → 抛错拒绝进入 0x34，日志含失败项。"""
-    base = slot_base(dest)
-    lo = base + IMAGE_HEADER_SIZE
-    hi = base + SLOT_SIZE
-    reset = struct.unpack_from("<I", image, IMAGE_HEADER_SIZE + 4)[0]
-    reset_t = reset & 0xFFFFFFFE
-    payload = image[IMAGE_HEADER_SIZE:]
-    hdr_crc = struct.unpack_from("<I", image, 8)[0]
-    calc_crc = zlib.crc32(payload) & 0xFFFFFFFF
-    sig = image[0x0C:0x0C + 64]
-    fails = []
-    if not (lo <= reset_t < hi):
-        fails.append("① Reset handler 0x%08X 不在 Slot %s 窗口 [0x%08X, 0x%08X)"
-                     "（Boot fail_step 4 会拒绝并回旧槽）"
-                     % (reset, slot_name(dest), lo, hi))
-    if calc_crc != hdr_crc:
-        fails.append("② CRC 不一致：头=0x%08X 实算=0x%08X（Boot fail_step 3 会拒绝）"
-                     % (hdr_crc, calc_crc))
-    if not os.path.isfile(PUBLIC_KEY_PATH):
-        fails.append("③ 找不到公钥 %s，无法独立验签" % PUBLIC_KEY_PATH)
-    else:
-        pub = None
-        try:
-            pub = _load_ec_public_key(PUBLIC_KEY_PATH)
-        except Exception as e:
-            fails.append("③ 公钥解析失败: %s" % e)
-        if pub is not None:
-            if _ecdsa_verify_affine(pub, payload, sig):
-                _log("[自检] 签名本地验证 PASS（public.pem 独立仿射验签，%s payload）" % what)
-            else:
-                fails.append("③ 独立验签 FAIL：public.pem 对 %s 头签名验证不通过"
-                             "（Boot fail_step 6 会拒绝）" % what)
-    if fails:
-        raise RuntimeError("%s：%s" % (what, "；".join(fails)))
-    _log("[自检] %s PASS：Reset=0x%08X ∈ Slot %s 窗口，CRC=0x%08X 与头一致，"
-         "签名独立验签通过" % (what, reset, slot_name(dest), hdr_crc))
-
-
 def relocate_image_to_slot(image, dest, priv):
     """Move a Slot-A-linked (or B-linked) image onto dest and re-sign.
 
     1.0 on A upgrading to 1.2 (also built as A) writes inactive B: every
     Flash pointer in the payload is shifted by (B-A) and CRC/ECDSA redone.
-    返回前强制宿主自检（Reset 落位/CRC/独立验签，见 _selfcheck_image），
-    任一 FAIL 拒绝进入 0x34。"""
+    """
     linked = image_target_slot(image)
     if linked is None:
         raise RuntimeError("无法识别镜像链接槽")
     if dest == linked:
         _log("镜像已按 Slot %s 链接，无需重定位" % slot_name(dest))
-        _selfcheck_image(image, dest, "镜像自检（未重定位）")
         return image
     delta = (slot_base(dest) - slot_base(linked)) & 0xFFFFFFFF
     lo = slot_base(linked)
@@ -676,11 +454,9 @@ def relocate_image_to_slot(image, dest, priv):
     ts = image[HDR_BUILD_TS_OFF:HDR_BUILD_TS_OFF + 4]  # build_timestamp @0x5C（偏移未变）
     header = struct.pack("<III", IMAGE_MAGIC, len(payload), crc) + sig + hdr_reserved_ver + ts
     header += b"\x00" * (IMAGE_HEADER_SIZE - len(header))
-    out = header + payload
     _log("镜像 Slot %s → Slot %s，重定位 %d 处地址 crc=0x%08X" % (
         slot_name(linked), slot_name(dest), n, crc))
-    _selfcheck_image(out, dest, "重定位镜像自检")
-    return out
+    return header + payload
 
 
 
@@ -762,10 +538,8 @@ def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
             _log("[Rx] " + _hex(data[:24]))
             sm_step = _safe_mode_step(data)
             if sm_step is not None:
-                # 库若把 Boot safe mode 应答帧当响应数据透传（历史裸帧
-                # 62 21 13 FE <step> 或 ISO-TP SF 05 62 21 13 FE <step>，
-                # _safe_mode_step 双格式识别），立即按 safe mode 报错，
-                # 不得误判为 APP DID 0x2113 正响应。
+                # 库若把 Boot safe mode 标记帧当响应数据透传（62 21 13 FE <step>），
+                # 立即按 safe mode 报错，不得误判为 APP DID 0x2113 正响应。
                 raise SafeModeError(sm_step)
         if len(data) >= 3 and data[0] == SID_NRC:
             if data[2] == NRC_RCRRP:
@@ -777,11 +551,7 @@ def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
             raise UdsNrcError(data[1], data[2])
         if not resp or not resp.get("result"):
             raise RuntimeError("无应答 SID=0x%02X %s" % (sid, (resp or {}).get("result_msg", "")))
-        if not data:
-            # 库层成功但零应答字节（帧未上线/设备静默）：如实报无应答，
-            # 不误报"非正响应"（后者暗示收到过应答数据）。
-            raise RuntimeError("无应答 SID=0x%02X %s" % (sid, (resp or {}).get("result_msg", "")))
-        if data[0] != (sid + SID_PR):
+        if len(data) < 1 or data[0] != (sid + SID_PR):
             raise RuntimeError("非正响应 SID=0x%02X %s" % (sid, _hex(data)))
         return data
 
@@ -795,37 +565,8 @@ def uds_try(bus_id, sid, payload, suppress=0):
 
 
 def uds_ecu_reset(bus_id):
-    """切槽激活：非 suppress 11 01（等待 51 01 正响应）。
-
-    旧实现用 uds_try 发 11 81（suppress）：ZCANPRO suppress 投递不可证
-    ——发送失败被静默吞掉、无应答可核，设备未复位时 metadata trial
-    PENDING 停留，Boot 不进试运行，升级"假成功"（取证报告
-    /mnt/k/slot_switch_forensics_0919.md §3 M4'）。改为非 suppress 11 01：
-    uds_request 等 51 01 正响应，超时重发 ≤3 次。
-
-    三次全超时不立即判死：新版固件（0x37 收尾 APP 自复位，见
-    ota_download.c ota_dl_poll）在本步之前可能已自行复位，51 01 不可达
-    属预期形态；最终判定权在复位确认窗口的三条件闭环（2113==目标槽 +
-    0xF195==预期版本），复位未生效时判定逻辑会自动补发 11 01 一次并给
-    断电重启指引。"""
-    last_err = None
-    for attempt in range(1, 4):
-        if stopTask:
-            raise RuntimeError("用户停止脚本")
-        try:
-            _log("ECUReset 11 01（非 suppress，等 51 01 正响应；第 %d/3 次）" % attempt)
-            uds_req(bus_id, SID_ER, [0x01])
-            _log("收到 51 01，MCU 复位中（Boot 将按 trial PENDING 切槽）")
-            return
-        except SafeModeError:
-            raise
-        except Exception as e:
-            last_err = e
-            _log("11 01 第 %d/3 次未收到 51 01: %s" % (attempt, e))
-            if attempt < 3:
-                time.sleep(0.5)
-    _log("11 01 三次均未收到 51 01（%s）。新固件 0x37 后已自复位时此形态"
-         "属预期；切槽是否生效由复位确认窗口三条件判定" % last_err)
+    """0x11 with SPR=1: MCU resets, no 0x51. Do not wait the 3s UDS timeout."""
+    uds_try(bus_id, SID_ER, [0x81], suppress=1)
 
 
 def read_did_u8(bus_id, did):
@@ -1017,18 +758,13 @@ def confirm_app_after_reset(bus_id):
     三阶段：前 3 次盲探 22 2113 → 失败后 wake_bus + 监听生命周期帧 →
     继续探测并间歇监听。窗口 45s。
 
-    返回 (slot, sw_ver)：slot=复位后 0x2113 应答槽字节（0=A/1=B），
-    sw_ver=0xF195 应答 ASCII rstrip（读失败=None）——两者供 run_ota
-    判定闭环（三条件）使用，本函数内仅记录不断言。
-
     三态诊断：
     a) UDS 响应 = 成功；
     b) 生命周期帧但无 UDS = APP 已启动但链路/会话异常；
     c) 全静默 = 可能停在 Boot safe mode 或镜像问题：raw 探测 22 2113 识别
-       safe mode 应答（_safe_mode_step 双格式识别，命中→SafeModeError
-       精确报错），未命中提示 merge_prod_bin。应答帧格式（现行 ISO-TP SF
-       05 62 21 13 FE <fail_step>）与 fail_step 语义见文件头 SAFE_MODE
-       注释（与 boot_safe_mode.c 两侧一致）。
+       标记帧 62 21 13 FE <fail_step>（命中→SafeModeError 精确报错），
+       未命中提示 merge_prod_bin。标记帧格式与 fail_step 语义见文件头
+       SAFE_MODE 注释（与 boot_safe_mode.c 两侧一致）。
     """
     WINDOW_S = 45.0
     BLIND_PROBES = 3
@@ -1112,31 +848,26 @@ def confirm_app_after_reset(bus_id):
                 "safe-mode 标记帧也未捕获（旧 Boot 固件无此应答或 CAN 未起）；"
                 "请用 merge_prod_bin.py 重刷排查: %s" % (WINDOW_S, last_err))
 
-    slot = None
-    if rx is not None and len(rx) >= 4:
-        slot = rx[3]
     _log("复位后 DID 0x2113 slot=" + _hex((rx or [])[3:4]))
     try:
         fw = uds_req(bus_id, SID_RDBI, [0x20, 0x10])
         _log("DID 0x2010 fw_type=" + _hex(fw[3:4]))
     except UdsNrcError as e:
         _log("DID 0x2010 NRC 0x%02X（Boot 无此 DID）" % e.nrc)
-    # 运行版本采集：DID 0xF195 应答 = APP 编译时常量 SW_VERSION_STR
+    # 运行版本确认：DID 0xF195 应答 = APP 编译时常量 SW_VERSION_STR
     # （can_protocol.c 唯一真相源），不读 OTA metadata / XATO 镜像头；
     # 解析方式与 zcanpro_read_app_version.py 一致（rx[3:35] 32B ASCII rstrip）。
-    # 采集值供判定闭环第③条件使用，读失败计入 FAIL 差异明细。
-    sw_ver = None
     try:
         ver = uds_req(bus_id, SID_RDBI, [0xF1, 0x95])
         if len(ver) >= 35 and ver[0] == (SID_RDBI + SID_PR):
-            sw_ver = "".join(chr(b) if 0x20 <= b < 0x7F else "?" for b in ver[3:35]).rstrip()
-            _log("DID 0xF195 APP编译版本=" + sw_ver + "（来源=固件 SW_VERSION_STR 编译常量）")
+            sw = "".join(chr(b) if 0x20 <= b < 0x7F else "?" for b in ver[3:35]).rstrip()
+            _log("DID 0xF195 APP编译版本=" + sw + "（来源=固件 SW_VERSION_STR 编译常量）")
         else:
             _log("DID 0xF195 响应异常: " + _hex(ver[:8]))
     except UdsNrcError as e:
-        _log("DID 0xF195 NRC 0x%02X（计入判定差异明细）" % e.nrc)
+        _log("DID 0xF195 NRC 0x%02X（不影响判定）" % e.nrc)
     except Exception as e:
-        _log("DID 0xF195 读取失败（计入判定差异明细）: %s" % e)
+        _log("DID 0xF195 读取失败（不影响判定）: %s" % e)
     try:
         uds_req(bus_id, SID_RD, [0x00])
         _log("复位后 0x34 正响应，已在 APP")
@@ -1144,65 +875,6 @@ def confirm_app_after_reset(bus_id):
         _log("复位后 0x34 NRC 0x%02X，已在 APP（默认会话下正常）" % e.nrc)
     except RuntimeError as e:
         raise RuntimeError("复位后 0x34 无应答（跳转失败或 APP CAN 未起来）: " + str(e))
-    return slot, sw_ver
-
-
-def _read_did_u8_safe(bus_id, did):
-    """判定差异明细用只读采集：任何异常返回 None，不中断判定流程。"""
-    try:
-        return read_did_u8(bus_id, did)
-    except Exception as e:
-        _log("DID 0x%04X 读失败（差异明细采集）: %s" % (did, e))
-        return None
-
-
-def _fmt_slot(v):
-    return slot_name(v) if v is not None else "读失败"
-
-
-def _raise_ota_fail(bus_id, from_slot, dest, to_slot, got_ver, expect_ver,
-                    problems, otx_anomaly):
-    """OTA 判定 FAIL：差异明细 + 判别矩阵指引 + 明确 FAIL 判定。
-
-    判据缺口背景：旧脚本"OTA 成功"仅要求复位后有 APP 应答，不校验
-    切槽/版本（取证报告 /mnt/k/slot_switch_forensics_0919.md §3 M5
-    确证缺陷）——"脚本说完成+版本仍旧"是该缺口的直接预期形态。"""
-    pend = _read_did_u8_safe(bus_id, 0x2114)
-    reason = _read_did_u8_safe(bus_id, 0x2115)
-    rollback = _read_did_u8_safe(bus_id, 0x2116)
-    if pend == 0xFE:
-        pend_str = "NONE(无待定)"
-    else:
-        pend_str = _fmt_slot(pend)
-    lines = []
-    lines.append("OTA 判定 FAIL（判定闭环三条件未全部满足，禁止假成功）")
-    for p in problems:
-        lines.append("  · " + p)
-    lines.append("差异明细：0x2113 当前槽=%s（升级前=%s 目标槽=%s）；"
-                 "0xF195 当前版本=%s（预期=%s）；0x2114 pending=%s；"
-                 "0x2116 rollback_count=%s；0x2115 last_boot_reason=%s"
-                 % (_fmt_slot(to_slot), slot_name(from_slot), slot_name(dest),
-                    got_ver or "未读到", expect_ver or "不可用",
-                    pend_str,
-                    ("%d" % rollback) if rollback is not None else "读失败",
-                    ("0x%02X" % reason) if reason is not None else "读失败"))
-    if otx_anomaly:
-        lines.append("附加事实：0x37 TransferExit 应答链异常（五次无最终应答或"
-                     "重试落在已自复位重启的设备上），详见上方日志")
-    lines.append("判别矩阵指引（0x2115 语义：00=POR 01=SW 02=WDG 03=OTA激活 04=回滚）：")
-    lines.append("  · 2113=目标槽但版本旧 → 镜像内容问题：SW_VERSION_STR 构建链/"
-                 "pack 输入/app bin 残留旧镜像（查日志「固件」「选中 bin 内 "
-                 "SW_VERSION_STR」行，并在实际被刷 bin 内 strings 自检）")
-    lines.append("  · 2113=升级前槽 且 2115=0x04 或 2116≥1 → Boot 回滚：新槽验签失败"
-                 "（重定位/签名/Device Info 公钥配对；safe-mode fail_step 语义见"
-                 "脚本头注释）或试运行确认失败")
-    lines.append("  · 2113=升级前槽 且 2114=目标槽 → trial PENDING 已落盘但设备未复位"
-                 "（11 01 投递问题；脚本已自动补发过仍无效时）→ 请断电重启后重跑")
-    lines.append("  · 2113=升级前槽 且 2114=0xFE → 无切槽证据链：0x37 commit 未发生"
-                 "或 metadata 被重置（挂死后重烧/多次异常掉电）→ 查 0x37 段日志"
-                 "与设备恢复方式")
-    lines.append("完整判别矩阵：/mnt/k/slot_switch_forensics_0919.md §5")
-    raise RuntimeError("\n".join(lines))
 
 
 def _as_int(x):
@@ -1309,11 +981,9 @@ def _raw_send(bus_id, can_id, data):
 
 def _raw_probe_safe_mode(bus_id, sniff_s=2.0):
     """失败路径取证：raw 发 22 2113 探测帧（ISO-TP SF）后监听 Boot safe
-    mode 应答：现行固件为 ISO-TP 单帧 05 62 21 13 FE <fail_step>
-    （DLC=8，0xCC 填充）；_safe_mode_step 双格式兼容历史裸帧
-    62 21 13 FE <fail_step>。返回 fail_step（int）或 None；finally 恢复
-    UDS 通道。应答仅在设备收到探测帧时发一次，库路径可能吞掉，故须 raw
-    重探。"""
+    mode 标记帧 62 21 13 FE <fail_step>（5 字节原始单帧，非 ISO-TP）。
+    返回 fail_step（int）或 None；finally 恢复 UDS 通道。
+    标记帧仅在设备收到探测帧时应答一次，库路径可能吞掉，故须 raw 重探。"""
     step = None
     try:
         zcanpro.uds_deinit()
@@ -1441,38 +1111,15 @@ def run_ota(bus_id):
     uds_init()
     try:
         FIRMWARE_PATH = _pick_firmware()
-        fw_data = open(FIRMWARE_PATH, "rb").read()
-        bin_ver = _extract_sw_version(fw_data)
-        _log("选中 bin 内 SW_VERSION_STR=%s（strings 扫描 QC_JYF_FW_ 前缀）"
-             % (bin_ver or "未找到"))
-        if EXPECTED_SW_VERSION:
-            if bin_ver != EXPECTED_SW_VERSION:
-                raise RuntimeError(
-                    "拒闪：选中 bin 版本 %s ≠ EXPECTED_SW_VERSION %s。构建链检查："
-                    "① can_protocol.c SW_VERSION_STR 是否已改为目标版本（唯一真相源）；"
-                    "② MDK 是否 Rebuild（禁 Incremental Build）；"
-                    "③ pack/OTA 输入是否为本次构建产物；"
-                    "④ python_tools/app bin/ 是否残留旧镜像（清理或确保 Keil bin 更新）"
-                    % (bin_ver or "未找到", EXPECTED_SW_VERSION))
-            _log("版本感知：bin 版本与 EXPECTED_SW_VERSION=%s 一致，允许刷写"
-                 % EXPECTED_SW_VERSION)
         image = pack_image_if_needed(FIRMWARE_PATH, priv)
         linked = validate_image(image)
-        want_ver = bin_ver or _extract_sw_version(image)
-        expect_ver = EXPECTED_SW_VERSION or want_ver
-        _log("镜像内 SW_VERSION_STR=%s；判定预期版本=%s（%s）" % (
-            want_ver or "未找到", expect_ver or "不可用",
-            "EXPECTED_SW_VERSION 配置" if EXPECTED_SW_VERSION else "缺省取镜像 strings"))
         if not probe_in_app(bus_id):
             raise RuntimeError("UDS 无应答（已重试 %d 轮）。"
                                "跳转后试运行确认会擦 metadata，CAN 可能 bus-off；"
                                "请烧录含 bus-off 恢复的 APP 后再连升。"
                                "空片用 merge_prod_bin.py。" % PROBE_ROUNDS)
-        from_slot = read_did_u8(bus_id, 0x2113)
-        _log("升级前运行槽 DID 0x2113=%s" % slot_name(from_slot))
         _log("镜像链接 Slot %s；将写入非活跃槽（必要时重定位）" % slot_name(linked))
-        _log("在 APP 内升级（31/34/36/37）；新固件 0x37 成功后自复位切槽，"
-             "11 01 为旧 APP 兼容与补发手段")
+        _log("在 APP 内升级（31/34/36/37），完成后 11 01 由 Boot 切槽")
         _log("---- Programming ----")
         last_err = None
         for attempt in range(1, 9):
@@ -1522,22 +1169,10 @@ def run_ota(bus_id):
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
         _log("---- 擦除 ----")
         _erase_with_retry(bus_id)
-        # 目标槽 = 运行槽取反（固件擦除目标 inactive_slot()=PC 推导运行槽
-        # 取反，ota_download.c）；DID 0x2114 仅交叉校验（擦除后 RAM 标志，
-        # 读失败/不一致不影响重定位方向）。
-        if from_slot not in (SLOT_A, SLOT_B):
-            raise RuntimeError("升级前 DID 0x2113 槽号无效: %d" % from_slot)
-        dest = SLOT_B if from_slot == SLOT_A else SLOT_A
-        try:
-            did_dest = read_did_u8(bus_id, 0x2114)
-            _log("擦除目标 Slot %s（对面槽；DID 0x2114=%s）" % (
-                slot_name(dest), slot_name(did_dest)))
-            if did_dest != dest:
-                _log("警告: DID 0x2114=%s 与对面槽 %s 不一致，按对面槽重定位"
-                     "（固件擦除目标=inactive_slot()=运行槽取反）" % (
-                         slot_name(did_dest), slot_name(dest)))
-        except Exception as e:
-            _log("DID 0x2114 读失败（%s），按对面槽 %s 重定位" % (e, slot_name(dest)))
+        dest = read_did_u8(bus_id, 0x2114)
+        _log("擦除目标 Slot %s (DID 0x2114=%d)" % (slot_name(dest), dest))
+        if dest not in (SLOT_A, SLOT_B):
+            raise RuntimeError("DID 0x2114 槽号无效: %d" % dest)
         image = relocate_image_to_slot(image, dest, priv)
         size = len(image)
         addr_val = slot_base(dest)
@@ -1567,48 +1202,13 @@ def run_ota(bus_id):
                 uds_req(bus_id, SID_RTE, [], wait_pending_s=45)
                 last_err = None
                 break
-            except SafeModeError:
-                raise
             except Exception as e:
                 last_err = e
                 _log("0x37 第 %d/5 次: %s" % (attempt, e))
                 if attempt < 5:
                     time.sleep(0.8)
-        # 0x37 应答链异常分流（判别闭环原则：最终结论由复位后三条件给出，
-        # 此处只拦"固件确定性拒绝"）：
-        #   最终 NRC ≠ 0x22 → verify/字节数/commit_trial 被固件拒绝
-        #     （ota_download.c ota_dl_poll 回 NRC 0x72 等），metadata 未提交，
-        #     切槽必败 → 立即报错，不让判定闭环输出误导性"复位未生效"；
-        #   NRC 0x22 → 可能是会话丢失，也可能是新固件 0x37 成功即自复位后
-        #     重试帧落在重启后的新 APP（默认会话回 0x22）→ 快速取证0x2113：
-        #     已是目标槽则升级实际已完成，交由三条件判定；
-        #   纯超时 → 新固件 77 后自复位来不及应答/帧丢失，不判死，
-        #     交给确认窗口判定。
-        otx_anomaly = False
         if last_err is not None:
-            if isinstance(last_err, UdsNrcError):
-                if last_err.nrc == 0x22:
-                    qs = _read_did_u8_safe(bus_id, 0x2113)
-                    if qs == dest:
-                        otx_anomaly = True
-                        _log("0x37 重试收 NRC 0x22 但 0x2113=%s 已是目标槽——设备已"
-                             "自复位并切槽（应答丢失形态），继续三条件判定"
-                             % slot_name(qs))
-                    else:
-                        raise RuntimeError(
-                            "0x37 TransferExit 被固件拒绝：%s（NRC 0x22=条件不正确："
-                            "会话丢失或设备已重启；0x2113 探测=%s）。若设备已自复位"
-                            "但探测不到，请断电重启后读 0xF195/0x2113 核对升级结果"
-                            % (last_err, _fmt_slot(qs)))
-                else:
-                    raise RuntimeError(
-                        "0x37 TransferExit 被固件拒绝：%s（验签/字节数/commit_trial "
-                        "失败时固件回 NRC 0x72，见 ota_download.c ota_dl_poll）"
-                        % last_err)
-            else:
-                otx_anomaly = True
-                _log("0x37 五次均无最终应答（%s）。新固件 0x37 收尾 77 后即自复位，"
-                     "应答丢失属可能形态；切槽/版本三条件闭环将给出最终判定" % last_err)
+            raise last_err
         _log("---- Reset ----")
         uds_ecu_reset(bus_id)
         t0 = time.time()
@@ -1616,56 +1216,7 @@ def run_ota(bus_id):
             if stopTask:
                 raise RuntimeError("用户停止脚本")
             time.sleep(0.05)
-        to_slot, got_ver = confirm_app_after_reset(bus_id)
-
-        # ---- 复位未生效检测与一次自动补发（P2）----
-        # 指纹：0x2113 仍=升级前槽 且 0x2114==目标槽（metadata trial PENDING
-        # 已在 commit_trial 先备后主落盘，但设备从未复位走 Boot 试运行）
-        # ——11 01 投递丢失/被吞的典型形态（取证报告 §3 M4'）。
-        resend_done = False
-        if to_slot == from_slot:
-            pend = _read_did_u8_safe(bus_id, 0x2114)
-            if pend == dest:
-                resend_done = True
-                _log("判定：复位未生效——0x2113=%s 未变而 0x2114=%s（=目标槽，"
-                     "trial PENDING 已落盘）→ 自动补发 11 01 一次"
-                     % (slot_name(to_slot), slot_name(pend)))
-                try:
-                    uds_req(bus_id, SID_ER, [0x01])
-                    _log("补发 11 01 已收到 51 01")
-                except Exception as e:
-                    _log("补发 11 01 无应答: %s（继续复位确认窗口）" % e)
-                t0 = time.time()
-                while time.time() - t0 < 2.0:
-                    if stopTask:
-                        raise RuntimeError("用户停止脚本")
-                    time.sleep(0.05)
-                to_slot, got_ver = confirm_app_after_reset(bus_id)
-
-        # ---- 判定闭环（P1）：三条件缺一不可 ----
-        # ① 复位后 APP 应答（confirm_app_after_reset 不抛异常即满足）
-        # ② 0x2113 == 目标槽 dest
-        # ③ 0xF195 == 预期版本（EXPECTED_SW_VERSION 配置，缺省=镜像 strings）
-        problems = []
-        if resend_done and to_slot == from_slot:
-            problems.append("复位未生效且自动补发 11 01 无效——请断电重启后重跑本脚本"
-                            "（断电重启即触发 Boot 处理 trial PENDING 切槽）")
-        if to_slot != dest:
-            problems.append("切槽未生效：0x2113=%s，目标槽=%s（升级前=%s）"
-                            % (_fmt_slot(to_slot), slot_name(dest), slot_name(from_slot)))
-        if not expect_ver:
-            problems.append("预期版本不可用：EXPECTED_SW_VERSION 未设置且镜像内未找到"
-                            " QC_JYF_FW_ 版本串——请在脚本 EXPECTED_SW_VERSION 配置"
-                            "目标版本后重跑")
-        elif got_ver != expect_ver:
-            problems.append("版本不符：0xF195=%s，预期=%s"
-                            % (got_ver or "未读到", expect_ver))
-        if problems:
-            _raise_ota_fail(bus_id, from_slot, dest, to_slot, got_ver, expect_ver,
-                            problems, otx_anomaly)
-        _log("判定闭环三条件全部满足：① 复位后 APP 应答（22 2113/0x34 正常）；"
-             "② 0x2113=%s==目标槽 %s；③ 0xF195=%s==预期版本 %s" % (
-                 slot_name(to_slot), slot_name(dest), got_ver, expect_ver))
+        confirm_app_after_reset(bus_id)
         _log("======== OTA 成功 ========")
     finally:
         zcanpro.uds_deinit()
