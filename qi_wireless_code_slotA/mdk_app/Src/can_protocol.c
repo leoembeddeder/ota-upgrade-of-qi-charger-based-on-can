@@ -948,8 +948,8 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
     return;
   }
 
-  /* 11 01 仍可复位。1.1.2+ 在 0x37 成功后已自行复位；本服务留给
-   * 旧 APP（1.1.1 无 0x37 自复位）和主机补发。 */
+  /* After 0x37, metadata is already trial PENDING. 11 01 only resets;
+   * Bootloader jumps the new slot. */
 
   if (!suppress)
   {

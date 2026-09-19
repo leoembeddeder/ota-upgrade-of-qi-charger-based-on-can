@@ -189,7 +189,7 @@ python merge_prod_bin.py
 
 | 组件 | 版本号 | 版本字符串位置 |
 |------|--------|----------------|
-| APP 固件 | **QC_JYF_FW_1.1.2** | `can_protocol.c` → `SW_VERSION_STR` |
+| APP 固件 | **QC_JYF_FW_1.1.1** | `can_protocol.c` → `SW_VERSION_STR` |
 | Bootloader | QC_JYF_BL_1.0.0 | `can_protocol.c` → `BOOTLOADER_VER_STR` |
 | 硬件版本 | QC_JYF_HW_1.1.5 | `can_protocol.c` → `HW_VERSION_STR` |
 
@@ -199,7 +199,6 @@ python merge_prod_bin.py
 
 | 日期 | 变更内容 |
 |------|----------|
-| 2026-09-19 | APP 版本号升至 **QC_JYF_FW_1.1.2**（`SW_VERSION_STR`）；OTA 激活改 11 01（不再用 ZCANPRO 经常不发的 11 81 suppress）；0x37 成功后 APP 自行复位切槽；脚本按运行槽写对面槽并核对 0x2113/0xF195 |
 | 2026-09-18 | **XATO 镜像头删除 version 字段声明**：双工程 `image_header_t`/`ota_image_header_t` 的 `version[16]`（0x4C）从定义删除，同偏移改 `hdr_reserved_ver[16]` 保留占位（打包固定填 `0x00`，偏移锁定不可回收）；打包/OTA 脚本拼装处同改保留 padding，解析侧无 0x4C 残留引用（已复核）；头总长 256B 与 magic/长度/CRC32/签名/时间戳偏移逐字节不变（gcc offsetof 前后实测一致），旧 bin/新 bin 双向兼容；固件仅头文件声明变化、无代码引用该区，无需重编译烧录 |
 | 2026-09-18 | **打包产物 XATO 镜像头不再携带版本号**：头 version 区（0x4C，16B）打包固定填 `0x00`；删打包脚本 `IMAGE_VERSION` 常量及 pack/verify/OTA/relocate 全链路对头 version 字段的写入/解析/日志；固件删 `ota_get_image_version()`（Boot/APP 校验均不依赖该字段）；版本号唯一定义在固件 `SW_VERSION_STR`，发版只改固件常量 + 文档；头总长 256B/magic/长度/CRC/签名偏移全部不变，旧 bin 兼容 |
 | 2026-09-18 | **软件版本读取源改造**：DID 0xF195 应答改取 APP 编译常量 `SW_VERSION_STR`（`can_protocol.c` 唯一真相源），不再读 OTA metadata / XATO 镜像头；镜像头 version 字段保留镜像标识/打包校验用途；`zcanpro_ext_ota_auto.py` 复位确认增加 0xF195 编译版本日志 |

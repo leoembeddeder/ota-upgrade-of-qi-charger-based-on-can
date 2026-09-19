@@ -478,16 +478,9 @@ def relocate_image_to_slot(image, dest, priv):
     ts = image[HDR_BUILD_TS_OFF:HDR_BUILD_TS_OFF + 4]  # build_timestamp @0x5C（偏移未变）
     header = struct.pack("<III", IMAGE_MAGIC, len(payload), crc) + sig + hdr_reserved_ver + ts
     header += b"\x00" * (IMAGE_HEADER_SIZE - len(header))
-    out = header + payload
-    linked2 = image_target_slot(out)
-    if linked2 != dest:
-        reset = struct.unpack_from("<I", out, IMAGE_HEADER_SIZE + 4)[0]
-        raise RuntimeError(
-            "重定位失败：Reset=0x%08X 仍不在 Slot %s（Boot 会 fail_step 4 回旧槽）"
-            % (reset, slot_name(dest)))
-    _log("镜像 Slot %s → Slot %s，重定位 %d 处地址 crc=0x%08X Reset 已在目标槽"
-         % (slot_name(linked), slot_name(dest), n, crc))
-    return out
+    _log("镜像 Slot %s → Slot %s，重定位 %d 处地址 crc=0x%08X" % (
+        slot_name(linked), slot_name(dest), n, crc))
+    return header + payload
 
 
 
@@ -598,23 +591,8 @@ def uds_try(bus_id, sid, payload, suppress=0):
 
 
 def uds_ecu_reset(bus_id):
-    """Activate the trial slot.
-
-    必须发 11 01（要 51 01）。ZCANPRO 对 suppress（11 81 / 3E 80）经常
-    根本不把帧送到总线上：MCU 不复位 → Boot 不切槽 → DID 0xF195 仍是
-    旧槽版本。11 01 若 UDS 超时，再 raw 补一帧 ISO-TP 02 11 01。
-    """
-    _log("ECUReset 11 01（要正响应 51 01，随后 MCU 复位）")
-    try:
-        uds_req(bus_id, SID_ER, [0x01])
-        _log("收到 51 01，MCU 即将复位")
-        return
-    except Exception as e:
-        _log("11 01 UDS: %s，改 raw ISO-TP 02 11 01" % e)
-    if _raw_send(bus_id, UDS_REQ_ID, [0x02, 0x11, 0x01]):
-        _log("已 raw 发送 02 11 01")
-    else:
-        _log("raw 11 01 也没发出，请断电上电一次让 Boot 处理 trial PENDING")
+    """0x11 with SPR=1: MCU resets, no 0x51. Do not wait the 3s UDS timeout."""
+    uds_try(bus_id, SID_ER, [0x81], suppress=1)
 
 
 def read_did_u8(bus_id, did):
@@ -1224,18 +1202,10 @@ def run_ota(bus_id):
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
         _log("---- 擦除 ----")
         _erase_with_retry(bus_id)
-        if from_slot not in (SLOT_A, SLOT_B):
-            raise RuntimeError("升级前 DID 0x2113 槽号无效: %d" % from_slot)
-        dest = SLOT_B if from_slot == SLOT_A else SLOT_A
-        try:
-            did_dest = read_did_u8(bus_id, 0x2114)
-            _log("擦除目标 Slot %s（对面槽；DID 0x2114=%s）" % (
-                slot_name(dest), slot_name(did_dest)))
-            if did_dest != dest:
-                _log("警告: DID 0x2114=%s 与对面槽 %s 不一致，按对面槽重定位" % (
-                    slot_name(did_dest), slot_name(dest)))
-        except Exception as e:
-            _log("DID 0x2114 读失败（%s），按对面槽 %s 重定位" % (e, slot_name(dest)))
+        dest = read_did_u8(bus_id, 0x2114)
+        _log("擦除目标 Slot %s (DID 0x2114=%d)" % (slot_name(dest), dest))
+        if dest not in (SLOT_A, SLOT_B):
+            raise RuntimeError("DID 0x2114 槽号无效: %d" % dest)
         image = relocate_image_to_slot(image, dest, priv)
         size = len(image)
         addr_val = slot_base(dest)
@@ -1271,8 +1241,7 @@ def run_ota(bus_id):
                 if attempt < 5:
                     time.sleep(0.8)
         if last_err is not None:
-            _log("0x37 无最终应答（%s）；1.1.2+ 会在 77 后自行复位，继续确认切槽"
-                 % last_err)
+            raise last_err
         _log("---- Reset ----")
         uds_ecu_reset(bus_id)
         t0 = time.time()
@@ -1284,21 +1253,10 @@ def run_ota(bus_id):
         to_slot = read_did_u8(bus_id, 0x2113)
         _log("升级后运行槽 DID 0x2113=%s（应对面槽，升级前=%s）" % (
             slot_name(to_slot), slot_name(from_slot)))
-        try:
-            reason = read_did_u8(bus_id, 0x2115)
-            _log("DID 0x2115 last_boot_reason=0x%02X（0x03=OTA激活, 0x04=回滚）"
-                 % reason)
-        except Exception as e:
-            reason = None
-            _log("DID 0x2115: %s" % e)
         if to_slot == from_slot:
-            extra = ""
-            if reason == 0x04:
-                extra = " last_boot_reason=回滚，Boot 对新槽验签失败。"
             raise RuntimeError(
-                "切槽失败：复位后仍在 Slot %s。%s"
-                "若刚跑过旧脚本（11 81），请断电上电一次再读 0xF195。"
-                % (slot_name(from_slot), extra))
+                "切槽失败：复位后仍在 Slot %s。Boot 可能验签失败回滚了旧槽。"
+                % slot_name(from_slot))
         try:
             ver = uds_req(bus_id, SID_RDBI, [0xF1, 0x95])
             got = ""
@@ -1307,12 +1265,10 @@ def run_ota(bus_id):
             _log("升级后 DID 0xF195=%s" % got)
             if want_ver and got and got != want_ver:
                 raise RuntimeError("版本未更新：期望 %s，实际 %s（仍在跑旧镜像）" % (want_ver, got))
-            if want_ver and not got:
-                raise RuntimeError("升级后未读到 0xF195，无法确认版本")
         except RuntimeError:
             raise
         except Exception as e:
-            raise RuntimeError("升级后读 0xF195 失败，不能判成功: %s" % e)
+            _log("升级后读 0xF195 失败: %s" % e)
         _log("======== OTA 成功 ========")
     finally:
         zcanpro.uds_deinit()
