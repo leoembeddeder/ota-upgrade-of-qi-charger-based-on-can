@@ -29,18 +29,7 @@
 #include "core_cm4.h"
 #include "at32f422_426_conf.h"
 
-/**
- * @brief  Jump-to-APP method selection
- *         0 = inline assembly (msr msp + bx) — safe across all ARM compilers
- *         1 = CMSIS __set_MSP + function pointer — matches official IAP example
- */
-#ifndef BOOT_JUMP_METHOD
-#define BOOT_JUMP_METHOD  0
-#endif
-
-#if (BOOT_JUMP_METHOD == 1U)
 typedef void (*app_entry_t)(void);
-#endif
 
 int8_t boot_jump_vectors_ok(uint32_t app_addr)
 {
@@ -115,21 +104,10 @@ void boot_jump_to_app(uint32_t app_addr)
   __DSB();
   __ISB();
 
-#if (BOOT_JUMP_METHOD == 0U)
-  /* Method 0: inline assembly — do not touch C locals after MSR MSP */
-  __ASM volatile(
-    "msr msp, %0 \n"
-    "bx  %1      \n"
-    :
-    : "r" (msp), "r" (reset)
-    : "memory"
-  );
-#else
   /* Method 1: CMSIS __set_MSP + function pointer (official IAP style) */
   (void)reset;  /* unused: Reset_Handler address loaded via function pointer */
   __set_MSP(msp);
   ((app_entry_t)(*(volatile uint32_t *)(app_addr + 4U)))();
-#endif
 
   while (1)
   {
