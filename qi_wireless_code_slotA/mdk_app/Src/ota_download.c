@@ -1,7 +1,8 @@
 /**
   **************************************************************************
   * @file     ota_download.c
-  * @brief    Write the inactive APP slot via UDS 0x31/0x34/0x36/0x37
+  * @brief    Write the inactive APP slot via UDS 0x31/0x34/0x36/0x37.
+  *           0x37 验签并 commit_trial 后自行 NVIC_SystemReset，Boot 切槽。
   **************************************************************************
   */
 
@@ -11,6 +12,7 @@
 #include "can_driver.h"
 #include "sit1145.h"
 #include "timer_drv.h"
+#include "lifecycle.h"
 #include "device_info.h"
 #include "sha256.h"
 #include "uECC.h"
@@ -594,5 +596,9 @@ void ota_dl_poll(void)
   can_proto_end_long_op();
   resp[0] = (uint8_t)(UDS_SID_TRANSFER_EXIT + UDS_POSITIVE_RESPONSE_OFFSET);
   can_proto_send_response(resp, 1);
+  /* 77 发出后自行复位：不依赖主机 11 81（ZCANPRO suppress 经常不发帧，
+   * Boot 不进 trial，对面槽写好了 F195 仍停在旧版本）。主机仍可再发 11 01。 */
+  lifecycle_set_state(LIFECYCLE_SHUTDOWN);
   (void)can_driver_wait_tx_idle(50U);
+  NVIC_SystemReset();
 }
