@@ -6,6 +6,14 @@
 - 改完必须 `git push` 到 origin/main，其他位置的 clone（如 Windows 端 `C:\Users\18452\Documents\Github-young-nights\...`）只通过 `git pull` 同步，禁止在非 WSL 仓库直接修改后当源使用。
 - 背景教训：曾出现 Windows 端 clone 本地改动未推送、与 WSL 仓库分叉，导致修复互相覆盖、无法互相验证（2026-09 OTA 唤醒探测修复事件）。
 
+### 修改范围边界（2026-09-19 起）
+
+- 用户指令原文（2026-09-19 10:35，om_x100b65eb063698a0b2a49fbeb40a75c）：「\\wsl.localhost\Ubuntu-24.04\home\whites\embedded_item\ota-upgrade-of-qi-charger-based-on-can 你只负责WSL2下面的这个工程的修改就行，Windows下的不要去动，写入此路径下AGENTS.md中把这个规则」。
+- **修改范围仅限**：WSL2 工程本仓库 `\\wsl.localhost\Ubuntu-24.04\home\whites\embedded_item\ota-upgrade-of-qi-charger-based-on-can`（即 `/home/whites/embedded_item/ota-upgrade-of-qi-charger-based-on-can`）。本规则为上文「唯一改动源规则」的强化版：从「不得以 Windows 为源修改」升级为「Windows 端一律不触碰」。
+- **Windows 端一律不触碰**：`I:\GitHub-young-nights`（用户运行端 clone）、`C:\Users\18452\Documents\Github-young-nights`（旧 clone）等一切 Windows 路径——不修改 / 不写入 / 不删除 / 不执行构建；运行端更新一律由用户自行 `git pull`。
+- **例外**：Windows 端操作仅在用户对具体操作明确指令时执行（例：2026-09-18 23:04 编译产物清理属单次授权）；未明确指令时默认禁止。
+- **代理任务书纪律**：所有 AI 代理（coder / clerk / evaluator 等）的任务书必须内置本约束声明，任务书未声明时以本 AGENTS.md 条目为准。
+
 ## 提交推送规则
 
 - 每次代码修改后，强制 `git add -A` 全工程提交，不留残留文件。
