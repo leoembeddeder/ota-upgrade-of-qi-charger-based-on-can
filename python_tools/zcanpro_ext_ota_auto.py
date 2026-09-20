@@ -19,7 +19,7 @@ commit_trial 成功后自行复位（ota_download.c ota_dl_poll），Boot 按
 trial PENDING 切槽；主机 11 01（非 suppress）保留为旧 APP 兼容与
 复位未生效时的补发手段。"OTA 成功"判定为三条件闭环：①复位后 APP
 应答 ②0x2113==目标槽 ③0xF195==预期版本，缺一即 FAIL + 差异明细。
-固件只编 Slot A（IROM1=0x08004100）；写入 B 时脚本自动重定位、重签
+双 Target 编译：slotA（IROM1=0x08004100）+ slotB（IROM1=0x08010100）；脚本按目标槽自动选 bin，选不到时回退重定位
 并在进入 0x34 前做宿主自检（Reset 落位/CRC/独立验签）。
 
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
@@ -81,6 +81,7 @@ FIRMWARE_DIR = os.path.join(_TOOLS_DIR, "app bin")
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 PUBLIC_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "public.pem")
 KEIL_BIN_A = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project", "Objects", "qi_wireless.bin")
+KEIL_BIN_B = os.path.join(REPO_ROOT, "qi_wireless_code_slotB", "mdk_project", "Objects", "qi_wireless.bin")
 
 def _scan_firmware():
     """扫描 app bin/ 目录，返回 {SLOT_A: path, SLOT_B: path} 字典。"""
@@ -148,9 +149,12 @@ def _pick_firmware():
         seen.add(ap)
         candidates.append((path, tag))
 
-    _add(KEIL_BIN_A, "Keil bin")
-    packed = os.path.join(FIRMWARE_DIR, "app_slot_a.bin")
-    _add(packed, "app bin/app_slot_a.bin")
+    _add(KEIL_BIN_A, "Keil slotA bin")
+    _add(KEIL_BIN_B, "Keil slotB bin")
+    packed_a = os.path.join(FIRMWARE_DIR, "app_slot_a.bin")
+    _add(packed_a, "app bin/app_slot_a.bin")
+    packed_b = os.path.join(FIRMWARE_DIR, "app_slot_b.bin")
+    _add(packed_b, "app bin/app_slot_b.bin")
     if os.path.isdir(FIRMWARE_DIR):
         for _name in sorted(os.listdir(FIRMWARE_DIR)):
             if _name.endswith(".bin"):
@@ -182,15 +186,97 @@ def _pick_firmware():
     # EXPECTED 为空：维持旧语义（Keil 新 bin 优先，mtime 次序兜底）
     keil = KEIL_BIN_A
     if os.path.isfile(keil):
-        if (not os.path.isfile(packed)) or (os.path.getmtime(keil) >= os.path.getmtime(packed) - 1.0):
-            _log("使用 Keil bin: " + keil)
+        if (not os.path.isfile(packed_a)) or (os.path.getmtime(keil) >= os.path.getmtime(packed_a) - 1.0):
+            _log("使用 Keil slotA bin: " + keil)
             return keil
-        _log("app_slot_a.bin 比 Keil bin 新，使用 " + packed)
-        return packed
-    if os.path.isfile(packed):
-        _log("固件 " + packed)
-        return packed
-    raise RuntimeError("找不到固件。请编 Slot A 或运行 pack_image.py")
+        _log("app_slot_a.bin 比 Keil bin 新，使用 " + packed_a)
+        return packed_a
+    if os.path.isfile(KEIL_BIN_B):
+        _log("使用 Keil slotB bin: " + KEIL_BIN_B)
+        return KEIL_BIN_B
+    if os.path.isfile(packed_b):
+        _log("固件 " + packed_b)
+        return packed_b
+    if os.path.isfile(packed_a):
+        _log("固件 " + packed_a)
+        return packed_a
+    raise RuntimeError("找不到固件。请编 Slot A/Slot B 或运行 pack_image.py")
+
+
+def _pick_firmware_for_slot(target_slot):
+    """按目标槽选固件：返回链接地址==target_slot 的最优候选路径，无匹配返回 None。
+    双 Target 编译后每个版本有两个 bin，此函数优先选地址天然匹配的，
+    免去 relocate_image_to_slot 的二进制重定位+重签开销。"""
+    candidates = []
+    seen = set()
+
+    def _add(path, tag):
+        ap = os.path.abspath(path)
+        if ap in seen or not os.path.isfile(path):
+            return
+        try:
+            if os.path.getsize(path) < IMAGE_HEADER_SIZE + 8:
+                return
+        except Exception:
+            return
+        seen.add(ap)
+        candidates.append((path, tag))
+
+    if target_slot == SLOT_B:
+        _add(KEIL_BIN_B, "Keil slotB bin")
+        _add(os.path.join(FIRMWARE_DIR, "app_slot_b.bin"), "app bin/app_slot_b.bin")
+    else:
+        _add(KEIL_BIN_A, "Keil slotA bin")
+        _add(os.path.join(FIRMWARE_DIR, "app_slot_a.bin"), "app bin/app_slot_a.bin")
+
+    if os.path.isdir(FIRMWARE_DIR):
+        for _name in sorted(os.listdir(FIRMWARE_DIR)):
+            if not _name.endswith(".bin"):
+                continue
+            path = os.path.join(FIRMWARE_DIR, _name)
+            try:
+                data = open(path, "rb").read()
+                if len(data) < IMAGE_HEADER_SIZE + 8:
+                    continue
+                if struct.unpack_from("<I", data, 0)[0] == IMAGE_MAGIC:
+                    reset = struct.unpack_from("<I", data, IMAGE_HEADER_SIZE + 4)[0] & 0xFFFFFFFE
+                else:
+                    reset = struct.unpack_from("<I", data, 4)[0] & 0xFFFFFFFE
+                a0 = SLOT_A_BASE + IMAGE_HEADER_SIZE
+                a1 = SLOT_A_BASE + SLOT_SIZE
+                b0 = SLOT_B_BASE + IMAGE_HEADER_SIZE
+                b1 = SLOT_B_BASE + SLOT_SIZE
+                if target_slot == SLOT_A and a0 <= reset < a1:
+                    _add(path, "app bin/" + _name)
+                elif target_slot == SLOT_B and b0 <= reset < b1:
+                    _add(path, "app bin/" + _name)
+            except Exception:
+                continue
+
+    if not candidates:
+        return None
+    if EXPECTED_SW_VERSION:
+        matched = []
+        for path, tag in candidates:
+            try:
+                ver = _extract_sw_version(open(path, "rb").read())
+            except Exception:
+                ver = None
+            _log("槽%s候选 %s（%s）strings 版本=%s" % (slot_name(target_slot), path, tag, ver or "未找到"))
+            if ver == EXPECTED_SW_VERSION:
+                matched.append((os.path.getmtime(path), path, tag))
+        if not matched:
+            return None
+        matched.sort(key=lambda t: t[0], reverse=True)
+        _mt, path, tag = matched[0]
+        _log("按目标槽 %s 选载荷: %s（%s，版本 %s 匹配，mtime 最新）"
+             % (slot_name(target_slot), path, tag, EXPECTED_SW_VERSION))
+        return path
+    candidates.sort(key=lambda t: os.path.getmtime(t[0]), reverse=True)
+    path, tag = candidates[0]
+    _log("按目标槽 %s 选载荷: %s（%s，mtime 最新）" % (slot_name(target_slot), path, tag))
+    return path
+
 
 FIRMWARE_PATH = ""
 DOWNLOAD_ADDR = 0x08004000
@@ -1634,6 +1720,15 @@ def run_ota(bus_id):
                          slot_name(did_dest), slot_name(dest)))
         except Exception as e:
             _log("DID 0x2114 读失败（%s），按对面槽 %s 重定位" % (e, slot_name(dest)))
+        # 双 Target：优先选链接地址==目标槽的 bin，免去重定位+重签
+        if linked != dest:
+            alt_path = _pick_firmware_for_slot(dest)
+            if alt_path and os.path.abspath(alt_path) != os.path.abspath(FIRMWARE_PATH):
+                _log("目标槽 %s 有地址匹配的载荷 %s，替换当前 %s" % (
+                    slot_name(dest), alt_path, FIRMWARE_PATH))
+                FIRMWARE_PATH = alt_path
+                image = pack_image_if_needed(FIRMWARE_PATH, priv)
+                linked = validate_image(image)
         image = relocate_image_to_slot(image, dest, priv)
         size = len(image)
         addr_val = slot_base(dest)
