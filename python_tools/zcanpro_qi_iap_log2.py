@@ -118,6 +118,7 @@ def _to_list(b):
 
 
 def z_notify(type, obj):
+    global stopTask
     _log("Notify " + str(type) + " " + str(obj))
     if type == "stop":
             stopTask = True
