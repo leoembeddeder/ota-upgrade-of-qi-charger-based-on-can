@@ -5,7 +5,8 @@
  **************************************************************************
  *
  * Dual-copy metadata at 0x0801C000 / 0x0801C800. Single-App format
- * (META_VERSION=2): legacy A/B-era metadata is rejected -> defaults.
+ * (META_VERSION=3): v2-and-earlier metadata is rejected -> defaults
+ * rebuild (Q2 slimming).
  * All writes funnel through meta_write_to_flash (IRQ-off single-bank
  * erase+program+readback) — power-safe, backup copy written first.
  */
