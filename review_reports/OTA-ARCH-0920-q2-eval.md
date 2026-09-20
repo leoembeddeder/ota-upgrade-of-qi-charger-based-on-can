@@ -25,4 +25,22 @@
 - 设备侧影响（coder 风险自报确认）：v2 metadata 升级后被 defaults 重建=版本拒绝机制预期行为；safe-mode flash 现场记录随 reserved 区删除消失，取证改依赖 CAN 帧（M2/M3/ABT）+copy_fail_step/last_boot_reason——设计权衡，非缺陷。
 - N5 前置沿用：MDK 未编译（WSL 限制）；B1 修复后仍需双工程完整 Rebuild。
 
-*—— 评估员已完成复审 | 只读铁律：业务代码零触碰*
+## 补充核查（主管 18:34 增补）：v2 陈旧注释全清单（注释修正级，非阻断）
+
+主管发现 boot_metadata.h 头部注释与 v3 代码不符——确认属实并全仓扩展枚举 @d3b550d，共 **7 处/4 文件**：
+
+| # | 文件:行 | 陈旧表述 | 应改为 |
+|---|---|---|---|
+| 1 | qi_wireless_bootloader/mdk_app/Inc/boot_metadata.h:20 | "byte-frozen (272 bytes, crc32 at offset 268)" | v3：28B，crc32@0x18(24) |
+| 2 | 同上 :22 | "META_VERSION bumped to 2: v1 …rejected -> defaults" | META_VERSION=3：v2 及以前拒绝→defaults |
+| 3 | 同上 :71（struct 文档注释） | "OTA metadata structure (272 bytes total, layout byte-frozen)" | 28B，布局随版本管理 |
+| 4 | qi_wireless_code_app/mdk_app/Inc/ota_trigger.h:18-19 | "byte-frozen (272B, crc32 @0x10C)…legacy slot fields retained as reserved bytes" | 28B/@0x18；legacy 字段已删除非保留 |
+| 5 | qi_wireless_bootloader/mdk_app/Src/boot_metadata.c:8（文件头注释） | "(META_VERSION=2): legacy A/B-era metadata is rejected" | META_VERSION=3 |
+| 6 | docs/2. Flash 分配方案.md:15（分区表） | "OTA 元数据主副本（272B 结构）" | 28B |
+| 7 | docs/2. Flash 分配方案.md:30（ASCII 图） | "ota_metadata_t (272B)" | 28B |
+
+排除项：ota_trigger.h:70 XATO image header "256B, byte-frozen"——打包头确为 256B 未变，表述准确非陈旧；sha256.c:33 常量内含"272"子串——误命中。boot_trial.h/boot_safe_mode.h 注释已随 d3b550d 同步（copy_fail_step 语义），无残留。
+
+处置：与 B1（ota_image_header_t 恢复）一并交 coder 热修或下一批修复；docs/2 §一/§三自相矛盾（§三已改 v3 而 :15/:30 仍 272B）优先修正。注释级问题不影响代码事实（v3 结构/版本/CRC offset 双工程代码层已验证正确），不改变 FAIL verdict（B1 仍为唯一 blocking）。
+
+*—— 评估员已完成复审（含主管增补核查）| 只读铁律：业务代码零触碰*
