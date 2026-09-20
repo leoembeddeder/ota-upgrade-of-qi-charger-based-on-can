@@ -35,7 +35,7 @@
   *             （sit1145_normal_mode_set，见 enter_safe_mode 主循环）
   *
   *   fail_step 语义（提取自 boot_verify.c g_verify_fail_step）:
-  *     0 = 未执行镜像校验 / select_boot_slot 无有效槽
+  *     0 = image verify not executed / no usable metadata state
   *     1 = 镜像 magic 校验失败
   *     2 = image_length 为 0 或超出槽范围
   *     3 = 镜像 CRC32 校验失败
@@ -135,11 +135,14 @@ void boot_diag_can_init(void)
 
 void boot_diag_m1(const void *meta)
 {
+  /* M1 payload (single-App arch): b1=app_valid b2=meta load source
+   * (0=primary 1=backup-copy 2=defaults 0xFF=n/a) b3=magic_ok
+   * b4=ver_ok b5=crc_ok */
   const ota_metadata_t *m = (const ota_metadata_t *)meta;
   uint8_t p[6];
 
   p[0] = 0xA1U;
-  p[1] = (m != (const ota_metadata_t *)0) ? m->active_slot : 0xFFU;
+  p[1] = (m != (const ota_metadata_t *)0) ? m->app_valid : 0xFFU;
   p[2] = g_diag_meta_src;
   if (m != (const ota_metadata_t *)0)
   {
@@ -157,24 +160,30 @@ void boot_diag_m1(const void *meta)
   boot_diag_frame_send(p, 6U);
 }
 
-void boot_diag_m2(int8_t ret, uint8_t slot)
+void boot_diag_m2(int8_t ret, uint8_t info)
 {
+  /* M2 payload (single-App arch): b1=copy result
+   * (0=sequence start / no pending when b2=0xFF, 1=copy committed,
+   * 0xFF=copy failed) b2=detail (fail_step on failure, 0xFF=not pending) */
   uint8_t p[3];
 
   p[0] = 0xA2U;
-  p[1] = slot;
-  p[2] = (uint8_t)ret;   /* 0=成功；0xFF=-1 失败（safe mode 0x01 路径） */
+  p[1] = info;
+  p[2] = (uint8_t)ret;
   boot_diag_frame_send(p, 3U);
 }
 
-void boot_diag_m3(uint8_t pass, uint8_t fail_step, uint8_t slot)
+void boot_diag_m3(uint8_t pass, uint8_t fail_step, uint8_t target)
 {
+  /* M3 payload (single-App arch): b1=pass b2=fail_step
+   * (0xFF=verify starting) b3=target region (0=Backup source,
+   * 1=App region) */
   uint8_t p[4];
 
   p[0] = 0xA3U;
   p[1] = pass;
   p[2] = fail_step;
-  p[3] = slot;
+  p[3] = target;
   boot_diag_frame_send(p, 4U);
 }
 
@@ -198,7 +207,12 @@ void enter_safe_mode(uint8_t cause)
   uint8_t  step = g_verify_fail_step;
   uint32_t last_hb;
 
-  g_meta.reserved1    = (uint16_t)(((uint16_t)cause << 8) | step);
+  /* persist failure context in reserved_trial[] (single-App struct):
+   * [2]=cause [3]=verify fail_step [4]=0xA5 marker; [0] keeps the
+   * backup-copy fail_step written by boot_copy_backup */
+  g_meta.reserved_trial[2] = cause;
+  g_meta.reserved_trial[3] = step;
+  g_meta.reserved_trial[4] = 0xA5U;
   g_meta.reserved2[0] = g_meta.last_boot_reason;
   g_meta.reserved2[1] = 0xA5U;
   (void)boot_metadata_save(&g_meta);

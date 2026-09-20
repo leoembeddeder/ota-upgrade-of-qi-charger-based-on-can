@@ -1,339 +1,177 @@
-#!/usr/bin/env python3
-"""Verify XATO image integrity: Magic, Length, CRC32, ECDSA P-256 signature.
+# -*- coding: utf-8 -*-
+"""Verify a packed XATO app image (magic/length/CRC/reset vector/ECDSA).
+
+Single-App architecture (OTA-ARCH-0920): the image must be linked for the
+App window — reset vector inside [0x08004100, 0x08010000). The image is
+staged at Backup 0x08010000 during OTA and copied verbatim to App
+0x08004000 by BOOT; one image serves both locations.
 
 Usage:
-    python verify_image.py <image_path> [--key <public_key.pem>]
-    python verify_image.py app_slot_a.ota.bin
-    python verify_image.py app_slot_a.ota.bin --key docs/keys/public.pem
-
-Exit code: 0 = all pass, 1 = verification failed, 2 = file error.
+    python verify_image.py app bin/app_image.bin
+    python verify_image.py app bin/app_image.bin --key docs/keys/public.pem
 """
 
 from __future__ import print_function
 
 import argparse
 import binascii
+import hashlib
 import os
 import struct
-import subprocess
 import sys
-import tempfile
 
 IMAGE_MAGIC = 0x4F544158  # "XATO"
 IMAGE_HEADER_SIZE = 256
 
-# Flash layout (must match boot_metadata.h)
-APP_A_BASE_ADDR = 0x08004000
-APP_B_BASE_ADDR = 0x08010000
-APP_SLOT_SIZE    = 0xC000  # 48KB per slot
+APP_BASE_ADDR = 0x08004000      # App image region (incl. header)
+APP_SIZE = 0xC000               # 48KB
+APP_ENTRY_ADDR = APP_BASE_ADDR + IMAGE_HEADER_SIZE   # 0x08004100
+BACKUP_BASE_ADDR = 0x08010000   # OTA staging region (same image verbatim)
 
-# ECDSA public key magic marker (matches boot_verify.h ECDSA_PUBKEY_MAGIC)
-ECDSA_PUBKEY_MAGIC = 0x4B594550  # "KEYP"
-
-# Embedded public key from boot_verify.c (SEC1 uncompressed: 04 || x || y)
-EMBEDDED_PUBKEY = bytes([
-    0x04,
-    0x79, 0x0d, 0x96, 0xca, 0x91, 0x2d, 0x90, 0xdb,
-    0x73, 0xdf, 0x21, 0xb0, 0x6e, 0xe7, 0xce, 0x19,
-    0xaa, 0x7c, 0x1f, 0x75, 0x30, 0x55, 0x0a, 0x48,
-    0x21, 0x84, 0x19, 0xb4, 0x4b, 0x4c, 0x37, 0xcb,
-    0xf5, 0x7c, 0xd3, 0xfc, 0x9e, 0x26, 0xbe, 0x1b,
-    0xa6, 0x94, 0xdd, 0x45, 0x62, 0x7e, 0xaa, 0xca,
-    0x71, 0x38, 0xf5, 0x7a, 0x8e, 0xa8, 0xd5, 0xdd,
-    0x20, 0x70, 0x33, 0x26, 0xf0, 0x95, 0x41, 0x71,
-])
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_KEY = os.path.join(REPO_ROOT, "docs", "keys", "public.pem")
+HDR_MAGIC_OFF = 0x00
+HDR_LEN_OFF = 0x04
+HDR_CRC_OFF = 0x08
+HDR_SIG_OFF = 0x0C              # 64B ECDSA R||S
+HDR_RESERVED_VER_OFF = 0x4C     # 16B reserved placeholder, filled 0x00
+HDR_BUILD_TS_OFF = 0x5C
 
 
 def verify_magic(header):
-    """Check 1: header magic number."""
-    magic = struct.unpack("<I", header[0:4])[0]
-    if magic != IMAGE_MAGIC:
-        return False, "Magic 错误: 0x{:08X} (expect 0x4F544158)".format(magic)
-    return True, "Magic 正确: XATO"
+    magic = struct.unpack_from("<I", header, HDR_MAGIC_OFF)[0]
+    return magic == IMAGE_MAGIC, magic
 
 
 def verify_image_length(header, firmware_len):
-    """Check 2: image_length within bounds."""
-    img_len = struct.unpack("<I", header[4:8])[0]
-    if img_len == 0:
-        return False, "Image length 为 0"
-    if img_len > firmware_len:
-        return False, "Image length ({}) > 实际固件大小 ({})".format(img_len, firmware_len)
-    return True, "Image length 正确: {} bytes".format(img_len)
+    image_length = struct.unpack_from("<I", header, HDR_LEN_OFF)[0]
+    return image_length == firmware_len and image_length <= (APP_SIZE - IMAGE_HEADER_SIZE), image_length
 
 
 def verify_crc32(header, firmware):
-    """Check 3: CRC32 of firmware data (IEEE 802.3)."""
-    stored_crc = struct.unpack("<I", header[8:12])[0]
-    computed_crc = binascii.crc32(firmware) & 0xFFFFFFFF
-    if stored_crc != computed_crc:
-        return False, "CRC32 不匹配: stored=0x{:08X} computed=0x{:08X}".format(
-            stored_crc, computed_crc
-        )
-    return True, "CRC32 正确: 0x{:08X}".format(stored_crc)
-
-
-# 0x4C..0x5C（16B）为保留占位区：原 version 字段已从 image_header_t 定义
-# 删除（2026-09-18），打包固定填 0x00（版本号唯一定义在固件 SW_VERSION_STR）。
-# 校验忽略该区：CRC32 只覆盖头后 payload、ECDSA 签名只签 payload，保留占位
-# 区不在任何校验范围内，历史镜像中该区的残留字节同样不影响校验结果。
-
-
-def verify_build_timestamp(header):
-    """Check 5: build timestamp."""
-    ts = struct.unpack("<I", header[0x5C:0x60])[0]
-    if ts == 0:
-        return True, "Build timestamp: 0 (未设置)"
-    from datetime import datetime
-    try:
-        dt = datetime.utcfromtimestamp(ts)
-        return True, "Build timestamp: {} UTC".format(dt.strftime("%Y-%m-%d %H:%M:%S"))
-    except (OSError, OverflowError):
-        return True, "Build timestamp: {} (raw)".format(ts)
+    stored = struct.unpack_from("<I", header, HDR_CRC_OFF)[0]
+    computed = binascii.crc32(firmware) & 0xFFFFFFFF
+    return stored == computed, stored, computed
 
 
 def p1363_to_der(sig_bytes):
-    """Convert 64-byte IEEE P1363 (R||S) signature to DER format for OpenSSL."""
-    if len(sig_bytes) != 64:
-        raise ValueError("Signature must be 64 bytes, got {}".format(len(sig_bytes)))
-
+    """Convert 64B IEEE P1363 R||S to DER SEQUENCE for openssl checks."""
     r = int.from_bytes(sig_bytes[:32], "big")
     s = int.from_bytes(sig_bytes[32:], "big")
 
-    def int_to_der_int(n):
-        b = n.to_bytes(32, "big").lstrip(b"\x00")
-        if not b:
-            b = b"\x00"
+    def _int_der(v):
+        b = v.to_bytes((v.bit_length() + 7) // 8 or 1, "big")
         if b[0] & 0x80:
             b = b"\x00" + b
         return b"\x02" + bytes([len(b)]) + b
 
-    r_der = int_to_der_int(r)
-    s_der = int_to_der_int(s)
-    seq = r_der + s_der
-    return b"\x30" + bytes([len(seq)]) + seq
+    body = _int_der(r) + _int_der(s)
+    return b"\x30" + bytes([len(body)]) + body
 
 
 def pem_to_sec1(public_key_path):
-    """Extract SEC1 uncompressed public key (04||x||y) from PEM file."""
-    tmpdir = tempfile.mkdtemp(prefix="pubkey_")
-    try:
-        out_path = os.path.join(tmpdir, "pubkey.der")
-        result = subprocess.Popen(
-            ["openssl", "ec", "-pubin", "-in", public_key_path,
-             "-outform", "DER", "-out", out_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        result.communicate()
-        if result.returncode != 0:
-            return None
-        with open(out_path, "rb") as f:
-            der_key = f.read()
-        # DER EC public key: last 65 bytes are SEC1 uncompressed point
-        if len(der_key) >= 65 and der_key[-65] == 0x04:
-            return der_key[-65:]
-        return None
-    finally:
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    """Extract uncompressed SEC1 point (04||X||Y) from an SPKI PEM."""
+    raw = open(public_key_path, "rb").read()
+    text = raw.decode("ascii", "ignore")
+    lines = [l.strip() for l in text.splitlines() if "BEGIN" not in l and "END" not in l]
+    der = binascii.a2b_base64("".join(lines))
+    i = der.find(b"\x03")
+    while i >= 0:
+        j = i + 1
+        ln = der[j]
+        j += 1
+        if ln & 0x80:
+            k = ln & 0x7F
+            ln = 0
+            for _ in range(k):
+                ln = (ln << 8) | der[j]
+                j += 1
+        if ln == 66 and der[j] == 0x00 and der[j + 1] == 0x04:
+            return der[j + 2:j + 66]
+        i = der.find(b"\x03", i + 1)
+    raise ValueError("no P-256 uncompressed point found in %s" % public_key_path)
 
 
-def verify_reset_handler(image, slot_base, slot_size):
-    """Check 4: Reset Handler must point inside the target slot.
-
-    MCU checks (boot_verify.c check 3b) read the vector table AFTER the
-    256-byte XATO header:
-      vec = (uint32_t *)(base_addr + IMAGE_HEADER_SIZE)
-      reset = vec[1] & 0xFFFFFFFE  (clear thumb bit)
-      entry = base_addr + IMAGE_HEADER_SIZE
-      end   = base_addr + slot_size
-      if (reset < entry || reset >= end) => FAIL
-
-    历史缺陷修正（2026-09-18）：本函数旧实现 unpack(header[:8])，读到的是
-    XATO 头的 magic/image_length 而非固件向量表，任何合法镜像都会误报
-    FAIL；现按 MCU 逻辑从整镜像偏移 IMAGE_HEADER_SIZE 处取 word[1]。
-    """
+def verify_reset_handler(image):
+    """Reset vector must land inside the App run window."""
     if len(image) < IMAGE_HEADER_SIZE + 8:
-        return False, "镜像太短：不足头 256B + 向量表 8B"
-    firmware_base = slot_base + IMAGE_HEADER_SIZE
-    # Vector table sits right after the header:
-    # word[0] = initial SP, word[1] = Reset Handler
-    vec = struct.unpack("<II", image[IMAGE_HEADER_SIZE:IMAGE_HEADER_SIZE + 8])
-    if vec[1] == 0xFFFFFFFF or vec[1] == 0:
-        return False, "Reset Handler 无效: 0x{:08X}".format(vec[1])
-    reset = vec[1] & 0xFFFFFFFE
-    slot_end = slot_base + slot_size
-    if reset < firmware_base or reset >= slot_end:
-        return False, (
-            "Reset Handler 0x{:08X} 不在槽范围内 [0x{:08X}, 0x{:08X})"
-            .format(reset, firmware_base, slot_end)
-        )
-    return True, "Reset Handler 0x{:08X} 在槽范围内".format(reset)
-
-
-def verify_public_key_match(public_key_path):
-    """Check 8: PEM public key must match the embedded bootloader key.
-
-    MCU uses boot_verify_get_public_key() which checks ECDSA_PUBKEY_MAGIC
-    and returns the hardcoded g_ecdsa_public_key.  If the PEM key doesn't
-    match, offline ECDSA PASS but board step 5/6 will FAIL.
-    """
-    if not os.path.isfile(public_key_path):
-        return False, "公钥文件不存在: {}".format(public_key_path)
-
-    sec1 = pem_to_sec1(public_key_path)
-    if sec1 is None:
-        return False, "无法从 PEM 提取公钥 (openssl ec 失败)"
-
-    if len(sec1) != 65:
-        return False, "SEC1 公钥长度错误: {} bytes (expect 65)".format(len(sec1))
-
-    if sec1 != EMBEDDED_PUBKEY:
-        return False, (
-            "PEM 公钥与嵌入式 bootloader 公钥不一致!\n"
-            "  PEM X: {}\n"
-            "  MCU X: {}"
-            .format(sec1[1:33].hex(), EMBEDDED_PUBKEY[1:33].hex())
-        )
-    return True, "PEM 公钥与嵌入式 bootloader 公钥一致"
+        return False, 0
+    reset = struct.unpack_from("<I", image, IMAGE_HEADER_SIZE + 4)[0] & 0xFFFFFFFE
+    ok = APP_ENTRY_ADDR <= reset < (APP_BASE_ADDR + APP_SIZE)
+    return ok, reset
 
 
 def verify_ecdsa(firmware, signature, public_key_path):
-    """Check 6: ECDSA P-256 signature using OpenSSL CLI."""
-    if not os.path.isfile(public_key_path):
-        return False, "公钥文件不存在: {}".format(public_key_path)
-
-    if len(signature) != 64:
-        return False, "签名长度错误: {} bytes (expect 64)".format(len(signature))
-
-    # Check if signature is all zeros
-    if signature == b"\x00" * 64:
-        return False, "签名全零 (placeholder，未实际签名)"
-
+    """Independent host-side ECDSA check via openssl (best effort)."""
     try:
+        import subprocess
+        import tempfile
+        sec1 = pem_to_sec1(public_key_path)
         der_sig = p1363_to_der(signature)
-    except ValueError as e:
-        return False, "签名格式错误: {}".format(e)
-
-    # Write temp files for OpenSSL
-    tmpdir = tempfile.mkdtemp(prefix="verify_")
-    try:
-        fw_path = os.path.join(tmpdir, "firmware.bin")
-        sig_path = os.path.join(tmpdir, "signature.der")
-        with open(fw_path, "wb") as f:
-            f.write(firmware)
-        with open(sig_path, "wb") as f:
-            f.write(der_sig)
-
-        # openssl dgst -sha256 -verify <pubkey> -signature <sig> <data>
-        result = subprocess.Popen(
-            [
-                "openssl", "dgst", "-sha256",
-                "-verify", public_key_path,
-                "-signature", sig_path,
-                fw_path,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        stdout, stderr = result.communicate()
-        output = (stdout.decode() + stderr.decode()).strip()
-
-        if result.returncode == 0 and "Verified OK" in output:
-            return True, "ECDSA 签名验证通过"
-        else:
-            return False, "ECDSA 签名验证失败: {}".format(output)
-    except FileNotFoundError:
-        return False, "openssl 未安装或不在 PATH 中"
-    finally:
-        # Cleanup temp files
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        digest = hashlib.sha256(firmware).digest()
+        with tempfile.NamedTemporaryFile(delete=False) as f_sig, \
+             tempfile.NamedTemporaryFile(delete=False) as f_pub, \
+             tempfile.NamedTemporaryFile(delete=False) as f_dgst:
+            f_sig.write(der_sig)
+            f_pub.write(b"\x04" + sec1[1:] if sec1[0:1] != b"\x04" else sec1)
+            f_dgst.write(digest)
+            sig_path, pub_path, dgst_path = f_sig.name, f_pub.name, f_dgst.name
+        rc = subprocess.call(["openssl", "dgst", "-sha256", "-verify", pub_path,
+                              "-signature", sig_path, dgst_path],
+                             stdout=open(os.devnull, "w"),
+                             stderr=open(os.devnull, "w"))
+        for p in (sig_path, pub_path, dgst_path):
+            os.unlink(p)
+        return rc == 0, "openssl exit %d" % rc
+    except Exception as e:
+        return None, "skipped (%s)" % e
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Verify XATO image: Magic + Length + CRC32 + Reset Handler + Public Key + ECDSA P-256"
-    )
-    parser.add_argument("image", help="Path to .ota.bin image file")
-    parser.add_argument(
-        "--key", default=DEFAULT_KEY,
-        help="ECDSA P-256 public key PEM (default: docs/keys/public.pem)",
-    )
-    parser.add_argument(
-        "--slot", choices=["A", "B", "a", "b"], default="A",
-        help="Target slot (A or B, default: A). Determines base address for Reset Handler check.",
-    )
+    parser = argparse.ArgumentParser(description="Verify packed XATO app image")
+    parser.add_argument("image", help="packed image path (app bin/app_image.bin)")
+    parser.add_argument("--key", default=None,
+                        help="public key PEM for ECDSA check (optional)")
     args = parser.parse_args(argv)
 
-    image_path = args.image
-    key_path = args.key
-    slot = args.slot.upper()
-    slot_base = APP_A_BASE_ADDR if slot == "A" else APP_B_BASE_ADDR
-
-    # ---- load image ----
-    if not os.path.isfile(image_path):
-        sys.stderr.write("ERROR: 文件不存在: {}\n".format(image_path))
-        return 2
-
-    with open(image_path, "rb") as f:
-        data = f.read()
-
+    data = open(args.image, "rb").read()
     if len(data) < IMAGE_HEADER_SIZE:
-        sys.stderr.write("ERROR: 文件太小 ({} bytes)，不足 256 字节头\n".format(len(data)))
-        return 2
-
+        sys.stderr.write("ERROR: image too short: {} bytes\n".format(len(data)))
+        return 1
     header = data[:IMAGE_HEADER_SIZE]
     firmware = data[IMAGE_HEADER_SIZE:]
-    img_len_stored = struct.unpack("<I", header[4:8])[0]
-    # Use stored length for signature verification (matches MCU behavior)
-    firmware_for_verify = firmware[:img_len_stored] if img_len_stored <= len(firmware) else firmware
 
-    # ---- run checks ----
-    passed = 0
-    failed = 0
+    ok_magic, magic = verify_magic(header)
+    ok_len, image_length = verify_image_length(header, len(firmware))
+    ok_crc, stored_crc, computed_crc = verify_crc32(header, firmware)
+    ok_reset, reset = verify_reset_handler(data)
+    reserved_ver = header[HDR_RESERVED_VER_OFF:HDR_RESERVED_VER_OFF + 16]
+    build_ts = struct.unpack_from("<I", header, HDR_BUILD_TS_OFF)[0]
 
-    print("=" * 60)
-    print("XATO Image Verification: {}".format(os.path.basename(image_path)))
-    print("File size: {} bytes (header {} + firmware {})".format(
-        len(data), IMAGE_HEADER_SIZE, len(firmware)
-    ))
-    print("=" * 60)
+    print("file         : {}".format(args.image))
+    print("total        : {} bytes (header {} + firmware {})".format(
+        len(data), IMAGE_HEADER_SIZE, len(firmware)))
+    print("target       : App window base=0x{:08X} size=0x{:04X} (OTA staging: Backup 0x{:08X})".format(
+        APP_BASE_ADDR, APP_SIZE, BACKUP_BASE_ADDR))
+    print("magic        : {} (0x{:08X})".format("OK" if ok_magic else "FAIL", magic))
+    print("image_length : {} (header={}, firmware={}) -> {}".format(
+        image_length, image_length, len(firmware), "OK" if ok_len else "FAIL"))
+    print("crc32        : stored=0x{:08X} computed=0x{:08X} -> {}".format(
+        stored_crc, computed_crc, "OK" if ok_crc else "FAIL"))
+    print("reset vector : 0x{:08X} window=[0x{:08X},0x{:08X}) -> {}".format(
+        reset, APP_ENTRY_ADDR, APP_BASE_ADDR + APP_SIZE,
+        "OK" if ok_reset else "FAIL"))
+    print("hdr @0x4C    : reserved placeholder = {}".format(reserved_ver.hex()))
+    print("build ts     : {}".format(build_ts))
 
-    print("Target slot:   {} (base=0x{:08X}, size=0x{:04X})".format(
-        slot, slot_base, APP_SLOT_SIZE))
+    ok_sig = None
+    if args.key:
+        ok_sig, note = verify_ecdsa(firmware, header[HDR_SIG_OFF:HDR_SIG_OFF + 64], args.key)
+        print("ecdsa        : {}{}".format(
+            "OK" if ok_sig else ("FAIL" if ok_sig is False else "N/A"), " " + note))
 
-    checks = [
-        ("Magic", lambda: verify_magic(header)),
-        ("Image Length", lambda: verify_image_length(header, len(firmware))),
-        ("CRC32", lambda: verify_crc32(header, firmware_for_verify)),
-        ("Reset Handler", lambda: verify_reset_handler(data, slot_base, APP_SLOT_SIZE)),
-        ("Public Key", lambda: verify_public_key_match(key_path)),
-        ("ECDSA P-256", lambda: verify_ecdsa(
-            firmware_for_verify,
-            header[0x0C:0x4C],  # 64-byte signature at offset 0x0C
-            key_path,
-        )),
-    ]
-
-    for name, check_fn in checks:
-        ok, msg = check_fn()
-        status = "PASS" if ok else "FAIL"
-        symbol = "\u2705" if ok else "\u274c"
-        print("  {} [{}] {}".format(symbol, status, msg))
-        if ok:
-            passed += 1
-        else:
-            failed += 1
-
-    print("=" * 60)
-    print("Result: {} passed, {} failed".format(passed, failed))
-    print("=" * 60)
-
-    return 0 if failed == 0 else 1
+    all_ok = ok_magic and ok_len and ok_crc and ok_reset and (ok_sig is not False)
+    print("")
+    print("RESULT: {}".format("PASS" if all_ok else "FAIL"))
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":

@@ -1,26 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA（用户实测流程对齐版）
+ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA（单 App 架构，OTA-ARCH-0920）
 
-用户五步流程（脚本严丝合缝支持，2026-09-20 对齐）：
-  ① 设备烧录 boot+slotA 完整固件（QC_JYF_FW_1.1.1）作为基线；
-  ② 手动改代码 SW_VERSION_STR → QC_JYF_FW_1.1.2（用户侧 Keil 工程）；
-  ③ Keil Rebuild APP 工程（禁 Incremental Build）；
-  ④ 运行 pack_image.py 打包生成载荷（落 app bin/；Keil 新 bin 亦可，
-     脚本会现场打包）；
-  ⑤ 运行本脚本升级到 B 槽。
-载荷构建前提：仓库固件 SW_VERSION_STR 保持 QC_JYF_FW_1.1.1 零触碰
-（铁律），1.1.2 版本串只存在于用户侧构建产物；EXPECTED_SW_VERSION
-固化 "QC_JYF_FW_1.1.2"，选 bin 版本匹配优先/mtime 次序（旧 1.1.1
-残留绝不被选中），不符→拒闪（fail-closed 零业务流量）。
-
-在 APP 内擦写非活跃槽（31/34/36/37）。新版固件 0x37 收尾在验签+
-commit_trial 成功后自行复位（ota_download.c ota_dl_poll），Boot 按
-trial PENDING 切槽；主机 11 01（非 suppress）保留为旧 APP 兼容与
-复位未生效时的补发手段。"OTA 成功"判定为三条件闭环：①复位后 APP
-应答 ②0x2113==目标槽 ③0xF195==预期版本，缺一即 FAIL + 差异明细。
-双 Target 编译：slotA（IROM1=0x08004100）+ slotB（IROM1=0x08010100）；脚本按目标槽自动选 bin，选不到时回退重定位
-并在进入 0x34 前做宿主自检（Reset 落位/CRC/独立验签）。
+升级流程（Boot + App + Backup 区，A/B 槽已移除）：
+  ① 设备烧录 boot+App 完整固件作为基线（产线 merge_prod_bin.py）；
+  ② 用户侧 Keil 改 SW_VERSION_STR → 目标版本；
+  ③ Rebuild qi_wireless_code_app 工程（禁 Incremental Build）；
+  ④ pack_image.py 打包（app bin/app_image.bin；Keil 新 bin 亦可，
+     脚本现场打包）；
+  ⑤ 运行本脚本：10 02→27→31 擦 Backup 区→34/36 写入 0x08010000→
+     37 验签提交（设备自复位）→ BOOT 搬运 Backup→App（擦 App 区→
+     复制→复核→清标志→跳转）→ 复位后版本核验。
+EXPECTED_SW_VERSION 固化 "QC_JYF_FW_1.1.2"，选 bin 版本匹配优先/
+mtime 次序（旧版本残留绝不被选中），不符→拒闪（fail-closed）。
+判定闭环：①复位后 APP 应答 ②0xF195==EXPECTED_SW_VERSION
+（0x2113 在单 App 架构恒为 0x00，仅信息展示）。
+仓库固件 SW_VERSION_STR 保持 QC_JYF_FW_1.1.1 零触碰（铁律）。
 
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
@@ -80,35 +75,25 @@ REPO_ROOT = _find_repo_root(_TOOLS_DIR)
 FIRMWARE_DIR = os.path.join(_TOOLS_DIR, "app bin")
 PRIVATE_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "private.pem")
 PUBLIC_KEY_PATH = os.path.join(REPO_ROOT, "docs", "keys", "public.pem")
-KEIL_BIN_A = os.path.join(REPO_ROOT, "qi_wireless_code_slotA", "mdk_project", "Objects", "qi_wireless.bin")
-KEIL_BIN_B = os.path.join(REPO_ROOT, "qi_wireless_code_slotB", "mdk_project", "Objects", "qi_wireless.bin")
+KEIL_APP_BIN = os.path.join(REPO_ROOT, "qi_wireless_code_app", "mdk_project", "Objects", "qi_wireless_code_app.bin")
 
 def _scan_firmware():
-    """扫描 app bin/ 目录，返回 {SLOT_A: path, SLOT_B: path} 字典。"""
-    result = {}
+    """Scan app bin/ for firmware candidates (single-App arch: every
+    image must be App-window linked; returns list of paths)."""
+    result = []
     if not os.path.isdir(FIRMWARE_DIR):
-        raise RuntimeError("找不到固件目录: " + FIRMWARE_DIR)
+        raise RuntimeError("firmware dir not found: " + FIRMWARE_DIR)
     for name in sorted(os.listdir(FIRMWARE_DIR)):
         if not name.endswith(".bin"):
             continue
         path = os.path.join(FIRMWARE_DIR, name)
-        data = open(path, "rb").read()
+        try:
+            data = open(path, "rb").read()
+        except Exception:
+            continue
         if len(data) < IMAGE_HEADER_SIZE + 8:
             continue
-        if struct.unpack_from("<I", data, 0)[0] == IMAGE_MAGIC:
-            reset = struct.unpack_from("<I", data, IMAGE_HEADER_SIZE + 4)[0] & 0xFFFFFFFE
-        else:
-            reset = struct.unpack_from("<I", data, 4)[0] & 0xFFFFFFFE
-        a0 = SLOT_A_BASE + IMAGE_HEADER_SIZE
-        a1 = SLOT_A_BASE + SLOT_SIZE
-        b0 = SLOT_B_BASE + IMAGE_HEADER_SIZE
-        b1 = SLOT_B_BASE + SLOT_SIZE
-        if a0 <= reset < a1:
-            _log("扫描: %s → Slot A (Reset=0x%08X)" % (name, reset))
-            result[SLOT_A] = path
-        elif b0 <= reset < b1:
-            _log("扫描: %s → Slot B (Reset=0x%08X)" % (name, reset))
-            result[SLOT_B] = path
+        result.append(path)
     return result
 
 
@@ -126,14 +111,12 @@ def _extract_sw_version(blob):
 
 
 def _pick_firmware():
-    """载荷选择：版本匹配优先、mtime 次序（用户五步流程对齐，2026-09-20）。
-
-    候选=Keil Slot A 构建产物(qi_wireless.bin) + app bin/ 下全部 .bin
-    （含 pack_image.py 产物）。EXPECTED_SW_VERSION 非空时：仅在
-    strings 版本==EXPECTED 的候选中取 mtime 最新者；无匹配候选→
-    直接报错（旧版本残留绝不被选中，与 run_ota 内拒闪门 fail-closed
-    双保险，拒闪门本身保持不动）。EXPECTED 为空时：维持旧语义
-    （Keil 新 bin 优先/app_slot_a.bin 兜底）。"""
+    """Payload selection (single-App arch): version-match first, mtime
+    second. Candidates = Keil app build + every .bin under app bin/
+    (packed or raw, all must be App-window linked; validate_image
+    enforces the reset-vector window). EXPECTED_SW_VERSION non-empty:
+    only version-matched candidates qualify, newest mtime wins; no
+    match -> fail-closed error (stale versions are never selected)."""
     candidates = []
     seen = set()
 
@@ -149,19 +132,14 @@ def _pick_firmware():
         seen.add(ap)
         candidates.append((path, tag))
 
-    _add(KEIL_BIN_A, "Keil slotA bin")
-    _add(KEIL_BIN_B, "Keil slotB bin")
-    packed_a = os.path.join(FIRMWARE_DIR, "app_slot_a.bin")
-    _add(packed_a, "app bin/app_slot_a.bin")
-    packed_b = os.path.join(FIRMWARE_DIR, "app_slot_b.bin")
-    _add(packed_b, "app bin/app_slot_b.bin")
+    _add(KEIL_APP_BIN, "Keil app bin")
     if os.path.isdir(FIRMWARE_DIR):
         for _name in sorted(os.listdir(FIRMWARE_DIR)):
             if _name.endswith(".bin"):
                 _add(os.path.join(FIRMWARE_DIR, _name), "app bin/" + _name)
     if not candidates:
-        raise RuntimeError("找不到固件。请按脚本头部五步流程构建载荷："
-                           "SW_VERSION_STR→1.1.2→Keil Rebuild APP→pack_image.py")
+        raise RuntimeError("firmware not found; build chain: SW_VERSION_STR -> "
+                           "Keil Rebuild qi_wireless_code_app -> pack_image.py")
     if EXPECTED_SW_VERSION:
         matched = []
         for path, tag in candidates:
@@ -175,111 +153,25 @@ def _pick_firmware():
         if not matched:
             raise RuntimeError(
                 "载荷选择 fail-closed：无任何候选 bin 版本==EXPECTED_SW_VERSION=%s"
-                "（旧版本残留绝不被选中）。请按脚本头部五步流程构建 1.1.2 载荷："
-                "用户侧 SW_VERSION_STR→QC_JYF_FW_1.1.2→Keil Rebuild APP→"
-                "pack_image.py（仓库固件保持 1.1.1 零触碰）" % EXPECTED_SW_VERSION)
+                "（旧版本残留绝不被选中）。构建链：用户侧 SW_VERSION_STR→目标"
+                "版本→Keil Rebuild qi_wireless_code_app→pack_image.py"
+                "（仓库固件保持 1.1.1 零触碰）" % EXPECTED_SW_VERSION)
         matched.sort(key=lambda t: t[0], reverse=True)
         _mt, path, tag = matched[0]
         _log("载荷选择：版本匹配 %s → %s（%s，mtime 最新）"
              % (EXPECTED_SW_VERSION, path, tag))
         return path
-    # EXPECTED 为空：维持旧语义（Keil 新 bin 优先，mtime 次序兜底）
-    keil = KEIL_BIN_A
-    if os.path.isfile(keil):
-        if (not os.path.isfile(packed_a)) or (os.path.getmtime(keil) >= os.path.getmtime(packed_a) - 1.0):
-            _log("使用 Keil slotA bin: " + keil)
-            return keil
-        _log("app_slot_a.bin 比 Keil bin 新，使用 " + packed_a)
-        return packed_a
-    if os.path.isfile(KEIL_BIN_B):
-        _log("使用 Keil slotB bin: " + KEIL_BIN_B)
-        return KEIL_BIN_B
-    if os.path.isfile(packed_b):
-        _log("固件 " + packed_b)
-        return packed_b
-    if os.path.isfile(packed_a):
-        _log("固件 " + packed_a)
-        return packed_a
-    raise RuntimeError("找不到固件。请编 Slot A/Slot B 或运行 pack_image.py")
-
-
-def _pick_firmware_for_slot(target_slot):
-    """按目标槽选固件：返回链接地址==target_slot 的最优候选路径，无匹配返回 None。
-    双 Target 编译后每个版本有两个 bin，此函数优先选地址天然匹配的，
-    免去 relocate_image_to_slot 的二进制重定位+重签开销。"""
-    candidates = []
-    seen = set()
-
-    def _add(path, tag):
-        ap = os.path.abspath(path)
-        if ap in seen or not os.path.isfile(path):
-            return
-        try:
-            if os.path.getsize(path) < IMAGE_HEADER_SIZE + 8:
-                return
-        except Exception:
-            return
-        seen.add(ap)
-        candidates.append((path, tag))
-
-    if target_slot == SLOT_B:
-        _add(KEIL_BIN_B, "Keil slotB bin")
-        _add(os.path.join(FIRMWARE_DIR, "app_slot_b.bin"), "app bin/app_slot_b.bin")
-    else:
-        _add(KEIL_BIN_A, "Keil slotA bin")
-        _add(os.path.join(FIRMWARE_DIR, "app_slot_a.bin"), "app bin/app_slot_a.bin")
-
-    if os.path.isdir(FIRMWARE_DIR):
-        for _name in sorted(os.listdir(FIRMWARE_DIR)):
-            if not _name.endswith(".bin"):
-                continue
-            path = os.path.join(FIRMWARE_DIR, _name)
-            try:
-                data = open(path, "rb").read()
-                if len(data) < IMAGE_HEADER_SIZE + 8:
-                    continue
-                if struct.unpack_from("<I", data, 0)[0] == IMAGE_MAGIC:
-                    reset = struct.unpack_from("<I", data, IMAGE_HEADER_SIZE + 4)[0] & 0xFFFFFFFE
-                else:
-                    reset = struct.unpack_from("<I", data, 4)[0] & 0xFFFFFFFE
-                a0 = SLOT_A_BASE + IMAGE_HEADER_SIZE
-                a1 = SLOT_A_BASE + SLOT_SIZE
-                b0 = SLOT_B_BASE + IMAGE_HEADER_SIZE
-                b1 = SLOT_B_BASE + SLOT_SIZE
-                if target_slot == SLOT_A and a0 <= reset < a1:
-                    _add(path, "app bin/" + _name)
-                elif target_slot == SLOT_B and b0 <= reset < b1:
-                    _add(path, "app bin/" + _name)
-            except Exception:
-                continue
-
-    if not candidates:
-        return None
-    if EXPECTED_SW_VERSION:
-        matched = []
-        for path, tag in candidates:
-            try:
-                ver = _extract_sw_version(open(path, "rb").read())
-            except Exception:
-                ver = None
-            _log("槽%s候选 %s（%s）strings 版本=%s" % (slot_name(target_slot), path, tag, ver or "未找到"))
-            if ver == EXPECTED_SW_VERSION:
-                matched.append((os.path.getmtime(path), path, tag))
-        if not matched:
-            return None
-        matched.sort(key=lambda t: t[0], reverse=True)
-        _mt, path, tag = matched[0]
-        _log("按目标槽 %s 选载荷: %s（%s，版本 %s 匹配，mtime 最新）"
-             % (slot_name(target_slot), path, tag, EXPECTED_SW_VERSION))
-        return path
     candidates.sort(key=lambda t: os.path.getmtime(t[0]), reverse=True)
     path, tag = candidates[0]
-    _log("按目标槽 %s 选载荷: %s（%s，mtime 最新）" % (slot_name(target_slot), path, tag))
+    _log("载荷选择（mtime 最新）：%s（%s）" % (path, tag))
     return path
 
 
+
+
+
 FIRMWARE_PATH = ""
-DOWNLOAD_ADDR = 0x08004000
+DOWNLOAD_ADDR = 0x08010000  # 0x34 target = Backup region (single-App arch)
 TRANSFER_BLOCK_DATA = 128
 
 UDS_REQ_ID = 0x18DA0D03
@@ -298,10 +190,19 @@ IMAGE_HEADER_SIZE = 256
 HDR_RESERVED_VER_OFF = 0x4C   # 原 version 字段起始偏移（保留占位区）
 HDR_RESERVED_VER_LEN = 16     # 保留占位区长度（=原 version 字段字节数）
 HDR_BUILD_TS_OFF     = 0x5C   # build_timestamp 偏移（紧随保留区之后，未变）
+# ---- Single-App partition constants (OTA-ARCH-0920; same-source with
+# ---- boot_metadata.h / ota_trigger.h) ----
+APP_BASE = 0x08004000
+APP_SIZE = 0xC000
+APP_ENTRY = 0x08004100
+BACKUP_BASE = 0x08010000
+BACKUP_SIZE = 0xC000
+DL_TARGET_BACKUP = 0x02
+# deprecated aliases kept so legacy helpers still compile
 SLOT_A, SLOT_B = 0, 1
-SLOT_A_BASE = 0x08004000
-SLOT_B_BASE = 0x08010000
-SLOT_SIZE = 0xC000
+SLOT_A_BASE = APP_BASE
+SLOT_B_BASE = BACKUP_BASE
+SLOT_SIZE = APP_SIZE
 MAX_TD_DATA = 254
 
 # SIT1145 Standby 唤醒标识帧：固件唤醒后约 100ms（CAN_LP_ANNOUNCE_DELAY_MS）
@@ -334,7 +235,7 @@ PROBE_ROUNDS = 3
 SAFE_MODE_RESP_ID = UDS_RESP_ID          # 0x18DA030D
 SAFE_MODE_MARKER = (0x62, 0x21, 0x13, 0xFE)  # UDS 载荷标记（不含 ISO-TP PCI）
 FAIL_STEP_DESC = {
-    0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
+    0: "未执行镜像校验（无待搬运固件且 App 区校验未跑）",
     1: "镜像 magic 校验失败",
     2: "image_length 为 0 或超出槽范围",
     3: "镜像 CRC32 校验失败",
@@ -703,33 +604,15 @@ def load_ec_private_key(path):
     raise ValueError("无法解析私钥: " + path)
 
 
-def image_target_slot(image):
-    if len(image) < IMAGE_HEADER_SIZE + 8:
-        return None
-    reset = struct.unpack_from("<I", image, IMAGE_HEADER_SIZE + 4)[0] & 0xFFFFFFFE
-    a0 = SLOT_A_BASE + IMAGE_HEADER_SIZE
-    a1 = SLOT_A_BASE + SLOT_SIZE
-    b0 = SLOT_B_BASE + IMAGE_HEADER_SIZE
-    b1 = SLOT_B_BASE + SLOT_SIZE
-    if a0 <= reset < a1:
-        return SLOT_A
-    if b0 <= reset < b1:
-        return SLOT_B
-    return None
-
-
 def slot_name(slot):
-    if slot == SLOT_A:
-        return "A"
-    if slot == SLOT_B:
-        return "B"
-    return "?"
+    """Diagnostic label (single-App arch): 0=App region, 1=Backup region."""
+    v = int(slot) & 0xFF if slot is not None else 0xFF
+    return {0: "App区", 1: "备份区"}.get(v, "未知(0x%02X)" % v)
 
 
 def slot_base(slot):
-    if slot == SLOT_B:
-        return SLOT_B_BASE
-    return SLOT_A_BASE
+    """Deprecated compat: single-App arch always runs from APP_BASE."""
+    return APP_BASE
 
 
 def validate_image(image):
@@ -741,27 +624,30 @@ def validate_image(image):
     expected = IMAGE_HEADER_SIZE + payload_len
     if expected != len(image):
         raise RuntimeError("镜像头 length=%d 与文件总长 %d 不一致" % (payload_len, len(image)))
-    if len(image) > SLOT_SIZE:
-        raise RuntimeError("镜像 %d 超过槽大小 %d (0x%X)" % (len(image), SLOT_SIZE, SLOT_SIZE))
-    linked = image_target_slot(image)
-    if linked is None:
-        reset = struct.unpack_from("<I", image, IMAGE_HEADER_SIZE + 4)[0]
-        raise RuntimeError("Reset Handler 0x%08X 不在 Slot A/B 内，请改 Target IROM1（A=0x08004100 / B=0x08010100）" % reset)
-    _log("镜像链接 Slot %s, 总长 %d" % (slot_name(linked), len(image)))
-    return linked
+    if len(image) > APP_SIZE:
+        raise RuntimeError("镜像 %d 超过 App 区大小 %d (0x%X)" % (len(image), APP_SIZE, APP_SIZE))
+    reset = struct.unpack_from("<I", image, IMAGE_HEADER_SIZE + 4)[0] & 0xFFFFFFFE
+    lo = APP_ENTRY
+    hi = APP_BASE + APP_SIZE
+    if not (lo <= reset < hi):
+        raise RuntimeError("Reset Handler 0x%08X 不在 App 窗口 [0x08004100, 0x08010000)，"
+                           "请改 Target IROM1=0x08004100" % reset)
+    _log("镜像校验通过：App 窗口链接，总长 %d（Backup 区暂存→BOOT 搬运）" % len(image))
+    return 0
 
 def _selfcheck_image(image, dest, what):
-    """重定位产物宿主自检（relocate_image_to_slot 返回前强制执行）：
+    """Packed-image host self-check (run before entering 0x34):
 
-    ① Reset handler 落目标槽窗口 [base+256, base+0xC000)——与 Boot
-       boot_verify.c step 4 同判据（fail_step=4 时 Boot 拒绝并回旧槽）；
-    ② payload CRC 与头 crc32 字段一致——与 Boot step 3 同判据
-       （fail_step=3）；
-    ③ 用 docs/keys/public.pem 对头签名做独立仿射验签——与 Boot step 6
-       同判据（fail_step=6）；验签实现刻意不复用 ecdsa_sign_msg 点运算
-       路径（SA 签名自检纪律，同一失效模式不能让签名与自检一起错）。
+    ① Reset handler inside the App run window [APP_BASE+256,
+       APP_BASE+APP_SIZE) — same criterion as Boot boot_verify_image
+       reset-window check (fail_step=4 rejects and BOOT skips copy);
+    ② payload CRC matches header crc32 — same as Boot fail_step=3;
+    ③ independent affine ECDSA verify with docs/keys/public.pem —
+       same as Boot fail_step=6; deliberately does NOT reuse the
+       ecdsa_sign_msg point arithmetic (signing and self-check must
+       not share a failure mode).
 
-    任一 FAIL → 抛错拒绝进入 0x34，日志含失败项。"""
+    Any FAIL -> raise, refusing to enter 0x34; log includes failures."""
     base = slot_base(dest)
     lo = base + IMAGE_HEADER_SIZE
     hi = base + SLOT_SIZE
@@ -799,51 +685,6 @@ def _selfcheck_image(image, dest, what):
          "签名独立验签通过" % (what, reset, slot_name(dest), hdr_crc))
 
 
-def relocate_image_to_slot(image, dest, priv):
-    """Move a Slot-A-linked (or B-linked) image onto dest and re-sign.
-
-    1.0 on A upgrading to 1.2 (also built as A) writes inactive B: every
-    Flash pointer in the payload is shifted by (B-A) and CRC/ECDSA redone.
-    返回前强制宿主自检（Reset 落位/CRC/独立验签，见 _selfcheck_image），
-    任一 FAIL 拒绝进入 0x34。"""
-    linked = image_target_slot(image)
-    if linked is None:
-        raise RuntimeError("无法识别镜像链接槽")
-    if dest == linked:
-        _log("镜像已按 Slot %s 链接，无需重定位" % slot_name(dest))
-        _selfcheck_image(image, dest, "镜像自检（未重定位）")
-        return image
-    delta = (slot_base(dest) - slot_base(linked)) & 0xFFFFFFFF
-    lo = slot_base(linked)
-    hi = lo + SLOT_SIZE
-    payload = bytearray(image[IMAGE_HEADER_SIZE:])
-    n = 0
-    i = 0
-    while i + 4 <= len(payload):
-        w = struct.unpack_from("<I", payload, i)[0]
-        raw = w & 0xFFFFFFFE
-        if lo <= raw < hi:
-            struct.pack_into("<I", payload, i, ((raw + delta) & 0xFFFFFFFE) | (w & 1))
-            n += 1
-        i += 4
-    payload = bytes(payload)
-    crc = zlib.crc32(payload) & 0xFFFFFFFF
-    sig = ecdsa_sign_msg(priv, payload)
-    # 0x4C..0x5C（16B）为保留占位区：原 version 字段已从 image_header_t 定义
-    # 删除（2026-09-18），该区固定填 0x00，偏移锁定不可回收。签名/CRC 只覆盖
-    # 头后 payload，保留区不参与任何校验；旧镜像头在此区的历史字节在此被清零。
-    hdr_reserved_ver = b"\x00" * HDR_RESERVED_VER_LEN
-    ts = image[HDR_BUILD_TS_OFF:HDR_BUILD_TS_OFF + 4]  # build_timestamp @0x5C（偏移未变）
-    header = struct.pack("<III", IMAGE_MAGIC, len(payload), crc) + sig + hdr_reserved_ver + ts
-    header += b"\x00" * (IMAGE_HEADER_SIZE - len(header))
-    out = header + payload
-    _log("镜像 Slot %s → Slot %s，重定位 %d 处地址 crc=0x%08X" % (
-        slot_name(linked), slot_name(dest), n, crc))
-    _selfcheck_image(out, dest, "重定位镜像自检")
-    return out
-
-
-
 def pack_image_if_needed(fw_path, priv):
     """必要时为裸 bin 补 XATO 头。0x4C 起 16B 为保留占位（原 version 字段，
     已从 image_header_t 定义删除），打包固定填 0x00，偏移锁定不可回收；
@@ -864,6 +705,7 @@ def pack_image_if_needed(fw_path, priv):
     header = struct.pack("<III", IMAGE_MAGIC, len(data), crc) + sig + hdr_reserved_ver + struct.pack("<I", int(time.time()) & 0xFFFFFFFF)
     header += b"\x00" * (IMAGE_HEADER_SIZE - len(header))
     _log("打包完成 crc=0x%08X（版本号不在镜像头，见固件 SW_VERSION_STR）" % crc)
+    _selfcheck_image(header + data, 0, "pack_image 打包自检")
     return header + data
 
 
@@ -1621,7 +1463,7 @@ def run_ota(bus_id):
             _log("版本感知：bin 版本与 EXPECTED_SW_VERSION=%s 一致，允许刷写"
                  % EXPECTED_SW_VERSION)
         image = pack_image_if_needed(FIRMWARE_PATH, priv)
-        linked = validate_image(image)
+        validate_image(image)
         want_ver = bin_ver or _extract_sw_version(image)
         expect_ver = EXPECTED_SW_VERSION or want_ver
         _log("镜像内 SW_VERSION_STR=%s；判定预期版本=%s（%s）" % (
@@ -1634,8 +1476,8 @@ def run_ota(bus_id):
                                "空片用 merge_prod_bin.py。" % PROBE_ROUNDS)
         _log("[人话] 设备应答正常，CAN 探测通过")
         from_slot = read_did_u8(bus_id, 0x2113)
-        _log("升级前运行槽 DID 0x2113=%s" % slot_name(from_slot))
-        # ---- B. 升级前基线确认（用户五步流程：基线=A 槽/1.1.1；提醒不拦截）----
+        _log("升级前 DID 0x2113=%s（0x00=App 区运行）" % _fmt_slot(from_slot))
+        # ---- pre-upgrade baseline check (single-App arch; warn-only) ----
         base_ver = None
         try:
             rxv = uds_req(bus_id, SID_RDBI, [0xF1, 0x95])
@@ -1643,18 +1485,16 @@ def run_ota(bus_id):
             base_ver = vb.split(b"\x00")[0].decode("ascii", "ignore").strip() or None
         except Exception as e:
             _log("[基线] 0xF195 读取失败（不拦截流程）: %s" % e)
-        if (from_slot == SLOT_A) and (base_ver == BASELINE_SW_VERSION):
-            _log("[基线] 设备基线：%s 槽 / %s，起点正确，开始升级"
-                 % (slot_name(from_slot), base_ver))
+        if base_ver == BASELINE_SW_VERSION:
+            _log("[基线] 设备基线：App 区 / %s，起点正确，开始升级" % base_ver)
         else:
-            _log("[基线] ！！！！！ 基线异常提醒 ！！！！！ 设备当前：%s 槽 / %s"
-                 % (slot_name(from_slot), base_ver or "未读到"))
-            _log("[基线] 用户流程预期起点=%s 槽 / %s（①烧录 boot+slotA 1.1.1 "
-                 "基线后再跑升级）；基线不符不拦截执行（升级仍写非活跃槽），"
-                 "请自行确认烧录基线是否正确" % (slot_name(SLOT_A), BASELINE_SW_VERSION))
-        _log("镜像链接 Slot %s；将写入非活跃槽（必要时重定位）" % slot_name(linked))
-        _log("在 APP 内升级（31/34/36/37）；新固件 0x37 成功后自复位切槽，"
-             "11 01 为旧 APP 兼容与补发手段")
+            _log("[基线] ！！！！！ 基线异常提醒 ！！！！！ 设备当前版本=%s"
+                 % (base_ver or "未读到"))
+            _log("[基线] 预期起点=App 区 / %s（①烧录 boot+App 完整固件基线后"
+                 "再升级）；基线不符不拦截执行，请自行确认烧录基线"
+                 % BASELINE_SW_VERSION)
+        _log("单 App 升级流：31/34/36 写 Backup 区 0x08010000 → 0x37 验签提交后"
+             "设备自复位 → BOOT 搬运 Backup→App（擦 App 区→复制→复核→清标志→跳转）")
         _log("---- Programming ----")
         last_err = None
         for attempt in range(1, 9):
@@ -1702,38 +1542,19 @@ def run_ota(bus_id):
             send_security_key(bus_id, sig, seed=seed, priv=priv)
         _log("---- DID 0x2010 APP ----")
         uds_req(bus_id, SID_WDBI, [0x20, 0x10, 0x01])
-        _log("---- 擦除 ----")
+        _log("---- 擦除 Backup 区（0x08010000~0x0801BFFF）----")
         _erase_with_retry(bus_id)
-        # 目标槽 = 运行槽取反（固件擦除目标 inactive_slot()=PC 推导运行槽
-        # 取反，ota_download.c）；DID 0x2114 仅交叉校验（擦除后 RAM 标志，
-        # 读失败/不一致不影响重定位方向）。
-        if from_slot not in (SLOT_A, SLOT_B):
-            raise RuntimeError("升级前 DID 0x2113 槽号无效: %d" % from_slot)
-        dest = SLOT_B if from_slot == SLOT_A else SLOT_A
         try:
             did_dest = read_did_u8(bus_id, 0x2114)
-            _log("擦除目标 Slot %s（对面槽；DID 0x2114=%s）" % (
-                slot_name(dest), slot_name(did_dest)))
-            if did_dest != dest:
-                _log("警告: DID 0x2114=%s 与对面槽 %s 不一致，按对面槽重定位"
-                     "（固件擦除目标=inactive_slot()=运行槽取反）" % (
-                         slot_name(did_dest), slot_name(dest)))
+            _log("DID 0x2114=0x%02X（0x02=Backup 区标记）" % did_dest)
+            if did_dest != DL_TARGET_BACKUP:
+                _log("警告: DID 0x2114=0x%02X ≠ 0x02（Backup 区标记），继续下载"
+                     % did_dest)
         except Exception as e:
-            _log("DID 0x2114 读失败（%s），按对面槽 %s 重定位" % (e, slot_name(dest)))
-        # 双 Target：优先选链接地址==目标槽的 bin，免去重定位+重签
-        if linked != dest:
-            alt_path = _pick_firmware_for_slot(dest)
-            if alt_path and os.path.abspath(alt_path) != os.path.abspath(FIRMWARE_PATH):
-                _log("目标槽 %s 有地址匹配的载荷 %s，替换当前 %s" % (
-                    slot_name(dest), alt_path, FIRMWARE_PATH))
-                FIRMWARE_PATH = alt_path
-                image = pack_image_if_needed(FIRMWARE_PATH, priv)
-                linked = validate_image(image)
-        image = relocate_image_to_slot(image, dest, priv)
+            _log("DID 0x2114 读失败（%s），继续下载" % e)
         size = len(image)
-        addr_val = slot_base(dest)
-        if DOWNLOAD_ADDR != addr_val:
-            _log("0x34 地址用槽基址 0x%08X（配置 DOWNLOAD_ADDR=0x%08X 已忽略）" % (addr_val, DOWNLOAD_ADDR))
+        addr_val = BACKUP_BASE
+        _log("[人话] 固件写入 Backup 区 0x08010000；0x37 提交后 BOOT 搬运到 App 区")
         sz = [(size >> 24) & 0xFF, (size >> 16) & 0xFF, (size >> 8) & 0xFF, size & 0xFF]
         addr = [(addr_val >> 24) & 0xFF, (addr_val >> 16) & 0xFF,
                 (addr_val >> 8) & 0xFF, addr_val & 0xFF]
@@ -1779,40 +1600,33 @@ def run_ota(bus_id):
         if last_err is not None:
             if isinstance(last_err, UdsNrcError):
                 if last_err.nrc == 0x22:
-                    qs = _read_did_u8_safe(bus_id, 0x2113)
-                    if qs == dest:
-                        otx_anomaly = True
-                        _log("0x37 重试收 NRC 0x22 但 0x2113=%s 已是目标槽——设备已"
-                             "自复位并切槽（应答丢失形态），继续三条件判定"
-                             % slot_name(qs))
-                    else:
-                        raise RuntimeError(
-                            "0x37 TransferExit 被固件拒绝：%s（NRC 0x22=条件不正确："
-                            "会话丢失或设备已重启；0x2113 探测=%s）。若设备已自复位"
-                            "但探测不到，请断电重启后读 0xF195/0x2113 核对升级结果"
-                            % (last_err, _fmt_slot(qs)))
+                    # post-commit self-reset makes retries land on the new APP
+                    # (default session -> NRC 0x22): transport anomaly only;
+                    # final verdict belongs to the post-reset window
+                    otx_anomaly = True
+                    _log("0x37 重试收 NRC 0x22（会话丢失或设备已自复位）——"
+                         "交给复位后版本核验判定")
                 else:
                     raise RuntimeError(
-                        "0x37 TransferExit 被固件拒绝：%s。0x37 失败 NRC 语义："
-                        "0x72=verify/commit_trial 失败（镜像校验/提交环节，metadata "
-                        "未提交、切槽必败，见 ota_download.c ota_dl_poll）；"
+                        "0x37 TransferExit 被固件拒绝：%s。NRC 语义："
+                        "0x72=verify/commit_backup 失败（Backup 区校验/提交环节，"
+                        "flag 未落盘，搬运不会发生，见 ota_download.c ota_dl_poll）；"
                         "0x22=条件不正确（会话丢失/设备已重启）；0x24=请求序错误；"
-                        "0x13=消息长度错；0x33=安全未解锁；0x71=传输中止/字节不符。"
-                        "固件 0x37 路径实发 0x22/0x33/0x71/0x72，其余按上表判读"
+                        "0x13=消息长度错；0x33=安全未解锁；0x71=传输中止/字节不符"
                         % last_err)
             else:
                 otx_anomaly = True
-                _log("0x37 五次均无最终应答（%s）。新固件 0x37 收尾 77 后即自复位，"
-                     "应答丢失属可能形态；切槽/版本三条件闭环将给出最终判定" % last_err)
+                _log("0x37 五次均无最终应答（%s）。设备 0x37 收尾 77 后即自复位，"
+                     "应答丢失属可能形态；复位后版本核验将给出最终判定" % last_err)
         if last_err is None:
-            _log("[人话] 固件数据已全部写入 %s 槽，设备校验提交成功（0x37 已确认），"
-                 "即将自动重启切换" % slot_name(dest))
+            _log("[人话] 固件已写入 Backup 区并校验提交（0x37 已确认），"
+                 "设备自复位后 BOOT 开始搬运")
         else:
             _log("[人话] 数据传输结束但 0x37 应答异常（详见上方技术日志）；"
-                 "是否提交成功以重启后三条件判定为准")
+                 "是否提交成功以复位后版本核验为准")
         _log("---- Reset ----")
         uds_ecu_reset(bus_id)
-        _log("[人话] 已发送重启指令，等待设备重启后回报槽位与版本…")
+        _log("[人话] 已发送重启指令；BOOT 搬运 Backup→App 约需数秒，等待设备回报…")
         t0 = time.time()
         while time.time() - t0 < 2.0:
             if stopTask:
@@ -1820,58 +1634,30 @@ def run_ota(bus_id):
             time.sleep(0.05)
         to_slot, got_ver = confirm_app_after_reset(bus_id)
 
-        # ---- 复位未生效检测与一次自动补发（P2）----
-        # 指纹：0x2113 仍=升级前槽 且 0x2114==目标槽（metadata trial PENDING
-        # 已在 commit_trial 先备后主落盘，但设备从未复位走 Boot 试运行）
-        # ——11 01 投递丢失/被吞的典型形态（取证报告 §3 M4'）。
-        resend_done = False
-        if to_slot == from_slot:
-            pend = _read_did_u8_safe(bus_id, 0x2114)
-            if pend == dest:
-                resend_done = True
-                _log("判定：复位未生效——0x2113=%s 未变而 0x2114=%s（=目标槽，"
-                     "trial PENDING 已落盘）→ 自动补发 11 01 一次"
-                     % (slot_name(to_slot), slot_name(pend)))
-                try:
-                    uds_req(bus_id, SID_ER, [0x01])
-                    _log("补发 11 01 已收到 51 01")
-                except Exception as e:
-                    _log("补发 11 01 无应答: %s（继续复位确认窗口）" % e)
-                t0 = time.time()
-                while time.time() - t0 < 2.0:
-                    if stopTask:
-                        raise RuntimeError("用户停止脚本")
-                    time.sleep(0.05)
-                to_slot, got_ver = confirm_app_after_reset(bus_id)
-
-        _log("[人话] 重启后设备回报：运行槽=%s，版本=%s；开始最终判定…"
-             % (slot_name(to_slot), got_ver or "未读到"))
-        # ---- 判定闭环（P1）：三条件缺一不可 ----
-        # ① 复位后 APP 应答（confirm_app_after_reset 不抛异常即满足）
-        # ② 0x2113 == 目标槽 dest
-        # ③ 0xF195 == 预期版本（EXPECTED_SW_VERSION 配置，缺省=镜像 strings）
+        _log("[人话] 重启后设备回报：0x2113=%s（0x00=App 区运行），版本=%s；"
+             "开始最终判定…" % (_fmt_slot(to_slot), got_ver or "未读到"))
+        # ---- verdict closed loop (single-App arch) ----
+        # 1) APP responds after reset (confirm_app_after_reset did not raise)
+        # 2) 0xF195 == EXPECTED_SW_VERSION (backup->App copy + jump happened)
+        # 3) 0x2113 informational: single-App architecture answers 0x00
         problems = []
-        if resend_done and to_slot == from_slot:
-            problems.append("复位未生效且自动补发 11 01 无效——请断电重启后重跑本脚本"
-                            "（断电重启即触发 Boot 处理 trial PENDING 切槽）")
-        if to_slot != dest:
-            problems.append("切槽未生效：0x2113=%s，目标槽=%s（升级前=%s）"
-                            % (_fmt_slot(to_slot), slot_name(dest), slot_name(from_slot)))
         if not expect_ver:
             problems.append("预期版本不可用：EXPECTED_SW_VERSION 未设置且镜像内未找到"
                             " QC_JYF_FW_ 版本串——请在脚本 EXPECTED_SW_VERSION 配置"
                             "目标版本后重跑")
         elif got_ver != expect_ver:
-            problems.append("版本不符：0xF195=%s，预期=%s"
+            problems.append("版本不符：0xF195=%s，预期=%s（Backup→App 搬运未生效"
+                            "或载荷错误——查看 Boot 诊断帧 M1~M4 与 copy_retry）"
                             % (got_ver or "未读到", expect_ver))
+        if to_slot is not None and to_slot != 0:
+            problems.append("异常：0x2113=0x%02X（单 App 架构应恒为 0x00=App 区）"
+                            % (to_slot & 0xFF))
         if problems:
-            _raise_ota_fail(bus_id, from_slot, dest, to_slot, got_ver, expect_ver,
-                            problems, otx_anomaly)
-        _log("判定闭环三条件全部满足：① 复位后 APP 应答（22 2113/0x34 正常）；"
-             "② 0x2113=%s==目标槽 %s；③ 0xF195=%s==预期版本 %s" % (
-                 slot_name(to_slot), slot_name(dest), got_ver, expect_ver))
-        _log("[人话] 升级成功：设备已运行 %s 槽 / %s（三条件全部满足）"
-             % (slot_name(to_slot), got_ver))
+            _raise_ota_fail(bus_id, 0, DL_TARGET_BACKUP, to_slot, got_ver,
+                            expect_ver, problems, otx_anomaly)
+        _log("判定闭环满足：① 复位后 APP 应答；② 0xF195=%s==预期版本 %s；"
+             "0x2113=%s（0x00=App 区）" % (got_ver, expect_ver, _fmt_slot(to_slot)))
+        _log("[人话] 升级成功：设备已运行 App 区 / %s（Boot 搬运完成）" % got_ver)
         _log("======== OTA 成功 ========")
     finally:
         zcanpro.uds_deinit()

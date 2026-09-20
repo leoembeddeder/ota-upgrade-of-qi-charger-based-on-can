@@ -1,29 +1,18 @@
 /**
-  **************************************************************************
-  * @file     main.c
-  * @brief    Bootloader main program for QI Charger OTA upgrade
-  **************************************************************************
-  *
-  * Copyright (c) 2025, Artery Technology, All rights reserved.
-  *
-  * The software Board Support Package (BSP) that is made available to
-  * download from Artery official website is the copyrighted work of Artery.
-  * Artery authorizes customers to use, copy, and distribute the BSP
-  * software and its related documentation for the purpose of design and
-  * development in conjunction with Artery microcontrollers. Use of the
-  * software is governed by this copyright notice and the following disclaimer.
-  *
-  * THIS SOFTWARE IS PROVIDED ON "AS IS" BASIS WITHOUT WARRANTIES,
-  * GUARANTEES OR REPRESENTATIONS OF ANY KIND. ARTERY EXPRESSLY DISCLAIMS,
-  * TO THE FULLEST EXTENT PERMITTED BY LAW, ALL EXPRESS, IMPLIED OR
-  * STATUTORY OR OTHER WARRANTIES, GUARANTEES OR REPRESENTATIONS,
-  * INCLUDING BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY,
-  * FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT.
-  *
-  **************************************************************************
-  */
+ **************************************************************************
+ * @file     main.c
+ * @brief    Bootloader main: backup->App copy + jump (OTA-ARCH-0920)
+ **************************************************************************
+ *
+ * Boot sequence (single-App architecture, A/B slots removed):
+ *   1. system clock + timer + diag CAN init
+ *   2. load OTA metadata (dual-copy, CRC checked)
+ *   3. if backup_valid flag set -> copy Backup region to App region
+ *      (idempotent: flag cleared only after re-verify passes)
+ *   4. verify App region image; on success jump to 0x08004100
+ *   5. otherwise enter safe mode (CAN diagnostic frames)
+ */
 
-/* includes ------------------------------------------------------------------*/
 #include "at32f422_426_clock.h"
 #include "at32f422_426_conf.h"
 #include "timer_drv.h"
@@ -32,90 +21,50 @@
 #include "boot_trial.h"
 #include "boot_jump.h"
 
-/* exported functions --------------------------------------------------------*/
-
-/**
- * @brief  bootloader main entry point
- * @note   boot sequence:
- *         1. system clock configuration
- *         2. initialize timer
- *         3. load OTA metadata
- *         4. detect boot reason
- *         5. process trial boot state machine
- *         6. select and verify boot slot
- *         7. jump to application or enter safe mode
- * @param  none
- * @retval none (should never return)
- */
 int main(void)
 {
-  uint8_t boot_slot;
-  uint8_t other_slot;
-  int8_t  boot_result;
+  int8_t copy_rc;
 
-  /* step 1: configure system clock (180MHz from HEXT via PLL) */
+  /* step 1: clocks + drivers */
   system_clock_config();
   nvic_priority_group_config(NVIC_PRIORITY_GROUP_4);
-
-  /* step 2: initialize drivers */
   timer_drv_init();
-
-  /* Boot 诊断版（观察不干预）：CAN 标记帧能力提前初始化——原首次调用在
-   * enter_safe_mode 内，M1~M4 在此之前发不出去。影响面：仅 CAN1/GPIOA/
-   * GPIOB/SPI1 时钟引脚+SIT1145 Normal（can_driver_init 自含 sit1145_init），
-   * 与决策链（flash 读写/CRC/ECDSA）零交集；发送 polling 有界（每帧 ≤3ms，
-   * 总线挂死即弃帧，不影响开机）。enter_safe_mode 内既有调用保留不变。 */
   boot_diag_can_init();
 
-  /* step 3: load and validate OTA metadata */
+  /* step 2: metadata (primary -> backup -> defaults) + boot reason */
   boot_metadata_init(&g_meta);
-
-  /* step 4: detect and record boot reason */
   g_meta.last_boot_reason = detect_boot_reason();
 
-  /* Download is APP-only. Boot only selects a slot and jumps.
-   * ota_state=DOWNLOADING is ignored (legacy metadata). */
-
-  /* step 5: process trial boot state machine */
-  process_trial_state(&g_meta);
-
-  /* step 6: PENDING/ACTIVE → trial_slot, else active_slot */
-  if (select_boot_slot(&g_meta, &boot_slot) != 0)
+  /* step 3: pending backup -> copy into App region */
+  if (boot_backup_pending(&g_meta))
   {
-    /* cause 0x01: metadata 无有效 active/trial 槽，镜像校验未执行 */
-    enter_safe_mode(0x01U);
-  }
-
-  /* trial 10s window is enforced in APP (ota_trial_poll). */
-
-  /* step 7: verify then jump. Jump does not return, so save rollback
-   * metadata before jumping to the fallback slot. */
-  boot_result = try_boot_slot(boot_slot, &g_meta);
-  if (boot_result == 0)
-  {
-    boot_jump_to_app(boot_metadata_slot_addr(boot_slot) + IMAGE_HEADER_SIZE);
-  }
-
-  other_slot = (boot_slot == SLOT_A) ? SLOT_B : SLOT_A;
-  boot_result = try_boot_slot(other_slot, &g_meta);
-  if (boot_result == 0)
-  {
-    if (g_meta.trial_state == TRIAL_STATE_ACTIVE)
+    g_meta.last_boot_reason = BOOT_REASON_OTA_ACT;
+    boot_diag_m2(0U, 0U); /* copy sequence starting */
+    copy_rc = boot_copy_backup(&g_meta);
+    if (copy_rc == 0)
     {
-      g_meta.trial_state       = TRIAL_STATE_IDLE;
-      g_meta.pending_slot      = SLOT_NONE;
-      g_meta.trial_retry_count = 0U;
-      g_meta.rollback_count++;
-      g_meta.last_boot_reason  = BOOT_REASON_ROLLBACK;
+      boot_diag_m2(1U, 0U); /* copy committed */
     }
-    g_meta.active_slot = other_slot;
-    (void)boot_metadata_save(&g_meta);
-    boot_jump_to_app(boot_metadata_slot_addr(other_slot) + IMAGE_HEADER_SIZE);
+    else
+    {
+      /* flag left set -> retry next boot; try current App image anyway */
+      boot_diag_m2(0xFFU, g_meta.reserved_trial[META_COPY_FAIL_STEP_OFF]);
+    }
+  }
+  else
+  {
+    boot_diag_m2(0U, 0xFFU); /* no pending copy */
   }
 
-  /* cause 0x02: 双槽镜像校验/向量检查均失败，g_verify_fail_step 现场
-   * 已由 enter_safe_mode 落盘到 reserved 字段并在 CAN 标记帧中上报 */
-  enter_safe_mode(0x02U);
+  /* step 4: verify App region and jump */
+  if (boot_app_image_ok() == 0)
+  {
+    boot_jump_to_app(APP_ENTRY_ADDR); /* does not return */
+  }
+
+  /* step 5: no bootable App image */
+  enter_safe_mode(g_meta.reserved_trial[META_COPY_FAIL_STEP_OFF] != 0U ?
+                  0x03U : 0x02U);
   while (1)
   {
     __NOP();

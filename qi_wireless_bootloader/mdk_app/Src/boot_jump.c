@@ -55,7 +55,7 @@ int8_t boot_jump_vectors_ok(uint32_t app_addr)
   }
   /* Reset must live in this slot's code window, not the link-time slot. */
   if ((reset_fn < app_addr) ||
-      (reset_fn >= (app_addr + (APP_A_SIZE - IMAGE_HEADER_SIZE))))
+      (reset_fn >= (app_addr + (APP_SIZE - IMAGE_HEADER_SIZE))))
   {
     return -1;
   }

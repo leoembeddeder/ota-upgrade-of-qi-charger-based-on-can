@@ -29,10 +29,10 @@ CAN 标记帧（ID=0x18FF480D）→ 逐帧人话解码 → 决策链串联摘要
   决策链摘要 + 一致性对照。
 
 解码表与 60d1137 终审规格逐字节一致（boot_safe_mode.h BOOT_DIAG 注释）：
-  M1 0xA1: [active_slot][meta_src][magic_ok][ver_ok][crc_ok]
-  M2 0xA2: [slot][ret]
-  M3 0xA3: [pass][fail_step][slot]
-  M4 0xA4: [app_addr LE 4B]
+  M1 0xA1: [app_valid][meta_src][magic_ok][ver_ok][crc_ok]
+  M2 0xA2: [copy result][detail]
+  M3 0xA3: [pass][fail_step][target 0=Backup/1=App]
+  M4 0xA4: [app_addr LE 4B] (App entry 0x08004100)
   帧格式：DLC=8，[标记 0xA1~0xA4][数据...][0xCC 填充]。
 
 本脚本为独立诊断工具：不签名、不写设备、无私钥/固件路径引用；
@@ -115,7 +115,9 @@ def _pad8(data):
 
 
 def _slot_name(v):
-    return {0: "A", 1: "B"}.get(int(v) & 0xFF, "未知(0x%02X)" % (int(v) & 0xFF))
+    """Region label (single-App arch): 0=App region, 1=Backup region."""
+    return {0: "App区", 1: "备份区"}.get(int(v) & 0xFF,
+                                     "未知(0x%02X)" % (int(v) & 0xFF))
 
 
 def _bool1(v):
@@ -130,9 +132,9 @@ def _bool1(v):
 def _addr_target(addr):
     a = int(addr) & 0xFFFFFFFF
     if a == 0x08004100:
-        return "A槽"
+        return "App区"
     if a == 0x08010100:
-        return "B槽"
+        return "历史B槽地址(已废弃)"
     return "非标准目标(0x%08X)" % a
 
 
@@ -152,16 +154,16 @@ def parse_diag_frame(data):
     if m == 0xA1:
         if len(b) < 6:
             return {"marker": 0xA1, "raw": b, "error": "M1 帧长度不足6"}
-        return {"marker": 0xA1, "active_slot": b[1], "meta_src": b[2],
+        return {"marker": 0xA1, "app_valid": b[1], "meta_src": b[2],
                 "magic_ok": b[3], "ver_ok": b[4], "crc_ok": b[5]}
     if m == 0xA2:
         if len(b) < 3:
             return {"marker": 0xA2, "raw": b, "error": "M2 帧长度不足3"}
-        return {"marker": 0xA2, "slot": b[1], "ret": b[2]}
+        return {"marker": 0xA2, "info": b[1], "ret": b[2]}
     if m == 0xA3:
         if len(b) < 4:
             return {"marker": 0xA3, "raw": b, "error": "M3 帧长度不足4"}
-        return {"marker": 0xA3, "passed": b[1], "fail_step": b[2], "slot": b[3]}
+        return {"marker": 0xA3, "passed": b[1], "fail_step": b[2], "target": b[3]}
     if m == 0xA4:
         if len(b) < 5:
             return {"marker": 0xA4, "raw": b, "error": "M4 帧长度不足5"}
@@ -179,22 +181,29 @@ def decode_diag_frame(data):
         return "[诊断] %s（原始：%s）" % (p["error"], _hex(p.get("raw", [])))
     m = p["marker"]
     if m == 0xA1:
-        return ("[诊断] M1 metadata读取：active=%s；来源=%s；magic=%s 版本=%s CRC=%s"
-                % (_slot_name(p["active_slot"]),
+        return ("[诊断] M1 metadata读取：app_valid=%s；来源=%s；magic=%s 版本=%s CRC=%s"
+                % (_bool1(p["app_valid"]),
                    META_SRC.get(p["meta_src"], "未知(0x%02X)" % p["meta_src"]),
                    _bool1(p["magic_ok"]), _bool1(p["ver_ok"]), _bool1(p["crc_ok"])))
     if m == 0xA2:
-        if p["ret"] == 0:
-            return "[诊断] M2 选槽结果：选中=%s" % _slot_name(p["slot"])
-        return ("[诊断] M2 选槽结果：失败(ret=0x%02X→safe mode路径)；"
-                "metadata槽字段原值=%s" % (p["ret"], _slot_name(p["slot"])))
+        if p["ret"] == 1:
+            return "[诊断] M2 搬运结果：成功（Backup→App 已提交）"
+        if p["ret"] == 0xFF:
+            return ("[诊断] M2 搬运结果：失败 detail=0x%02X（flag 保留，下轮开机重试）"
+                    % p["info"])
+        if p["info"] == 0xFF:
+            return "[诊断] M2 搬运结果：无待搬运固件"
+        return "[诊断] M2 搬运序列开始"
     if m == 0xA3:
+        target = {0: "Backup区(源)", 1: "App区"}.get(p["target"],
+                                                     "未知(0x%02X)" % p["target"])
+        if p["fail_step"] == 0xFF:
+            return "[诊断] M3 验签开始：目标=%s" % target
         if p["passed"]:
-            return "[诊断] M3 验签：通过 槽=%s" % _slot_name(p["slot"])
-        return ("[诊断] M3 验签：失败 关卡%d(%s) 槽=%s"
+            return "[诊断] M3 验签：通过 目标=%s" % target
+        return ("[诊断] M3 验签：失败 关卡%d(%s) 目标=%s"
                 % (p["fail_step"],
-                   FAIL_STEP.get(p["fail_step"], "未知关卡"),
-                   _slot_name(p["slot"])))
+                   FAIL_STEP.get(p["fail_step"], "未知关卡"), target))
     if m == 0xA4:
         return "[诊断] M4 跳转目标：0x%08X→%s" % (p["addr"], _addr_target(p["addr"]))
     return "[诊断] 未知标记 0x%02X" % m
@@ -283,25 +292,34 @@ def summarize_chain(parsed_frames, pre, post):
     m4 = next((p for p in parsed_frames if p and p.get("marker") == 0xA4 and "error" not in p), None)
 
     if m1:
-        s1 = "读记录=active%s(%s,校验magic:%s/ver:%s/crc:%s)" % (
-            _slot_name(m1["active_slot"]),
+        s1 = "读记录=app_valid=%s(%s,magic:%s/ver:%s/crc:%s)" % (
+            _bool1(m1["app_valid"]),
             META_SRC.get(m1["meta_src"], "src=0x%02X" % m1["meta_src"]),
             _bool1(m1["magic_ok"]), _bool1(m1["ver_ok"]), _bool1(m1["crc_ok"]))
     else:
         s1 = "读记录=无M1帧"
     if m2:
-        s2 = "选槽=%s" % (_slot_name(m2["slot"]) if m2["ret"] == 0
-                          else "失败(ret=0x%02X,槽字段=%s)" % (m2["ret"], _slot_name(m2["slot"])))
+        if m2["ret"] == 1:
+            s2 = "搬运=成功"
+        elif m2["ret"] == 0xFF:
+            s2 = "搬运=失败(detail=0x%02X)" % m2["info"]
+        elif m2["info"] == 0xFF:
+            s2 = "搬运=无待搬运固件"
+        else:
+            s2 = "搬运=序列开始"
     else:
-        s2 = "选槽=无M2帧"
+        s2 = "搬运=无M2帧"
     if m3s:
         parts = []
         for p in m3s:
-            if p["passed"]:
-                parts.append("%s槽通过" % _slot_name(p["slot"]))
+            target = {0: "Backup", 1: "App"}.get(p["target"], "0x%02X" % p["target"])
+            if p["fail_step"] == 0xFF:
+                parts.append("%s验签中" % target)
+            elif p["passed"]:
+                parts.append("%s通过" % target)
             else:
-                parts.append("%s槽失败(关卡%d:%s)" % (
-                    _slot_name(p["slot"]), p["fail_step"],
+                parts.append("%s失败(关卡%d:%s)" % (
+                    target, p["fail_step"],
                     FAIL_STEP.get(p["fail_step"], "未知")))
         s3 = "验签=" + "；".join(parts)
     else:
@@ -749,26 +767,37 @@ def _selftest():
                   and ("零帧≠决策证据" in h4), h4))
 
     # ---- 解码/摘要回归（保留）----
-    dcheck("M1 正常", [0xA1, 0x01, 0x00, 0x01, 0x01, 0x01, 0xCC, 0xCC],
-           "M1 metadata读取：active=B；来源=主区0x0801C000生效")
-    dcheck("M2 成功选B", [0xA2, 0x01, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC],
-           "M2 选槽结果：选中=B")
-    dcheck("M3 失败关卡6", [0xA3, 0x00, 0x06, 0x01, 0xCC, 0xCC, 0xCC, 0xCC],
-           "M3 验签：失败 关卡6(ECDSA签名失败) 槽=B")
-    dcheck("M4 跳B", [0xA4, 0x00, 0x01, 0x01, 0x08, 0xCC, 0xCC, 0xCC],
-           "M4 跳转目标：0x08010100→B槽")
-    dcheck("空帧", [], "无法解码")
+    dcheck("M1 app_valid", [0xA1, 0x01, 0x00, 0x01, 0x01, 0x01, 0xCC, 0xCC],
+           "M1 metadata读取：app_valid=过；来源=主区0x0801C000生效")
+    dcheck("M2 copy ok", [0xA2, 0x00, 0x01, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC],
+           "M2 搬运结果：成功（Backup→App 已提交）")
+    dcheck("M2 not pending", [0xA2, 0xFF, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC],
+           "M2 搬运结果：无待搬运固件")
+    dcheck("M2 copy fail", [0xA2, 0x03, 0xFF, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC],
+           "M2 搬运结果：失败 detail=0x03")
+    dcheck("M3 backup verify pass", [0xA3, 0x01, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC],
+           "M3 验签：通过 目标=Backup区(源)")
+    dcheck("M3 app verify fail ECDSA", [0xA3, 0x00, 0x06, 0x01, 0xCC, 0xCC, 0xCC, 0xCC],
+           "M3 验签：失败 关卡6(ECDSA签名失败) 目标=App区")
+    dcheck("M3 verify start marker", [0xA3, 0x00, 0xFF, 0x01, 0xCC, 0xCC, 0xCC, 0xCC],
+           "M3 验签开始：目标=App区")
+    dcheck("M4 app entry", [0xA4, 0x00, 0x41, 0x00, 0x08, 0xCC, 0xCC, 0xCC],
+           "M4 跳转目标：0x08004100→App区")
+    dcheck("empty frame", [], "无法解码")
+
     ok_chain = [parse_diag_frame(f) for f in (
-        [0xA1, 0x00, 0x00, 0x01, 0x01, 0x01, 0xCC, 0xCC],
-        [0xA2, 0x01, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC],
+        [0xA1, 0x01, 0x00, 0x01, 0x01, 0x01, 0xCC, 0xCC],
+        [0xA2, 0x00, 0x01, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC],
+        [0xA3, 0x01, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC],
         [0xA3, 0x01, 0x00, 0x01, 0xCC, 0xCC, 0xCC, 0xCC],
-        [0xA4, 0x00, 0x01, 0x01, 0x08, 0xCC, 0xCC, 0xCC])]
-    lines = summarize_chain(ok_chain, (0, "QC_JYF_FW_1.1.1"), (1, "QC_JYF_FW_1.1.2"))
-    cases.append(("摘要回归：正常链一致", any("一致（" in l for l in lines),
-                  " | ".join(lines)))
+        [0xA4, 0x00, 0x41, 0x00, 0x08, 0xCC, 0xCC, 0xCC])]
+    lines = summarize_chain(ok_chain, (0, "QC_JYF_FW_1.1.1"), (0, "QC_JYF_FW_1.1.2"))
+    cases.append(("chain summary single-App",
+                  any("实跳=0x08004100(App区)" in l for l in lines)
+                  and any("一致（" in l for l in lines), " | ".join(lines)))
 
     passed = sum(1 for c in cases if c[1])
-    print("=== zcanpro_boot_diag_capture 通信层v2 合成流自测 ===")
+    print("=== zcanpro_boot_diag_capture single-App decode self-test ===")
     for name, ok, s in cases:
         print("[%s] %s\n        → %s" % ("PASS" if ok else "FAIL", name, s))
     print("=== 自测结果：%s（%d/%d 通过）==="

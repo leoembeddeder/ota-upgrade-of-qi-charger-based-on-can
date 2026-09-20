@@ -1,47 +1,28 @@
 /**
-  **************************************************************************
-  * @file     boot_trial.c
-  * @brief    Trial boot state machine implementation
-  **************************************************************************
-  *
-  * Copyright (c) 2025, Artery Technology, All rights reserved.
-  *
-  * The software Board Support Package (BSP) that is made available to
-  * download from Artery official website is the copyrighted work of Artery.
-  * Artery authorizes customers to use, copy, and distribute the BSP
-  * software and its related documentation for the purpose of design and
-  * development in conjunction with Artery microcontrollers. Use of the
-  * software is governed by this copyright notice and the following disclaimer.
-  *
-  * THIS SOFTWARE IS PROVIDED ON "AS IS" BASIS WITHOUT WARRANTIES,
-  * GUARANTEES OR REPRESENTATIONS OF ANY KIND. ARTERY EXPRESSLY DISCLAIMS,
-  * TO THE FULLEST EXTENT PERMITTED BY LAW, ALL EXPRESS, IMPLIED OR
-  * STATUTORY OR OTHER WARRANTIES, GUARANTEES OR REPRESENTATIONS,
-  * INCLUDING BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY,
-  * FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT.
-  *
-  **************************************************************************
-  */
+ **************************************************************************
+ * @file     boot_trial.c
+ * @brief    Backup->App copy engine + boot decision (OTA-ARCH-0920)
+ **************************************************************************
+ *
+ * Single-App OTA: APP streams new firmware into the Backup region and
+ * sets meta.backup_valid; this file (Boot side) performs the physical
+ * copy Backup -> App. An APP cannot erase the flash region it executes
+ * from, so the copy must happen here, before jumping.
+ *
+ * Power-loss idempotence: backup_valid is cleared only AFTER the copied
+ * image re-verifies in the App region. Interruptions at any point leave
+ * the flag set; the next power-on re-runs the whole sequence.
+ */
 
-/* includes ------------------------------------------------------------------*/
 #include "boot_trial.h"
 #include "boot_verify.h"
 #include "boot_jump.h"
-#include "boot_safe_mode.h"   /* Boot 诊断标记 M2/M3（观察不干预） */
+#include "boot_safe_mode.h"
 #include "at32f422_426_conf.h"
+#include <string.h>
 
-/* private variables ---------------------------------------------------------*/
-
-/** @brief  OTA metadata instance */
 ota_metadata_t g_meta;
 
-/* exported functions --------------------------------------------------------*/
-
-/**
- * @brief  detect reset source and return boot reason code
- * @param  none
- * @retval boot reason code
- */
 uint8_t detect_boot_reason(void)
 {
   uint8_t reason = BOOT_REASON_POWER_ON;
@@ -68,157 +49,149 @@ uint8_t detect_boot_reason(void)
   return reason;
 }
 
-/**
- * @brief  select the slot to boot from based on metadata
- * @param  meta: pointer to metadata
- * @param  slot: output, selected slot index (0=A, 1=B)
- * @retval 0 on success (slot A or B), -1 if the chosen index is invalid
- */
-int8_t select_boot_slot(const ota_metadata_t *meta, uint8_t *slot)
+int8_t boot_backup_pending(const ota_metadata_t *meta)
 {
-  uint8_t s;
-
-  /* PENDING is turned into ACTIVE in process_trial_state() before this
-   * runs. Both must still boot trial_slot; active_slot stays the last
-   * confirmed image until APP confirms. */
-  if ((meta->trial_state == TRIAL_STATE_PENDING) ||
-      (meta->trial_state == TRIAL_STATE_ACTIVE))
-  {
-    s = meta->trial_slot;
-  }
-  else
-  {
-    s = meta->active_slot;
-  }
-
-  if ((s != SLOT_A) && (s != SLOT_B))
-  {
-    boot_diag_m2(-1, s);   /* 诊断 M2：失败路径，slot=metadata 实际槽字节 */
-    return -1;
-  }
-  *slot = s;
-  boot_diag_m2(0, s);      /* 诊断 M2：选中槽（观察不干预） */
-  return 0;
+  return (meta->backup_valid != 0U) ? 1 : 0;
 }
 
 /**
- * @brief  perform trial boot state machine processing
- * @param  meta: pointer to metadata (mutable)
- * @retval none
+ * @brief  erase one flash sector with bounded polling
  */
-void process_trial_state(ota_metadata_t *meta)
+static int8_t copy_erase_app_region(void)
 {
-  uint8_t other_slot;
+  uint32_t addr;
+  flash_status_type status;
 
-  switch (meta->trial_state)
+  for (addr = APP_BASE_ADDR; addr < (APP_BASE_ADDR + APP_SIZE);
+       addr += FLASH_SECTOR_SIZE)
   {
-    case TRIAL_STATE_IDLE:
-      /* no trial in progress, nothing to do */
-      break;
-
-    case TRIAL_STATE_PENDING:
-      /* trial requested: activate it */
-      meta->trial_state       = TRIAL_STATE_ACTIVE;
-      meta->trial_retry_count++;
-      meta->last_boot_reason  = BOOT_REASON_OTA_ACT;
-      boot_metadata_save(meta);
-      break;
-
-    case TRIAL_STATE_ACTIVE:
-      /* APP did not confirm (timeout NVIC_SystemReset, crash, or WDG). */
-      meta->trial_retry_count++;
-      if (meta->trial_retry_count > meta->trial_max_retries)
-      {
-        meta->rollback_count++;
-        meta->trial_state       = TRIAL_STATE_IDLE;
-        meta->pending_slot      = SLOT_NONE;
-        meta->trial_retry_count = 0;
-        meta->last_boot_reason  = BOOT_REASON_ROLLBACK;
-
-        other_slot = (meta->trial_slot == SLOT_A) ? SLOT_B : SLOT_A;
-        if ((other_slot == SLOT_A && meta->slot_a_valid) ||
-            (other_slot == SLOT_B && meta->slot_b_valid))
-        {
-          meta->active_slot = other_slot;
-        }
-
-        boot_metadata_save(meta);
-      }
-      else
-      {
-        boot_metadata_save(meta);
-      }
-      break;
-
-    case TRIAL_STATE_CONFIRMED:
-      /* APP already set active_slot to the trial slot */
-      meta->trial_state       = TRIAL_STATE_IDLE;
-      meta->pending_slot      = SLOT_NONE;
-      meta->trial_retry_count = 0;
-      boot_metadata_save(meta);
-      break;
-
-    default:
-      /* invalid state, reset to idle */
-      meta->trial_state = TRIAL_STATE_IDLE;
-      boot_metadata_save(meta);
-      break;
-  }
-}
-
-/**
- * @brief  attempt to boot from a given slot
- * @param  slot: slot index (0=A, 1=B)
- * @param  meta: pointer to metadata
- * @retval 0 if the image verified (caller jumps), -1 on failure
- */
-int8_t try_boot_slot(uint8_t slot, ota_metadata_t *meta)
-{
-  uint32_t slot_addr;
-  uint32_t slot_size;
-  uint8_t  *valid_flag;
-
-  slot_addr = boot_metadata_slot_addr(slot);
-  slot_size = boot_metadata_slot_size(slot);
-
-  if ((slot_addr == 0) || (slot_size == 0))
-  {
-    boot_diag_m3(0U, 0U, slot); /* 诊断 M3：槽地址/大小无效，校验未执行（fail_step=0） */
-    return -1;
-  }
-
-  if (slot == SLOT_A)
-  {
-    valid_flag = &meta->slot_a_valid;
-  }
-  else
-  {
-    valid_flag = &meta->slot_b_valid;
-  }
-
-  /* 诊断 M3-pre：进入验签前发出（fail_step=0xFF 标记"验签开始"）。
-  * 若此帧出现但后续 M3 pass/fail 缺失 → boot_verify_image 内部崩溃 */
-  boot_diag_m3(0U, 0xFFU, slot);
-
-  if ((boot_verify_image(slot_addr, slot_size) != 0) ||
-      (boot_jump_vectors_ok(slot_addr + IMAGE_HEADER_SIZE) != 0))
-  {
-    if (*valid_flag != 0U)
+    status = flash_sector_erase(addr);
+    if (status != FLASH_OPERATE_DONE)
     {
-      *valid_flag = 0U;
-      (void)boot_metadata_save(meta);
+      return -1;
     }
-    boot_diag_m3(0U, g_verify_fail_step, slot); /* 诊断 M3：验签/向量失败 */
+  }
+  return 0;
+}
+
+/**
+ * @brief  word-program [src, src+len) at dst, then readback verify
+ * @note   IRQ disabled per write burst (single-bank flash contention,
+ *         same rationale as meta_write_to_flash in boot_metadata.c)
+ */
+static int8_t copy_program_region(uint32_t dst, const uint8_t *src,
+                                  uint32_t len)
+{
+  uint32_t i;
+  uint32_t words;
+  const uint32_t *wsrc = (const uint32_t *)src;
+
+  words = (len + 3U) / 4U;
+  __disable_irq();
+  flash_unlock();
+  for (i = 0U; i < words; i++)
+  {
+    if (flash_word_program(dst + (i * 4U), wsrc[i]) != FLASH_OPERATE_DONE)
+    {
+      flash_lock();
+      __enable_irq();
+      return -1;
+    }
+  }
+  for (i = 0U; i < words; i++)
+  {
+    if (*(volatile uint32_t *)(dst + (i * 4U)) != wsrc[i])
+    {
+      flash_lock();
+      __enable_irq();
+      return -1;
+    }
+  }
+  flash_lock();
+  __enable_irq();
+  return 0;
+}
+
+int8_t boot_copy_backup(ota_metadata_t *meta)
+{
+  const ota_image_view_t *hdr;
+  uint32_t total;
+
+  hdr = (const ota_image_view_t *)BACKUP_BASE_ADDR;
+
+  /* 1. verify Backup image; vectors must target the App window */
+  boot_diag_m3(0U, 0xFFU, 0U); /* pre-verify marker: target=Backup region */
+  if (boot_verify_image(BACKUP_BASE_ADDR, BACKUP_SIZE,
+                        APP_BASE_ADDR, APP_SIZE) != 0)
+  {
+    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = g_verify_fail_step;
+    meta->copy_retry_count++;
+    meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
+    (void)boot_metadata_save(meta);
+    boot_diag_m3(0U, g_verify_fail_step, 0U);
+    return -1;
+  }
+  boot_diag_m3(1U, g_verify_fail_step, 0U);
+
+  /* staging consistency: metadata record must match image CRC */
+  if (meta->backup_crc32 != hdr->crc32)
+  {
+    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = 0xFFU; /* record mismatch */
+    meta->copy_retry_count++;
+    meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
+    (void)boot_metadata_save(meta);
     return -1;
   }
 
-  if (*valid_flag == 0U)
+  /* 2. erase App region */
+  if (copy_erase_app_region() != 0)
   {
-    *valid_flag = 1U;
+    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = 0xFEU; /* erase fail */
+    meta->copy_retry_count++;
+    meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
     (void)boot_metadata_save(meta);
+    return -1;
   }
 
-  boot_diag_m3(1U, g_verify_fail_step, slot);   /* 诊断 M3：过验（观察不干预） */
-  /* caller jumps after it has saved any trial/rollback metadata */
+  /* 3. copy header + payload from Backup to App */
+  total = IMAGE_HEADER_SIZE + hdr->image_length;
+  if (copy_program_region(APP_BASE_ADDR, (const uint8_t *)BACKUP_BASE_ADDR,
+                          total) != 0)
+  {
+    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = 0xFDU; /* program fail */
+    meta->copy_retry_count++;
+    meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
+    (void)boot_metadata_save(meta);
+    return -1;
+  }
+
+  /* 4. re-verify image in App region */
+  boot_diag_m3(0U, 0xFFU, 1U); /* pre-verify marker: target=App region */
+  if (boot_verify_image(APP_BASE_ADDR, APP_SIZE,
+                        APP_BASE_ADDR, APP_SIZE) != 0)
+  {
+    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = g_verify_fail_step;
+    meta->copy_retry_count++;
+    meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
+    (void)boot_metadata_save(meta);
+    boot_diag_m3(0U, g_verify_fail_step, 1U);
+    return -1;
+  }
+
+  /* 5. commit: only now clear the pending flag (power-loss safe) */
+  meta->app_valid    = 1U;
+  meta->app_crc32    = hdr->crc32;
+  meta->backup_valid = 0U;
+  meta->ota_state    = OTA_STATE_IDLE;
+  meta->last_boot_reason = BOOT_REASON_OTA_ACT;
+  meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = 0U;
+  (void)boot_metadata_save(meta);
+  boot_diag_m3(1U, g_verify_fail_step, 1U);
   return 0;
+}
+
+int8_t boot_app_image_ok(void)
+{
+  return (boot_verify_image(APP_BASE_ADDR, APP_SIZE,
+                            APP_BASE_ADDR, APP_SIZE) == 0) ? 0 : -1;
 }
