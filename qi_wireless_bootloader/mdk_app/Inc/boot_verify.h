@@ -28,6 +28,9 @@ typedef struct
   uint8_t  reserved[160];
 } ota_image_view_t;
 
+/** @brief  Magic marker value to detect public key corruption in Flash */
+#define ECDSA_PUBKEY_MAGIC  0x4B594550U  /* "KEYP" */
+
 /** @brief  last verification failure step
  *          0=pass 1=magic 2=length 3=CRC 4=reset-window 5=pubkey 6=ECDSA */
 extern volatile uint8_t g_verify_fail_step;
