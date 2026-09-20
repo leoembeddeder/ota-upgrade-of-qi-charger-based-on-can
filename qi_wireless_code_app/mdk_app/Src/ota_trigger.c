@@ -47,18 +47,16 @@ static void meta_fill_defaults(ota_metadata_t *meta)
 
   meta->magic             = OTA_META_MAGIC;
   meta->version           = OTA_META_VERSION;
-  meta->reserved_slots[0] = 0U;
-  meta->reserved_slots[1] = OTA_SLOT_NONE;
   meta->app_valid         = 0U;
   meta->backup_valid      = 0U;
-  meta->app_crc32         = 0U;
-  meta->backup_crc32      = 0U;
-  memset(meta->reserved_trial, 0, sizeof(meta->reserved_trial));
-  meta->copy_retry_count  = 0U;
+  meta->copy_fail_step    = 0U;
   meta->last_boot_reason  = 0U;
+  meta->backup_crc32      = 0U;
+  meta->copy_retry_count  = 0U;
   meta->ota_state         = OTA_STATE_IDLE;
-  meta->reserved2[0]      = 0U;
-  meta->reserved2[1]      = 0U;
+  meta->reserved[0]       = 0U;
+  meta->reserved[1]       = 0U;
+  meta->reserved[2]       = 0U;
 }
 
 uint32_t ota_crc32(const void *data, uint32_t length)

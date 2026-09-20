@@ -48,7 +48,7 @@ int main(void)
     else
     {
       /* flag left set -> retry next boot; try current App image anyway */
-      boot_diag_m2(0xFFU, g_meta.reserved_trial[META_COPY_FAIL_STEP_OFF]);
+      boot_diag_m2(0xFFU, g_meta.copy_fail_step);
     }
   }
   else
@@ -63,7 +63,7 @@ int main(void)
   }
 
   /* step 5: no bootable App image */
-  enter_safe_mode(g_meta.reserved_trial[META_COPY_FAIL_STEP_OFF] != 0U ?
+  enter_safe_mode(g_meta.copy_fail_step != 0U ?
                   0x03U : 0x02U);
   while (1)
   {

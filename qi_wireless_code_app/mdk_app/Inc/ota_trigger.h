@@ -45,7 +45,7 @@ extern "C" {
 #define OTA_FLASH_SECTOR_SIZE   0x400U
 
 #define OTA_META_MAGIC          0x4F54414DU   /* "MATO" */
-#define OTA_META_VERSION        2U            /* single-App format */
+#define OTA_META_VERSION        3U            /* v3 slim layout (Q2) */
 #define OTA_IMAGE_MAGIC         0x4F544158U   /* "XATO" */
 
 /* DID diagnostics markers (0x2114 during download reports 0x02 = backup) */
@@ -72,34 +72,17 @@ extern "C" {
  */
 typedef struct
 {
-  uint32_t magic;               /* 0x4F544158 "XATO" */
-  uint32_t image_length;       /* payload bytes after header */
-  uint32_t crc32;              /* CRC32 of payload */
-  uint8_t  signature[64];      /* ECDSA P-256 R||S */
-  uint8_t  hdr_reserved_ver[16];
-  uint32_t build_timestamp;
-  uint8_t  reserved[160];
-} ota_image_header_t;
-
-/**
- * @brief  OTA metadata (272B, byte-frozen; identical to boot_metadata.h)
- */
-typedef struct
-{
-  uint32_t magic;               /* @0x00 */
-  uint32_t version;             /* @0x04 = 2 */
-  uint8_t  reserved_slots[2];   /* @0x08 deprecated */
-  uint8_t  app_valid;           /* @0x0A */
-  uint8_t  backup_valid;        /* @0x0B pending-copy flag */
-  uint32_t app_crc32;           /* @0x0C */
-  uint32_t backup_crc32;        /* @0x10 */
-  uint8_t  reserved_trial[8];   /* @0x14 deprecated */
-  uint32_t copy_retry_count;    /* @0x1C */
-  uint8_t  last_boot_reason;    /* @0x20 */
-  uint8_t  ota_state;           /* @0x21 */
-  uint8_t  reserved2[2];        /* @0x22 */
-  uint8_t  padding[232];        /* @0x24 */
-  uint32_t crc32;               /* @0x10C */
+  uint32_t magic;            /* @0x00 0x4F54414D "MATO" */
+  uint32_t version;          /* @0x04 META_VERSION = 3 */
+  uint8_t  app_valid;        /* @0x08 App region image valid (M1 diag b1) */
+  uint8_t  backup_valid;     /* @0x09 Backup pending-copy flag */
+  uint8_t  copy_fail_step;   /* @0x0A last backup-copy fail_step */
+  uint8_t  last_boot_reason; /* @0x0B BOOT_REASON_* */
+  uint32_t backup_crc32;     /* @0x0C staging payload CRC (copy pre-check) */
+  uint32_t copy_retry_count; /* @0x10 failed copy attempts (DID 0x2116) */
+  uint8_t  ota_state;        /* @0x14 OTA_STATE_* */
+  uint8_t  reserved[3];      /* @0x15 alignment/future */
+  uint32_t crc32;            /* @0x18 CRC32 of all above fields */
 } ota_metadata_t;
 
 /* exported functions ------------------------------------------------------ */

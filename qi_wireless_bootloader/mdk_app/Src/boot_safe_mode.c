@@ -207,14 +207,10 @@ void enter_safe_mode(uint8_t cause)
   uint8_t  step = g_verify_fail_step;
   uint32_t last_hb;
 
-  /* persist failure context in reserved_trial[] (single-App struct):
-   * [2]=cause [3]=verify fail_step [4]=0xA5 marker; [0] keeps the
-   * backup-copy fail_step written by boot_copy_backup */
-  g_meta.reserved_trial[2] = cause;
-  g_meta.reserved_trial[3] = step;
-  g_meta.reserved_trial[4] = 0xA5U;
-  g_meta.reserved2[0] = g_meta.last_boot_reason;
-  g_meta.reserved2[1] = 0xA5U;
+  /* Q2 metadata slimming (v3): write-only forensic slots removed.
+   * cause/step stay observable live via CAN frames (M2/M3 markers,
+   * ABT heartbeat, safe-mode probe response). copy_fail_step written by
+   * boot_copy_backup persists through this save. */
   (void)boot_metadata_save(&g_meta);
 
   can_driver_init();

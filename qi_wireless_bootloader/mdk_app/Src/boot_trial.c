@@ -124,7 +124,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
   if (boot_verify_image(BACKUP_BASE_ADDR, BACKUP_SIZE,
                         APP_BASE_ADDR, APP_SIZE) != 0)
   {
-    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = g_verify_fail_step;
+    meta->copy_fail_step = g_verify_fail_step;
     meta->copy_retry_count++;
     meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
     (void)boot_metadata_save(meta);
@@ -136,7 +136,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
   /* staging consistency: metadata record must match image CRC */
   if (meta->backup_crc32 != hdr->crc32)
   {
-    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = 0xFFU; /* record mismatch */
+    meta->copy_fail_step = 0xFFU; /* record mismatch */
     meta->copy_retry_count++;
     meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
     (void)boot_metadata_save(meta);
@@ -146,7 +146,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
   /* 2. erase App region */
   if (copy_erase_app_region() != 0)
   {
-    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = 0xFEU; /* erase fail */
+    meta->copy_fail_step = 0xFEU; /* erase fail */
     meta->copy_retry_count++;
     meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
     (void)boot_metadata_save(meta);
@@ -158,7 +158,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
   if (copy_program_region(APP_BASE_ADDR, (const uint8_t *)BACKUP_BASE_ADDR,
                           total) != 0)
   {
-    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = 0xFDU; /* program fail */
+    meta->copy_fail_step = 0xFDU; /* program fail */
     meta->copy_retry_count++;
     meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
     (void)boot_metadata_save(meta);
@@ -170,7 +170,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
   if (boot_verify_image(APP_BASE_ADDR, APP_SIZE,
                         APP_BASE_ADDR, APP_SIZE) != 0)
   {
-    meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = g_verify_fail_step;
+    meta->copy_fail_step = g_verify_fail_step;
     meta->copy_retry_count++;
     meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
     (void)boot_metadata_save(meta);
@@ -180,11 +180,10 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
 
   /* 5. commit: only now clear the pending flag (power-loss safe) */
   meta->app_valid    = 1U;
-  meta->app_crc32    = hdr->crc32;
   meta->backup_valid = 0U;
   meta->ota_state    = OTA_STATE_IDLE;
   meta->last_boot_reason = BOOT_REASON_OTA_ACT;
-  meta->reserved_trial[META_COPY_FAIL_STEP_OFF] = 0U;
+  meta->copy_fail_step = 0U;
   (void)boot_metadata_save(meta);
   boot_diag_m3(1U, g_verify_fail_step, 1U);
   return 0;

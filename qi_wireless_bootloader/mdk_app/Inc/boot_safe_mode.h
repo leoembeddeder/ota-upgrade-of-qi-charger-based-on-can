@@ -18,7 +18,7 @@
  * @note   entered when no bootable slot remains. Does not return.
  * @param  cause: 0x02 = no valid App image after copy attempt,
  *                0x03 = backup copy verification failed (detail in
- *                metadata reserved_trial[0])
+ *                metadata copy_fail_step)
  * @retval none (does not return)
  */
 void enter_safe_mode(uint8_t cause);

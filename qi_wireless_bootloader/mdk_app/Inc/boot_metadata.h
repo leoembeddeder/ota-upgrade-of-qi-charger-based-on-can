@@ -51,7 +51,7 @@ extern "C" {
 #define SRAM_SIZE               0x5000U
 
 #define META_MAGIC              0x4F54414DU   /* "MATO" */
-#define META_VERSION            2U            /* single-App format */
+#define META_VERSION            3U            /* v3 slim layout (Q2) */
 
 /* boot reason codes */
 #define BOOT_REASON_POWER_ON    0x00U
@@ -64,8 +64,6 @@ extern "C" {
 #define OTA_STATE_IDLE          0x00U
 #define OTA_STATE_DOWNLOADING   0x01U
 
-/* Diagnostics: reserved_trial[0] holds last backup-copy fail_step */
-#define META_COPY_FAIL_STEP_OFF 0U
 
 /* exported types ---------------------------------------------------------- */
 
@@ -76,20 +74,17 @@ extern "C" {
  */
 typedef struct
 {
-  uint32_t magic;               /* 0x4F54414D "MATO"                 @0x00 */
-  uint32_t version;             /* META_VERSION = 2                   @0x04 */
-  uint8_t  reserved_slots[2];   /* legacy active/pending slot (dep.)  @0x08 */
-  uint8_t  app_valid;           /* App region image valid             @0x0A */
-  uint8_t  backup_valid;        /* Backup holds pending fw (copy flag)@0x0B */
-  uint32_t app_crc32;           /* CRC32 of App payload               @0x0C */
-  uint32_t backup_crc32;        /* CRC32 of Backup payload            @0x10 */
-  uint8_t  reserved_trial[8];   /* legacy trial fields (deprecated)   @0x14 */
-  uint32_t copy_retry_count;    /* failed copy attempts (diagnostics) @0x1C */
-  uint8_t  last_boot_reason;    /* BOOT_REASON_*                      @0x20 */
-  uint8_t  ota_state;           /* OTA_STATE_*                        @0x21 */
-  uint8_t  reserved2[2];        /*                                    @0x22 */
-  uint8_t  padding[232];        /*                                    @0x24 */
-  uint32_t crc32;               /* CRC32 of all above                 @0x10C */
+  uint32_t magic;            /* @0x00 0x4F54414D "MATO" */
+  uint32_t version;          /* @0x04 META_VERSION = 3 */
+  uint8_t  app_valid;        /* @0x08 App region image valid (M1 diag b1) */
+  uint8_t  backup_valid;     /* @0x09 Backup pending-copy flag */
+  uint8_t  copy_fail_step;   /* @0x0A last backup-copy fail_step */
+  uint8_t  last_boot_reason; /* @0x0B BOOT_REASON_* */
+  uint32_t backup_crc32;     /* @0x0C staging payload CRC (copy pre-check) */
+  uint32_t copy_retry_count; /* @0x10 failed copy attempts (DID 0x2116) */
+  uint8_t  ota_state;        /* @0x14 OTA_STATE_* */
+  uint8_t  reserved[3];      /* @0x15 alignment/future */
+  uint32_t crc32;            /* @0x18 CRC32 of all above fields */
 } ota_metadata_t;
 
 /* exported functions ------------------------------------------------------ */

@@ -35,9 +35,9 @@ int8_t boot_backup_pending(const ota_metadata_t *meta);
  *         pass; each power-on retries. Steps: verify Backup image
  *         (magic/length/CRC/ECDSA + vectors target App window) -> erase
  *         App region -> word copy -> re-verify App -> update metadata
- *         (app_valid/app_crc32, clear backup_valid) -> save.
+ *         (app_valid, clear backup_valid) -> save.
  * @retval 0 on success, -1 on failure (fail_step stored in
- *         meta.reserved_trial[META_COPY_FAIL_STEP_OFF], copy_retry_count++
+ *         meta.copy_fail_step, copy_retry_count++
  *         saved; flag left set for retry)
  */
 int8_t boot_copy_backup(ota_metadata_t *meta);
