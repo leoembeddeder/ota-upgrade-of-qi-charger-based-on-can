@@ -45,11 +45,11 @@
 | 工程 | 目录 | 职责 |
 |------|------|------|
 | Bootloader | `qi_wireless_bootloader/` | 上电引导、镜像验签、双槽选择、Trial Boot 管理（无 UDS，Safe Mode 仅挂起） |
-| APP | `qi_wireless_code_slotA/` | Qi 充电业务、CAN 生命周期广播、UDS 诊断与 OTA 下载（APP 内完成擦写） |
+| APP | `qi_wireless_code_app/` | Qi 充电业务、CAN 生命周期广播、UDS 诊断与 OTA 下载（APP 接收写备份区，BOOT 搬运至 App 区） |
 | 工具集 | `python_tools/` | 镜像打包、签名、合并、验证、一键 OTA、功能测试脚本 |
 
 > **说明**：APP 固件是位置无关的（运行时按 PC 判断所在槽，写入前自动重定位重签），因此**只需维护一份 APP 源码工程**。
-> 早期的 `qi_wireless_code_slotB/` 副本已于 2026-09-17 删除，Flash 双槽 A/B 机制不受影响。
+> 2026-09-20 起架构重构（OTA-ARCH-0920）：A/B 双槽永久取消，改为 Boot + App + 备份区单 App 升级流（详见 docs/2）。
 
 ---
 
@@ -69,7 +69,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 │   │   │                                   sha256 / uECC / sit1145 / timer_drv
 │   └── libraries/                          ← CMSIS + AT32 SPL 驱动库
 │
-├── qi_wireless_code_slotA/                 ← APP 工程 (48KB/槽, IROM=0x08004100)
+├── qi_wireless_code_app/                   ← APP 工程 (App 区 48KB, IROM1=0x08004100)
 │   ├── mdk_project/                        ← Keil 工程，输出 qi_wireless.bin
 │   ├── mdk_user/                           ← main.c 入口、时钟、中断
 │   ├── mdk_can/                            ← CAN 底层驱动
@@ -127,7 +127,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 
 ### 3.3 APP 编译
 
-1. 打开 `qi_wireless_code_slotA/mdk_project/qi_wireless.uvprojx`
+1. 打开 `qi_wireless_code_app/mdk_project/qi_wireless_code_app.uvprojx`
 2. Target → IROM1: `0x08004100` / `0xBF00`
 3. Linker → 勾选 "Use Memory Layout from Target Dialog"
 4. Build → 输出 `Objects/qi_wireless.bin`（裸 bin，不含 XATO 头）
@@ -146,7 +146,7 @@ python merge_prod_bin.py
 # 3. 烧录 prod_image.bin 到 0x08000000 (J-Link / AT-Link / SWD)
 ```
 
-> 产线只烧 Bootloader + Slot A。Slot B 出厂为空，留给首次 CAN OTA 写入。
+> 产线烧录 Bootloader + App 区镜像（merge_prod_bin.py 合并）。备份区出厂为空，OTA 时主机写入、BOOT 搬运。
 > 空片 / 双槽无效时 Boot 挂起，靠 `merge_prod_bin.py` 产线镜像救砖。
 
 ---
@@ -158,7 +158,7 @@ python merge_prod_bin.py
 | 脚本 | 功能 |
 |------|------|
 | `pack_image.py` | 裸 bin → XATO 头 .ota.bin (CRC32 + ECDSA P-256) |
-| `merge_prod_bin.py` | Bootloader + Slot A 合并为单文件产线镜像 |
+| `merge_prod_bin.py` | Bootloader + App 镜像合并为单文件产线镜像 |
 | `verify_image.py` | 校验 XATO 镜像完整性 + 签名 |
 | `sign_seed.py` | SecurityAccess seed 签名生成 (ECDSA P-256) |
 

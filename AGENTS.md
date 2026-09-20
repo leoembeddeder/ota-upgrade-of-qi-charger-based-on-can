@@ -26,7 +26,7 @@
 
 ## 版本号联动规则（2026-09-18 起）
 
-- 软件版本号**唯一定义**在 APP 固件编译常量 `SW_VERSION_STR`（`qi_wireless_code_slotA/mdk_app/Src/can_protocol.c`）。
+- 软件版本号**唯一定义**在 APP 固件编译常量 `SW_VERSION_STR`（`qi_wireless_code_app/mdk_app/Src/can_protocol.c`）。
 - 发版只改两处：固件 `SW_VERSION_STR` + 文档（docs/README 中的版本值与说明）。
 - 打包产物 XATO 镜像头 version 区（偏移 0x4C，16 字节）打包固定填 `0x00`，**不携带版本号**；打包/OTA/校验脚本不写、不读、不输出该字段。
 - 不存在打包脚本 `IMAGE_VERSION` 常量环节（已删除）；UDS DID `0xF195` 应答取固件编译常量，不读镜像头 / OTA metadata。
