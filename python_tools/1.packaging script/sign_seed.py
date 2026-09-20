@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import os
 import subprocess
+from ecdsa import SigningKey, der
 import sys
 import tempfile
 

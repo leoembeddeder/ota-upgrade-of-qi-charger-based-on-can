@@ -567,6 +567,7 @@ def run_qi_iap(bus_id):
 
 
 def z_main():
+    global stopTask
     stopTask = False
     _log("======== Qi 芯片 IAP 升级 ========")
     _log("固件目录: " + FIRMWARE_DIR)
