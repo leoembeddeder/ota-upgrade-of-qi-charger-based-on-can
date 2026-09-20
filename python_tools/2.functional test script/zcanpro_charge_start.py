@@ -540,10 +540,10 @@ def charge_state_name(state):
 #     （应答集合：正响应/0x22/0x33/0x24/0x13/0x31）→ 对 0x34 的任何应答=在 APP；
 #   - Boot 无完整 UDS：仅 Boot safe mode 应答 22 2113 与非 suppress 的 3E，
 #     0x34 无分支静默（boot_safe_mode.c）→ 0x34 无应答不能反推“不在 APP”；
-#   - APP 的 DID 0x2113（active slot）同样正响应：62 21 13 <slot>，slot=
-#     ota_running_slot()=0x00/0x01（can_protocol.h:132、can_protocol.c
-#     fill_did_payload case DID_ACTIVE_SLOT、ota_trigger.c:242-248、
-#     ota_trigger.h:55-56），永不 0xFE → Boot safe mode 判据=应答中
+#   - APP 的 DID 0x2113（运行区标识）同样正响应：62 21 13 <slot>，单 App
+#     架构 slot 恒 0x00=App 区运行（ota_running_slot() 为 deprecated
+#     shim 恒 0，can_protocol.c fill_did_payload case DID_ACTIVE_SLOT），
+#     永不 0xFE → Boot safe mode 判据=应答中
 #     62 21 13 后字节为 0xFE（boot_safe_mode.c:155），而非“正响应”本身；
 #   - 无应答 ≠ 不在 APP：SIT1145 空闲 180s（CAN_LP_IDLE_TIMEOUT_MS）进
 #     Standby，首帧只当 ISO 11898-2 WUP 被消耗，MCU 收不到内容。先唤醒
@@ -567,7 +567,7 @@ LIFE_LISTEN_S       = 2.0
 VERDICT_CN = {"APP": "APP", "BOOT_SM": "Boot safe mode", "UNKNOWN": "UNKNOWN"}
 
 FAIL_STEP_DESC = {
-    0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
+    0: "未执行镜像校验 / metadata 无有效状态（单 App 架构无槽选择）",
     1: "镜像 magic 校验失败",
     2: "image_length 为 0 或超出槽范围",
     3: "镜像 CRC32 校验失败",

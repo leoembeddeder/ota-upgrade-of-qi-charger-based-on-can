@@ -19,7 +19,6 @@ from __future__ import print_function
 import argparse
 import hashlib
 import os
-import struct
 import subprocess
 import sys
 import tempfile
@@ -91,7 +90,6 @@ def sign_with_openssl(seed_bytes, private_key_path):
 
 def sign_with_ecdsa_lib(seed_hash, private_key_path):
     """Sign using ecdsa Python library (pip install ecdsa)."""
-    from ecdsa import SigningKey, NIST256p, der
 
     with open(private_key_path, "r") as f:
         pem_data = f.read()

@@ -190,7 +190,7 @@ def uds_try(bus_id, sid, payload, suppress=0):
 # （固件依据文件:行号见脚本头部与提交报告）：绝不按 NRC 值分叉定位——
 # 0x34/22 2113 的任何应答（正响应或任意 NRC，且非 0xFE 标记）= 在 APP；
 # 22 2113 应答中 62 21 13 后字节为 0xFE = Boot safe mode（APP 的
-# DID 0x2113 也正响应，slot 字节 0x00/0x01 永不 0xFE）；无应答 ≠ 不在 APP，
+# DID 0x2113 也正响应，slot 字节单 App 架构恒 0x00，永不 0xFE）；无应答 ≠ 不在 APP，
 # 先 Standby 唤醒收敛（3E 80 burst）+ 释放 UDS 通道监听 0x18FF260D
 # 生命周期帧再判。
 
@@ -209,7 +209,7 @@ LIFE_LISTEN_S       = 2.0
 VERDICT_CN = {"APP": "APP", "BOOT_SM": "Boot safe mode", "UNKNOWN": "UNKNOWN"}
 
 FAIL_STEP_DESC = {
-    0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
+    0: "未执行镜像校验 / metadata 无有效状态（单 App 架构无槽选择）",
     1: "镜像 magic 校验失败",
     2: "image_length 为 0 或超出槽范围",
     3: "镜像 CRC32 校验失败",

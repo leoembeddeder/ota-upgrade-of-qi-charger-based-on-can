@@ -514,7 +514,7 @@ LIFE_LISTEN_S       = 2.0
 VERDICT_CN = {"APP": "APP", "BOOT_SM": "Boot safe mode", "UNKNOWN": "UNKNOWN"}
 
 FAIL_STEP_DESC = {
-    0: "未执行镜像校验 / select_boot_slot 无有效槽（metadata 无 active/trial 槽）",
+    0: "未执行镜像校验 / metadata 无有效状态（单 App 架构无槽选择）",
     1: "镜像 magic 校验失败",
     2: "image_length 为 0 或超出槽范围",
     3: "镜像 CRC32 校验失败",

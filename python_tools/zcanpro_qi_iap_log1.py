@@ -19,7 +19,7 @@ ZCANPRO 扩展脚本 — Qi 芯片 IAP 固件升级
 import os
 import sys
 import time
-import struct
+import binascii
 
 try:
     import zcanpro
@@ -120,8 +120,7 @@ def _to_list(b):
 def z_notify(type, obj):
     _log("Notify " + str(type) + " " + str(obj))
     if type == "stop":
-        global stopTask
-        stopTask = True
+            stopTask = True
 
 
 # ======== ECDSA 签名（复用 ota 脚本的逻辑） ========
@@ -298,7 +297,6 @@ def uds_init():
 
 
 def uds_req(bus_id, sid, payload, suppress=0, wait_pending_s=0):
-    global stopTask
     if stopTask:
         raise RuntimeError("用户停止脚本")
     req = {
@@ -492,7 +490,6 @@ def send_security_key(bus_id, sig):
 # ======== 主流程 ========
 
 def run_qi_iap(bus_id):
-    global stopTask
 
     # 1. 检查固件文件
     fw_path = os.path.join(FIRMWARE_DIR, FIRMWARE_NAME)
@@ -570,7 +567,6 @@ def run_qi_iap(bus_id):
 
 
 def z_main():
-    global stopTask
     stopTask = False
     _log("======== Qi 芯片 IAP 升级 ========")
     _log("固件目录: " + FIRMWARE_DIR)
