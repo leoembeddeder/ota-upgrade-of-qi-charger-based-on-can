@@ -196,6 +196,10 @@ int8_t try_boot_slot(uint8_t slot, ota_metadata_t *meta)
     valid_flag = &meta->slot_b_valid;
   }
 
+  /* 诊断 M3-pre：进入验签前发出（fail_step=0xFF 标记"验签开始"）。
+  * 若此帧出现但后续 M3 pass/fail 缺失 → boot_verify_image 内部崩溃 */
+  boot_diag_m3(0U, 0xFFU, slot);
+
   if ((boot_verify_image(slot_addr, slot_size) != 0) ||
       (boot_jump_vectors_ok(slot_addr + IMAGE_HEADER_SIZE) != 0))
   {
