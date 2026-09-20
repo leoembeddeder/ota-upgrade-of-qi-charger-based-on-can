@@ -57,3 +57,16 @@
 **confidence=85**（逻辑/常量/边界维度证据充分；扣分=功能脚本内部业务逻辑未逐行复核（抽样 DID/CAN-ID/探测层）+I 盘实盘采信主管核实未亲验）。
 
 *—— 评估员已完成 R3 再审核 | 只读零改码；findings 修复后本席复验*
+
+## R3FE 复验章节（2026-09-20 21:40，HEAD=3dc0649，R3F=06296f9+6835603+3dc0649）
+
+**verdict: PASS → R3/R3F 全案闭环**
+
+1. **六项终态全达成**：①使用说明:25="28B×2 双副本，META_VERSION=3（v2 及以前拒收→defaults 重建）"，stale grep(272B/META_VERSION=2/0x10C)=0 ✓；②:70 0x2115 行在位（00=POR/01=SW/02=WDG/03=OTA/04=copy 失败）——与 boot_metadata.h:58-62 BOOT_REASON_* 逐值一致+can_protocol.c DID_LAST_BOOT_REASON 直读 meta.last_boot_reason 实证 ✓；③:73-75 v2→v3 重建段+ :78-80 断电幂等段在位（含代码行号引用）✓；④:83-86 版本口径现状段在位（SW 1.1.1 can_protocol.c:53 vs EXPECTED 1.1.2 ota_auto:51+升级前须改版本号 Rebuild+拒闪门 fail-closed）✓；⑤六功能脚本对 408e9a3 diff=纯注释+FAIL_STEP_DESC[0] 文档字符串（单 App 语义化改写，零行为变更行）✓；⑥iap_log1/2 :22 import binascii 在位+:197 binascii.unhexlify 使用点 ✓。
+2. **回归链闭环**：sign_seed.py :23 `from ecdsa import SigningKey, der` 恢复且实际引用（:98 SigningKey.from_pem/:99 der.sigencode），unused struct import 正确移除；iap_log1/2 stopTask 配对完好（:96 模块级/:120-124 z_notify global+stop→True/:570-572 z_main global+复位 False）；z_notify 锚点假信号无残留（函数体=_log+stop 判定）；三 commit 净语义变更=六项本体+import 修复，无任务书外语义改动 ✓。
+3. **终态独立复跑**：py_compile 17/17 OK+pyflakes 全部零告警（空输出）；read_app_version.py:37 期望 1.1.1 未动 ✓；capture 自测 21/21 PASS ✓。
+4. **范围审计**：三 commit 文件=10 python_tools+1 review_reports，全授权无越权 ✓。
+
+evidence_digest：①六项 file:line 全核实（:25/:70/:73-80/:83-86+六脚本 diff+import :22）；②0x2115 取值与 C 码逐值一致（boot_metadata.h:58-62+can_protocol.c 直读实证）；③回归链：sign_seed 在用 import 恢复+引用点在位、stopTask 配对/复位完好、无假信号残留；④py_compile+pyflakes 终态全零+自测 21/21；⑤范围干净零越权。confidence=94（剩余不确定性仅 MDK/实机，N5 前置沿用）。
+
+*—— 评估员已完成 R3FE 复验 | 只读零改码*
