@@ -17,9 +17,10 @@
  * flag in metadata -> reset -> BOOT erases App region, copies Backup ->
  * App, re-verifies, clears flag, jumps to App.
  *
- * Metadata struct layout is byte-frozen (272 bytes, crc32 at offset 268)
- * and defined identically in boot/app projects — C/Python same-source.
- * META_VERSION bumped to 2: v1 (A/B era) metadata is rejected -> defaults.
+ * Metadata struct v3 slim layout (28 bytes, crc32 at offset 0x18,
+ * META_VERSION=3), defined identically in boot/app projects —
+ * C/Python same-source; v2-and-earlier metadata rejected -> defaults
+ * rebuild (Q2 slimming).
  */
 
 #ifndef __BOOT_METADATA_H
@@ -68,7 +69,7 @@ extern "C" {
 /* exported types ---------------------------------------------------------- */
 
 /**
- * @brief  OTA metadata structure (272 bytes total, layout byte-frozen)
+ * @brief  OTA metadata structure v3 (28 bytes total, slim layout)
  * @note   Field offsets must stay identical across boot/app projects.
  *         Legacy A/B-slot fields are retained as reserved bytes.
  */

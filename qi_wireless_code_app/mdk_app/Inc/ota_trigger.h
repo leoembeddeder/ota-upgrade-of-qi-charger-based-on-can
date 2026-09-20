@@ -15,8 +15,8 @@
  *   Backup   0x08010000..0x0801BFFF  48KB
  *   Metadata 0x0801C000 / 0x0801C800, DeviceInfo 0x0801D000, NVM 0x0801E000
  *
- * ota_metadata_t layout is byte-frozen (272B, crc32 @0x10C) and identical
- * across projects; legacy slot fields retained as reserved bytes.
+ * ota_metadata_t v3 slim layout (28B, crc32 @0x18, META_VERSION=3),
+ * identical across projects; v2-and-earlier data rejected -> defaults.
  */
 
 #ifndef __OTA_TRIGGER_H
@@ -69,6 +69,21 @@ extern "C" {
 /**
  * @brief  XATO image header (256B, byte-frozen layout; @0x4C reserved
  *         placeholder — original version field removed, packed as 0x00)
+ */
+typedef struct
+{
+  uint32_t magic;               /* 0x4F544158 "XATO" */
+  uint32_t image_length;       /* payload bytes after header */
+  uint32_t crc32;              /* CRC32 of payload */
+  uint8_t  signature[64];      /* ECDSA P-256 R||S */
+  uint8_t  hdr_reserved_ver[16];
+  uint32_t build_timestamp;
+  uint8_t  reserved[160];
+} ota_image_header_t;
+
+/**
+ * @brief  OTA metadata v3 (28B; crc32 @0x18; identical to
+ *         boot_metadata.h; META_VERSION=3)
  */
 typedef struct
 {

@@ -47,7 +47,7 @@ CRC 读回/双副本落盘/断电幂等链（先验后擦/复核后清 flag/上�
 - py_compile 全脚本通过；pyflakes：zcanpro/capture/pack/verify/merge 零告警（sign_seed.py 2 处 unused-import 为本任务前既有问题，未触碰该文件）
 - 双工程结构静态对照：字段名/顺序/类型逐行 diff=IDENTICAL；sizeof 等效推算=28B（4+4+1+1+1+1+4+4+1+3+4）
 - 删除字段全仓 grep：reserved_trial/reserved_slots/reserved2/META_COPY_FAIL_STEP_OFF/app_crc32 在 C/py 源零残留（仅 3 行过期注释已同步修正）；padding 仅存于图像头上下文（无关）
-- capture 自测 21/21 全部通过；git show --stat 范围自查=8 文件（2 头/4 C/docs2/报告）
+- capture 自测 21/21 全部通过；git show --stat 实测=11 文件（初版口头计数 8 为估算口径，以实测为准）
 - 未验证项：MDK 编译（WSL 限制，如实列报）；设备上 v2→v3 defaults 重建行为待实测
 
 ## 五、风险
@@ -55,3 +55,17 @@ CRC 读回/双副本落盘/断电幂等链（先验后擦/复核后清 flag/上�
 1. 设备现有 v2 metadata（含乙线取证现场）升级后被 defaults 重建——expected by design（版本拒绝机制），但现场排查时 metadata 历史字段（copy_retry 等）归零
 2. safe-mode 现场 reserved 区记录随字段删除消失；故障后取证改依赖 CAN 帧（M2/M3/ABT）与 M1 帧现场，flash 侧仅剩 copy_fail_step/last_boot_reason
 3. MDK 未编译；首次 Rebuild 若有 sizeof 相关告警回报处理
+
+## 六、Q2F 热修记录（审计诚实性）
+
+Q2E 复审 d3b550d FAIL，唯一阻断项 B1：Q2 用正则重建 ota_metadata_t 结构块
+时，非贪婪匹配起点落在同文件更早的 ota_image_header_t typedef 上，连带
+删除该 256B XATO 镜像头类型定义；ota_download.c verify_backup_image/
+commit_backup 两消费点失去声明，Rebuild 必报 unknown type name。初版回报
+"打包头零触碰✓"被证伪（字节布局确未动，但类型定义被误删，自查只查了
+删除字段残留、未反向核查结构块重建波及面）。
+
+恢复：Q2F 从 90e1c95 逐字取回 typedef 至 ota_trigger.h 原位置（include
+链覆盖全部消费点）；boot 侧 ota_image_view_t 全程完好；metadata v3
+（28B/META_VERSION=3）一字节不动。教训：结构块批量重建类 patch 后必须
+对同文件其余 typedef 做存在性 grep。
