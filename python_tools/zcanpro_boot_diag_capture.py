@@ -10,8 +10,11 @@ CAN 标记帧（ID=0x18FF480D）→ 逐帧人话解码 → 决策链串联摘要
   诊断帧，零帧提示会引导排查）；CAN 通道 250kbps Classical CAN 扩展帧。
   流程：①读基线（22 2113 + 22 F195）→ ②raw 监听先行后发复位 11 01
   （非 suppress，≤3 次重试，等 51 01）→ ③捕获窗口 ≥30s（常量可调）
-  过滤 0x18FF480D 逐帧解码 → ④APP 回来后再读 22 2113 + 22 F195 →
-  ⑤决策链摘要+一致性对照（M4 实跳 vs 2113 自报）。
+  ——窗口内打印收到的【每一帧】原始数据（含非诊断帧，无需上位机
+  过滤），0x18FF480D 额外人话解码 → ④APP 回来后再读 22 2113 + 22
+  F195 → ⑤窗口结束打印总线活动统计（总帧数/按 ID 分布/诊断帧数）
+  +零帧二分提示（区分『总线死』与『有流量无诊断帧』）+决策链摘要
+  +一致性对照（M4 实跳 vs 2113 实读）。
 
 解码表与 60d1137 终审规格逐字节一致（boot_safe_mode.h BOOT_DIAG 注释）：
   M1 0xA1: [active_slot][meta_src][magic_ok][ver_ok][crc_ok]
@@ -172,16 +175,42 @@ def decode_diag_frame(data):
     return "[诊断] 未知标记 0x%02X" % m
 
 
-def zero_frame_hint():
-    """零帧分支提示（终审 C2 口径：零帧≠决策证据）。"""
-    return ("[诊断] !!!!! 捕获窗口内 0x18FF480D 零帧 !!!!! 按序排查："
-            "①设备 Boot 可能还不是诊断版——确认已烧录 60d1137 诊断标记版"
-            "构建（普通版/升级流程用 Boot 不发这些帧）；"
-            "②CAN 盒总线参数/接线/过滤——确认 250kbps Classical CAN 扩展帧、"
-            "终端电阻正常、接收窗口未过滤掉 0x18FF480D；"
-            "③确认 Boot 版本后手动断电重试一次（POR 同样触发 Boot 开机"
-            "决策链）。注意：零帧≠决策证据——不能据此判定 Boot 决策行为，"
-            "只能说明本次没有观测到诊断帧。")
+def summarize_bus(events):
+    """events=[(t_rel, can_id, data),...] → 总线活动统计 dict。纯函数。"""
+    ids = {}
+    diag = 0
+    for _t, cid, _d in events:
+        cidi = int(cid) & 0x1FFFFFFF
+        ids[cidi] = ids.get(cidi, 0) + 1
+        if cidi == DIAG_CAN_ID:
+            diag += 1
+    return {"total": len(events), "ids": ids, "diag": diag}
+
+
+def format_bus_stats(st):
+    """统计 dict → 人话统计行（含按 ID 分布）。纯函数。"""
+    parts = ["ID=0x%08X ×%d" % (k, v) for k, v in sorted(st["ids"].items())]
+    return ("[诊断] 总线活动统计：总帧数=%d，诊断帧(0x18FF480D)=%d；"
+            "按 ID 分布：%s"
+            % (st["total"], st["diag"], "，".join(parts) if parts else "无"))
+
+
+def bus_silent_hint():
+    """总帧数=0 提示：总线完全无流量 → 物理层排查。"""
+    return ("[诊断] 总线完全无任何帧（连非诊断流量都没有）→ 按物理层排查："
+            "设备上电/CAN 接线/CAN 通道参数（250kbps 扩展帧）；若确认已烧 "
+            "60d1137 诊断版 Boot 且设备已上电仍零帧，回报 agent:main。"
+            "注意：零帧≠决策证据——不能据此判定 Boot 决策行为。")
+
+
+def traffic_no_diag_hint(st):
+    """总帧数>0 且诊断帧=0 提示：有流量无诊断帧 → Boot 版本/开机事件二分。"""
+    parts = ["ID=0x%08X ×%d" % (k, v) for k, v in sorted(st["ids"].items())]
+    return ("[诊断] 总线有流量但无 0x18FF480D 诊断帧（总帧数=%d，ID 分布：%s）"
+            "→ 设备 Boot 可能非诊断版（未烧 60d1137 构建）或本窗口内未发生"
+            "开机事件——断电重试一次再看（断电重试期间本窗口继续监听并"
+            "打印全部帧，无需任何上位机操作）。注意：无诊断帧≠决策证据。"
+            % (st["total"], "，".join(parts) if parts else "无"))
 
 
 def summarize_chain(parsed_frames, pre, post):
@@ -378,19 +407,23 @@ def z_main():
     except Exception as e:
         _log("UDS 通道释放失败（继续）: %s" % e)
 
-    events = []          # (t_rel, cid, data)
+    events = []          # (t_rel, cid, data)——窗口内全部帧，统计唯一真相源
     parsed = []          # parse_diag_frame 结果序列
-    stats = {"diag": 0}  # 兼容风格：不用 nonlocal
 
     def _collect(t0):
+        """收帧一轮：打印每一帧原始数据（诊断帧额外人话解码）；
+        返回本轮 (cid, dat) 列表供复位 51 01 检测。"""
+        seen = []
         for cid, dat in _recv_frames_min(bus_id):
             t_rel = time.time() - t0
             events.append((t_rel, cid, dat))
+            seen.append((cid, dat))
+            _log("[Rx] T+%7.3fs ID=0x%08X DLC=%d data=%s"
+                 % (t_rel, cid & 0xFFFFFFFF, len(dat), _hex(dat)))
             if (cid & 0x1FFFFFFF) == DIAG_CAN_ID:
-                stats["diag"] += 1
-                _log("T+%.3fs [Rx] 0x%08X %s" % (t_rel, cid, _hex(dat[:8])))
                 parsed.append(parse_diag_frame(dat))
                 _log(decode_diag_frame(dat))
+        return seen
 
     # 2) 监听先行（0.5s 预热，防漏帧），再发复位
     _log("[诊断] raw 监听已建立（0.5s 预热后进入复位流程）")
@@ -413,15 +446,8 @@ def z_main():
              % (attempt, RESET_RETRIES))
         t_wait = time.time() + RESET_WAIT_S
         while time.time() < t_wait and not stopTask:
-            for cid, dat in _recv_frames_min(bus_id):
-                t_rel = time.time() - t_start
-                events.append((t_rel, cid, dat))
-                if (cid & 0x1FFFFFFF) == DIAG_CAN_ID:
-                    stats["diag"] += 1
-                    _log("T+%.3fs [Rx] 0x%08X %s" % (t_rel, cid, _hex(dat[:8])))
-                    parsed.append(parse_diag_frame(dat))
-                    _log(decode_diag_frame(dat))
-                elif (cid & 0x1FFFFFFF) == UDS_RESP_ID and _is_51_01(dat):
+            for cid, dat in _collect(t_start):
+                if (cid & 0x1FFFFFFF) == UDS_RESP_ID and _is_51_01(dat):
                     reset_ok = True
             if reset_ok:
                 break
@@ -432,17 +458,23 @@ def z_main():
     if not reset_ok:
         _log("[诊断] !!!!! 11 01 三次均未收到 51 01 应答 !!!!! 设备可能无响应"
              "或链路异常；可手动断电重试（POR 同样触发 Boot 决策链）——"
-             "监听窗口继续不中断，断电重试期间的诊断帧同样会被抓到")
+             "断电重试期间本窗口继续监听并打印收到的全部帧（含非诊断帧），"
+             "无需任何上位机操作；窗口结束的总线活动统计会区分"
+             "『总线死』与『有流量无诊断帧』")
 
     # 3) 捕获窗口：复位命令后 ≥CAPTURE_WINDOW_S
     t_win_end = t_start + CAPTURE_WINDOW_S
     while time.time() < t_win_end and not stopTask:
         _collect(t_start)
         time.sleep(POLL_INTERVAL_S)
-    _log("[诊断] 捕获窗口结束（%.1fs）：0x18FF480D 帧数=%d，总收帧=%d"
-         % (CAPTURE_WINDOW_S, stats["diag"], len(events)))
-    if stats["diag"] == 0:
-        _log(zero_frame_hint())
+    _log("[诊断] 捕获窗口结束（%.1fs）" % CAPTURE_WINDOW_S)
+    st = summarize_bus(events)
+    _log(format_bus_stats(st))
+    if st["diag"] == 0:
+        if st["total"] == 0:
+            _log(bus_silent_hint())
+        else:
+            _log(traffic_no_diag_hint(st))
 
     # 4) APP 回来后复读 DID
     _uds_init_min()
@@ -500,11 +532,38 @@ def _selftest():
     check("未知标记0xA5", [0xA5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
           "无法解码")
 
-    zh = zero_frame_hint()
-    cases.append(("零帧提示(含C2口径+60d1137+三点排查)",
-                  ("零帧≠决策证据" in zh) and ("60d1137" in zh)
-                  and ("①" in zh and "②" in zh and "③" in zh),
-                  zh[:80] + " ..."))
+    # ---- 合成流三场景（铁律：多 ID 含诊断/多 ID 无诊断/全静默）----
+    ev1 = [(0.011, UDS_RESP_ID, [0x02, 0x51, 0x01, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC]),
+           (0.052, DIAG_CAN_ID, [0xA1, 0x01, 0x00, 0x01, 0x01, 0x01, 0xCC, 0xCC]),
+           (0.054, DIAG_CAN_ID, [0xA2, 0x01, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC]),
+           (0.100, 0x18FF260D, [0x01, 0x41, 0x42, 0x54, 0x00, 0x00, 0xA5, 0x00])]
+    st1 = summarize_bus(ev1)
+    s1 = format_bus_stats(st1)
+    cases.append(("场景1统计：混流含诊断帧(总4/诊断2)",
+                  ("总帧数=4，诊断帧(0x18FF480D)=2" in s1)
+                  and ("ID=0x18FF480D ×2" in s1), s1))
+    cases.append(("场景1：诊断帧>0 不触发零帧提示", st1["diag"] == 2,
+                  "diag=%d" % st1["diag"]))
+    ev2 = [(0.010, UDS_RESP_ID, [0x02, 0x51, 0x01, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC]),
+           (0.080, 0x18FF260D, [0x01, 0x41, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05]),
+           (0.150, 0x18FF260D, [0x01, 0x41, 0x00, 0x02, 0x03, 0x04, 0x05, 0x06])]
+    st2 = summarize_bus(ev2)
+    h2 = traffic_no_diag_hint(st2)
+    cases.append(("场景2统计：混流无诊断帧(总3/诊断0)",
+                  "总帧数=3，诊断帧(0x18FF480D)=0" in format_bus_stats(st2),
+                  format_bus_stats(st2)))
+    cases.append(("场景2提示：有流量无诊断帧二分+ID分布+免上位机",
+                  ("总线有流量但无 0x18FF480D 诊断帧" in h2)
+                  and ("ID=0x18FF260D ×2" in h2)
+                  and ("无需任何上位机操作" in h2), h2))
+    st3 = summarize_bus([])
+    h3 = bus_silent_hint()
+    cases.append(("场景3统计：全静默(总0/诊断0/分布无)",
+                  "总帧数=0，诊断帧(0x18FF480D)=0；按 ID 分布：无"
+                  in format_bus_stats(st3), format_bus_stats(st3)))
+    cases.append(("场景3提示：总线死+物理层+回报agent:main+零帧≠证据",
+                  ("总线完全无任何帧" in h3) and ("回报 agent:main" in h3)
+                  and ("零帧≠决策证据" in h3), h3))
 
     ok_chain = [parse_diag_frame(f) for f in (
         [0xA1, 0x00, 0x00, 0x01, 0x01, 0x01, 0xCC, 0xCC],
@@ -525,7 +584,7 @@ def _selftest():
                   " | ".join(lines3)))
 
     passed = sum(1 for c in cases if c[1])
-    print("=== zcanpro_boot_diag_capture 合成帧自测 ===")
+    print("=== zcanpro_boot_diag_capture 合成流自测 ===")
     for name, ok, s in cases:
         print("[%s] %s\n        → %s" % ("PASS" if ok else "FAIL", name, s))
     print("=== 自测结果：%s（%d/%d 通过）==="
