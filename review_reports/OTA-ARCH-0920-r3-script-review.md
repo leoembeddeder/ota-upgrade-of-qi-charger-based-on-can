@@ -70,3 +70,18 @@
 evidence_digest：①六项 file:line 全核实（:25/:70/:73-80/:83-86+六脚本 diff+import :22）；②0x2115 取值与 C 码逐值一致（boot_metadata.h:58-62+can_protocol.c 直读实证）；③回归链：sign_seed 在用 import 恢复+引用点在位、stopTask 配对/复位完好、无假信号残留；④py_compile+pyflakes 终态全零+自测 21/21；⑤范围干净零越权。confidence=94（剩余不确定性仅 MDK/实机，N5 前置沿用）。
 
 *—— 评估员已完成 R3FE 复验 | 只读零改码*
+
+## R4 第三轮独立检查章节（2026-09-20 22:17，HEAD=64c31be）
+
+**verdict: PASS（无新发现 should_fix+；深查证据如下）**
+
+1. **git 状态**：HEAD=64c31be（=R3FE 报告 commit，叠于代码基线 3dc0649）；python_tools 对 3dc0649 diff=空——**21:36 后零漂移** ✓；使用说明未变（R3FE 结论携带有效）。
+2. **第三轮基准**：py_compile 17/17 OK+pyflakes 全零（独立复跑）✓。
+3. **ota_auto 边界深查（新角度，全部正向证据）**：①设备中途复位：11 01 三试×0.5s 失败→非致命日志"0x37 后已自复位属预期，判定权在三条件闭环"（:829-830）→确认窗口 WINDOW_S+BLIND_PROBES=3+SafeModeError 独立路径（:1036-1059）；②0x37 失败：五次无应答→otx_anomaly=True→继续判定不判死（前置证据 1708-1716）；③0x36 传输中断：块循环 :1567-1574（seq 1..0xFF 回绕+每块 stopTask 检查）异常即抛出→会话中断→重跑=0x31 重擦+新 0x34 干净重来；MCU 侧状态机（ota_download.c:62-68 g_block_seq/g_write_addr+:70 ota_dl_abort）+0x37 verify（magic/length/CRC/ECDSA）拦不完整镜像→flag 不置→fail-closed 端到端 ✓；④TransferExit :1577-1582 五试×45s+SafeModeError 独立；⑤SA 回退：27 02 整包 NRC→自动 27 03 分片（:862-863）✓；⑥超时参数：response=3000ms/enhanced=120000ms（覆盖 0x31 擦槽）✓。
+4. **打包四件套闭合**：pack_image（pack_one→pack_image_if_needed→_selfcheck_image 无条件自检①reset 窗②payload CRC③独立仿射 ECDSA，FAIL 拒产出 :708）↔ota_auto HDR 偏移（VER@0x4C/TS@0x5C :190-192）↔verify_image（MAGIC@0x00/LEN@0x04/CRC@0x08/SIG@0x0C :31-34）↔merge（Boot 16KB+镜像@0x4000）——签名/CRC 均"只覆盖头后 payload"（:692）与 MCU boot_verify/ota_download 同口径 ✓；sign_seed.py 独立作用域=0x27 SA seed 签名（docstring+sk.sign_digest(seed_hash) :98-99），与 ota_auto send_security_key（27 02/03+64B 校验 :841-863）配对闭合，与镜像链无交叉假设 ✓。
+5. **CAN ID/DID 有效性（复认）**：UDS_REQ/RESP=0x18DA0D03/0x18DA030D（can_driver.h/can_protocol.h 未动）；DIAG_CAN_ID=0x18FF480D（boot_safe_mode.h）；0x2113/2114/2115/2116/0xF195/0xF180/0xF193 全部在现行 can_protocol.c 活跃（R3/R3FE 锤行号）；功能脚本 FAIL_STEP_DESC 已 R3F 语义化；Qi/IAP 脚本引用 Qi 芯片层+UDS 对——无已删 ID 引用 ✓。
+6. **安全面（新角度）**：设备侧强制不可被脚本绕过（0x37 verify+boot ECDSA+验后置 flag，脚本无开关）✓；pack 自检无 skip 参数 ✓；三条 info 级记录（非缺陷）：⓪verify_image.py ECDSA 可选（--key，省略时打印 skipped，PASS≠签名已验——文档已标"可选"，建议使用说明强调）；ⓐEXPECTED_SW_VERSION="" 空串=拒闪门+外部锚定双关（文档化设计"留空恢复缺省"，需操作者刻意清空，非隐藏 bypass）；ⓒNRC 0x78 脚本层重试分支在 ZCANPRO 库上可能不触发（:736-738 文档化限制，120s enhanced_timeout 兜底）。
+
+**new_vs_r3fe=无新发现（should_fix+级）**；本轮产出=三边界场景正向证据+三条 info 安全面记录，均为前两轮未覆盖角度的确认，非凑数。confidence=88（0x36 中断恢复为静态代码级论证；ZCANPRO 库行为为文档化定性）。
+
+*—— 评估员已完成 R4 第三轮检查 | 只读零改码*
