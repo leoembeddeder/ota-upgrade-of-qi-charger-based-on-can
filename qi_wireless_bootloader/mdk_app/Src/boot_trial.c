@@ -183,6 +183,7 @@ int8_t try_boot_slot(uint8_t slot, ota_metadata_t *meta)
 
   if ((slot_addr == 0) || (slot_size == 0))
   {
+    boot_diag_m3(0U, 0U, slot); /* 诊断 M3：槽地址/大小无效，校验未执行（fail_step=0） */
     return -1;
   }
 
