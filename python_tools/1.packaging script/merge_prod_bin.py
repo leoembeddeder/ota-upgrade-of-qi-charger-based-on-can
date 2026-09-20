@@ -13,6 +13,7 @@ Usage:
     python merge_prod_bin.py
     python merge_prod_bin.py --boot <path> --app <path> --out <path>
     python merge_prod_bin.py --hex
+    python merge_prod_bin.py --force   # merge even without XATO magic
 """
 
 from __future__ import print_function
@@ -75,6 +76,9 @@ def main(argv=None):
                         help="output merged bin (default: burn bin/prod_image.bin)")
     parser.add_argument("--hex", action="store_true",
                         help="also produce Intel HEX next to the bin")
+    parser.add_argument("--force", action="store_true",
+                        help="merge even if the APP image does not start with "
+                             "XATO magic (default: hard-fail)")
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.boot):
@@ -96,9 +100,20 @@ def main(argv=None):
             len(app_data), APP_SIZE))
         return 1
     if len(app_data) < 4 or app_data[:4] != b"XATO":
-        sys.stderr.write(
-            "WARNING: APP image does not start with XATO magic; "
-            "is this a packed app_image.bin?\n")
+        # D4-R2: XATO magic mismatch is a hard gate by default — merging a
+        # non-XATO payload into a production bin would brick the App slot.
+        # --force downgrades to WARNING for deliberate overrides.
+        if args.force:
+            sys.stderr.write(
+                "WARNING: APP image does not start with XATO magic; "
+                "continuing because --force was given. "
+                "Is this a packed app_image.bin?\n")
+        else:
+            sys.stderr.write(
+                "ERROR: APP image does not start with XATO magic; "
+                "is this a packed app_image.bin? "
+                "Use --force to merge anyway.\n")
+            sys.exit(1)
 
     padded_boot = boot_data.ljust(BOOT_SIZE, b"\xFF")
     merged = padded_boot + app_data

@@ -15,7 +15,6 @@ from __future__ import print_function
 
 import argparse
 import binascii
-import hashlib
 import os
 import struct
 import sys
@@ -68,7 +67,13 @@ def p1363_to_der(sig_bytes):
 
 
 def pem_to_sec1(public_key_path):
-    """Extract uncompressed SEC1 point (04||X||Y) from an SPKI PEM."""
+    """Extract uncompressed SEC1 point (04||X||Y) from an SPKI PEM.
+
+    DEPRECATED (D4-M1): verify_ecdsa no longer converts the key to raw
+    SEC1 — openssl dgst -verify requires a PEM public key, so the key
+    file is now written through verbatim. Kept for reference/back-compat
+    only; do not use on signing/verification paths.
+    """
     raw = open(public_key_path, "rb").read()
     text = raw.decode("ascii", "ignore")
     lines = [l.strip() for l in text.splitlines() if "BEGIN" not in l and "END" not in l]
@@ -104,16 +109,36 @@ def verify_ecdsa(firmware, signature, public_key_path):
     try:
         import subprocess
         import tempfile
-        sec1 = pem_to_sec1(public_key_path)
         der_sig = p1363_to_der(signature)
-        digest = hashlib.sha256(firmware).digest()
         with tempfile.NamedTemporaryFile(delete=False) as f_sig, \
              tempfile.NamedTemporaryFile(delete=False) as f_pub, \
              tempfile.NamedTemporaryFile(delete=False) as f_dgst:
-            f_sig.write(der_sig)
-            f_pub.write(b"\x04" + sec1[1:] if sec1[0:1] != b"\x04" else sec1)
-            f_dgst.write(digest)
             sig_path, pub_path, dgst_path = f_sig.name, f_pub.name, f_dgst.name
+            f_sig.write(der_sig)
+            # D4-M1 ②: write firmware verbatim — the signature domain is a
+            # single SHA256 over the payload; let openssl dgst -sha256 do
+            # that one hash (pre-hashing here caused a double SHA256).
+            f_dgst.write(firmware)
+            # D4-M1 ①: openssl dgst -verify needs a PEM *public* key, not a
+            # raw SEC1 point (the old 0x04-prefix SEC1 mangling dropped X[0]
+            # and fed raw bytes -> "Could not read public key"). Public PEM
+            # is written through verbatim; a private-key PEM (e.g.
+            # docs/keys/private.pem) cannot be read by OpenSSL 3.x dgst as a
+            # verify key, so derive the public PEM via `openssl pkey
+            # -pubout`; fall back to a verbatim write if that ever fails.
+            key_raw = open(public_key_path, 'rb').read()
+            if b"PRIVATE" in key_raw:
+                f_pub.close()
+                rc_pub = subprocess.call(
+                    ["openssl", "pkey", "-in", public_key_path,
+                     "-pubout", "-out", pub_path],
+                    stdout=open(os.devnull, "w"),
+                    stderr=open(os.devnull, "w"))
+                if rc_pub != 0:
+                    with open(pub_path, "wb") as fh:
+                        fh.write(key_raw)
+            else:
+                f_pub.write(open(public_key_path, 'rb').read())
         rc = subprocess.call(["openssl", "dgst", "-sha256", "-verify", pub_path,
                               "-signature", sig_path, dgst_path],
                              stdout=open(os.devnull, "w"),
@@ -160,6 +185,9 @@ def main(argv=None):
         reset, APP_ENTRY_ADDR, APP_BASE_ADDR + APP_SIZE,
         "OK" if ok_reset else "FAIL"))
     print("hdr @0x4C    : reserved placeholder = {}".format(reserved_ver.hex()))
+    # D4-R1: audit visibility only — does not change PASS/FAIL.
+    if reserved_ver != b"\x00" * 16:
+        print("WARNING: hdr_reserved_ver @0x4C not all-zero (expected 0x00)")
     print("build ts     : {}".format(build_ts))
 
     ok_sig = None
