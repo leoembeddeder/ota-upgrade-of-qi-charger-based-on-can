@@ -13,6 +13,8 @@ ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA（单 App 架构，OTA-ARCH-09
      复制→复核→清标志→跳转）→ 复位后版本核验。
 EXPECTED_SW_VERSION 固化 "QC_JYF_FW_1.1.2"，选 bin 版本匹配优先/
 mtime 次序（旧版本残留绝不被选中），不符→拒闪（fail-closed）。
+命令行 --firmware <path> 可指定发送 bin（跳过自动选择；版本闸门照常执行，
+指定文件 strings 不含 EXPECTED_SW_VERSION 同样拒闪 fail-closed）。
 判定闭环：①复位后 APP 应答 ②0xF195==EXPECTED_SW_VERSION
 （0x2113 在单 App 架构恒为 0x00，仅信息展示）。
 仓库固件 SW_VERSION_STR 保持 QC_JYF_FW_1.1.1 零触碰（铁律）。
@@ -22,6 +24,7 @@ mtime 次序（旧版本残留绝不被选中），不符→拒闪（fail-closed
 需要: Python 3.8 32 位（ZCANPRO 扩展脚本要求）
 """
 
+import argparse
 import os
 import sys
 import time
@@ -54,6 +57,12 @@ EXPECTED_SW_VERSION = "QC_JYF_FW_1.1.2"
 # 基线）。仅用于升级前基线确认打印（异常时醒目提醒，不拦截流程），
 # 与判定闭环三条件无关。
 BASELINE_SW_VERSION = "QC_JYF_FW_1.1.1"
+
+# FIRMWARE_OVERRIDE：命令行 --firmware 指定的 OTA 载荷路径（None=自动选择）。
+#   仅 standalone 命令行运行且传入 --firmware 时由 __main__ 入口赋值；
+#   ZCANPRO 宿主加载（无 CLI 参数）时保持 None → _pick_firmware() 自动选择。
+#   指定路径不豁免版本闸门：strings 校验+拒闪 fail-closed 与自动路径同一套。
+FIRMWARE_OVERRIDE = None
 
 
 def _find_repo_root(start):
@@ -1442,11 +1451,21 @@ def run_ota(bus_id):
     priv = load_ec_private_key(PRIVATE_KEY_PATH)
     uds_init()
     try:
-        FIRMWARE_PATH = _pick_firmware()
+        if FIRMWARE_OVERRIDE:
+            _log("用户指定固件: %s（跳过自动选择）" % FIRMWARE_OVERRIDE)
+            if not os.path.isfile(FIRMWARE_OVERRIDE):
+                raise RuntimeError("用户指定固件不存在: %s（不回退自动选择；"
+                                   "请检查 --firmware 路径后重跑）"
+                                   % FIRMWARE_OVERRIDE)
+            FIRMWARE_PATH = os.path.abspath(FIRMWARE_OVERRIDE)
+        else:
+            FIRMWARE_PATH = _pick_firmware()
         fw_data = open(FIRMWARE_PATH, "rb").read()
         bin_ver = _extract_sw_version(fw_data)
         _log("选中 bin 内 SW_VERSION_STR=%s（strings 扫描 QC_JYF_FW_ 前缀）"
              % (bin_ver or "未找到"))
+        # 版本闸门（fail-closed）：_pick_firmware() 自动选择与 --firmware
+        # 指定两条路径均执行本检查，闸门不因指定文件而放松。
         if EXPECTED_SW_VERSION:
             if bin_ver != EXPECTED_SW_VERSION:
                 raise RuntimeError(
@@ -1676,3 +1695,34 @@ def z_main():
         run_ota(buses[0]["busID"])
     except Exception as e:
         _log("OTA 失败: " + str(e))
+
+
+def _parse_cli_args():
+    """命令行参数解析（standalone 运行路径专用）。
+
+    ZCANPRO 宿主加载本脚本时不经过本函数（宿主直接调用 z_main()，
+    FIRMWARE_OVERRIDE 保持 None → 自动选择路径）。用 parse_known_args：
+    宿主/包装器 argv 中的未知参数不拦截脚本执行。"""
+    parser = argparse.ArgumentParser(
+        description="Qi CAN-UDS OTA 扩展脚本（单 App 架构）命令行参数")
+    parser.add_argument("--firmware", default=None,
+                        help="指定 OTA 发送的 bin 文件路径（跳过自动选择，仍执行版本闸门检查）")
+    args, _unknown = parser.parse_known_args()
+    return args
+
+
+if __name__ == "__main__":
+    _cli = _parse_cli_args()
+    FIRMWARE_OVERRIDE = _cli.firmware
+    if zcanpro is None:
+        _log("zcanpro 模块不可用：本脚本需在 ZCANPRO 扩展脚本环境"
+             "（Python 3.8 32 位 + zcanpro 模块）中运行；"
+             "--firmware 参数解析正常（%s）"
+             % (FIRMWARE_OVERRIDE or "未指定，自动选择"))
+        sys.exit(1)
+    _argv0 = os.path.basename((sys.argv[0] if sys.argv else "") or "")
+    if _argv0.endswith(".py"):
+        # 命令行直跑本脚本（argv[0]=脚本路径）→ 参数解析后启动 OTA；
+        # ZCANPRO 宿主若以 __main__ 形态加载（argv[0]=宿主可执行体）不自跑，
+        # 由宿主调用 z_main()，避免双重执行。
+        z_main()
