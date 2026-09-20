@@ -9,9 +9,17 @@ ZCANPRO 脚本 — 读取 APP 侧版本号 DID 0xF195 / 0xF180 / 0xF193
   本脚本期望值必须与固件编译常量一致。
 
 流程：
-  1. TesterPresent 0x3E 00 连发两次（第一帧可能只唤醒 SIT1145 Standby）
+  1. TesterPresent 0x3E 00 最多连发 8 次（覆盖 Boot→App CAN 黑窗；
+     第一帧可能只唤醒 SIT1145 Standby）
   2. 原始 CAN 发 03 22 F1xx，收 ISO-TP 多帧并按 SN 组包
   3. 失败再试 zcanpro.uds_request
+
+架构（OTA-ARCH-0920）：Boot(16KB) + App(48KB) + Backup(48KB)，单 App 无 A/B 槽位。
+
+2026-09-21 P0-P2 修复（OTA-ARCH-0920-D3 审计）：
+  - P0: wake_mcu 重试 2→8 次、间隔 0.15→0.5s，覆盖最坏 ~5s Boot→App CAN 黑窗
+  - P1: raw 嗅探路径改为嗅探前重新 _uds_init()（deinit 后 receive 恒空，嗅探失效）
+  - P2: 旧架构文案（旧槽位/旧 Boot 尺寸表述）更新为当前单 App 架构口径
 
 receive() 实际返回 (status, [frames])，不是帧字典列表。
 """
@@ -300,7 +308,8 @@ def parse_did_string(did, rx):
 
 
 def _sniff(bus_id, seconds):
-    """不经过 UDS 库，把总线上的帧都打出来。"""
+    """不经过 UDS 库，把总线上的帧都打出来。
+    前提：UDS 处于 init 状态——ZLG deinit 后 receive 恒返回 (1,[])，嗅探必为 0 帧。"""
     t_end = time.time() + float(seconds)
     n = 0
     saw_boot = None
@@ -331,9 +340,12 @@ def _sniff(bus_id, seconds):
 
 
 def wake_mcu(bus_id):
-    """V1.0.0：3E 00 等 7E。第一帧可能被 WUP 吃掉。"""
+    """3E 00 等 7E，最多重试 8 次（OTA-ARCH-0920-D3/P0）。
+    Boot→App CAN 黑窗最坏 ~5s（backup_valid=1 时 ECDSA 验签×2 + 48KB Flash 擦写）；
+    旧参数 2 次×0.15s 窗口临界不足。每次 UDS 应答超时 2s + 间隔 0.5s，
+    8 次累计覆盖 ~20s。第一帧可能被 SIT1145 Standby WUP 吃掉。"""
     ok = False
-    for i in range(1, 3):
+    for i in range(1, 9):
         if stopTask:
             raise RuntimeError("用户停止")
         try:
@@ -343,8 +355,8 @@ def wake_mcu(bus_id):
                 ok = True
                 break
         except Exception as e:
-            _log("唤醒 %d/2: %s" % (i, e))
-            time.sleep(0.15)
+            _log("唤醒 %d/8: %s" % (i, e))
+            time.sleep(0.5)
     return ok
 
 
@@ -393,9 +405,11 @@ def run(bus_id):
                 _log("  %s = [失败] %s" % (name, err))
         return
 
-    _log("UDS 无 7E，deinit 后 raw 嗅探（init 过才能 receive）")
+    # OTA-ARCH-0920-D3/P1：ZLG 库 deinit 后 receive 恒返回 (1,[])，嗅探拿不到任何帧；
+    # 必须重新 _uds_init() 打开接收通路，raw 嗅探才有信息量。
+    _log("UDS 无 7E，重新 _uds_init() 后 raw 嗅探（deinit 后 receive 恒空）")
     time.sleep(0.05)
-    _uds_deinit()
+    _uds_init()
 
     can_send(bus_id, UDS_REQ_ID, [0x02, 0x3E, 0x00])
     _log("[Tx raw] 02 3E 00")
@@ -405,11 +419,12 @@ def run(bus_id):
 
     saw_boot, saw_app, saw_life, n = _sniff(bus_id, 1.5)
     if saw_boot is not None:
-        _log("设备在 Boot safe mode, fail_step=%d。请 merge_prod_bin 整片烧 Boot+APP。" % saw_boot)
+        _log("设备在 Boot safe mode, fail_step=%d。请 merge_prod_bin 整片烧写 Boot(16KB)+App(48KB)+Backup(48KB)。" % saw_boot)
         return
     if n == 0:
         _log("总线上 0 帧 MCU 回复。请确认：1) 通道 250kbps 扩展帧已打开；"
-             "2) 已用当前 main 同时烧 16KB Boot 和 Slot A APP（勿与 V1.0.0 28KB Boot 混用）；"
+             "2) 已用当前 main 烧写完整镜像 Boot(16KB)+App(48KB)+Backup(48KB)"
+             "（OTA-ARCH-0920 单 App 架构，无 A/B 槽位；勿与 V1.0.0 旧版 Boot 混用）；"
              "3) 断电重启后再跑。")
         return
 
