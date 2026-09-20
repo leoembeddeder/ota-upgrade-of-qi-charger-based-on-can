@@ -44,3 +44,16 @@
 处置：与 B1（ota_image_header_t 恢复）一并交 coder 热修或下一批修复；docs/2 §一/§三自相矛盾（§三已改 v3 而 :15/:30 仍 272B）优先修正。注释级问题不影响代码事实（v3 结构/版本/CRC offset 双工程代码层已验证正确），不改变 FAIL verdict（B1 仍为唯一 blocking）。
 
 *—— 评估员已完成复审（含主管增补核查）| 只读铁律：业务代码零触碰*
+
+## Q2FE 终验章节（2026-09-20 18:50，HEAD=7581fed）
+
+**verdict: PASS → Q2 全批闭环**（B1 判据全部成立+7 处注释全清+v3/红线无误动+范围干净）
+
+1. **B1 判据 PASS**：ota_image_header_t 定义点=1（ota_trigger.h:82）+消费点=2（ota_download.c:199/:264）✓；恢复的 typedef 与 90e1c95 原版字段逐字一致（magic 0x4F544158 "XATO"/image_length/crc32/signature[64]/hdr_reserved_ver[16]/build_timestamp/reserved[160]，256B，顺序/类型/命名全同）✓；编译阻断解除。
+2. **7 处注释终验 PASS（ALL_7_CLEAN 复现）**：boot_metadata.h:20-22→"v3 slim layout (28 bytes, crc32 at offset 0x18, META_VERSION=3)…v2-and-earlier rejected"；boot_metadata.h:70-72→"structure v3 (28 bytes total)"；ota_trigger.h:18-19→"v3 slim layout (28B, crc32 @0x18, META_VERSION=3)"；boot_metadata.c:8→"(META_VERSION=3): v2-and-earlier…rejected"；docs/2:15→"（28B v3 结构）"、:30→"ota_metadata_t (28B v3)"；docs/2 全篇"272"计数=0 ✓；排除项 ota_trigger.h:70 XATO 256B byte-frozen 未被动 ✓。
+3. **v3 完好+红线 PASS**：boot_metadata.h META_VERSION=3U(:55)/copy_fail_step@0x0A(:82)/reserved[3]@0x15(:87)/crc32@0x18(:88)；ota_trigger.h OTA_META_VERSION=3U(:48)/copy_fail_step(:94)/crc32@0x18——与 d3b550d 复审结论一致，热修未误动 ✓；读回循环 boot_metadata.c:82+ota_trigger.c:149 `!= src[i]` 在位；boot_trial.c 先验后擦(:115-127)/copy_fail_step 写点(:127/:139/:149/:161/:173)/复核后清 flag(:183 backup_valid=0U)在位 ✓。
+4. **范围审计 PASS**：aaa7d91+7581fed 改动面=docs/2+boot_metadata.h+boot_metadata.c+ota_trigger.h+q2-review.md（另 f71ddca 为本报告增补，区间合计 6 文件均授权）；代码逻辑零改动（typedef 恢复+注释/文档文字）✓；Python/uvprojx 零触碰（定向 diff 空）✓。
+
+evidence_digest：①typedef 定义点 1+消费点 2+字段与 90e1c95 逐字一致=编译阻断解除实证；②7 处注释全部=v3 表述+docs/2"272"=0；③v3 结构字段/偏移/META_VERSION=3U 两侧与前审结论一致+红线 grep 全在位；④范围=注释/文档/typedef 恢复，零逻辑改动+Python 零触碰。confidence=93（剩余不确定性仅 MDK 实编译，N5 前置沿用）。
+
+*—— 评估员已完成 Q2FE 终验 | 只读铁律：业务代码零触碰*
