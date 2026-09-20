@@ -164,12 +164,16 @@ void boot_diag_m2(int8_t ret, uint8_t info)
 {
   /* M2 payload (single-App arch): b1=copy result
    * (0=sequence start / no pending when b2=0xFF, 1=copy committed,
-   * 0xFF=copy failed) b2=detail (fail_step on failure, 0xFF=not pending) */
+   * 0xFF=copy failed) b2=detail (fail_step on failure, 0xFF=not pending)
+   * — wire order == documented order == param order, same pattern as
+   *   M1/M3/M4; byte order unified per OTA-ARCH-0920-D5 (body previously
+   *   sent p[1]=info/p[2]=ret, inverted vs header doc + this comment,
+   *   capture-side M2 misread risk on retest) */
   uint8_t p[3];
 
   p[0] = 0xA2U;
-  p[1] = info;
-  p[2] = (uint8_t)ret;
+  p[1] = (uint8_t)ret; /* b1: copy result */
+  p[2] = info;         /* b2: detail */
   boot_diag_frame_send(p, 3U);
 }
 

@@ -35,6 +35,9 @@ void enter_safe_mode(uint8_t cause);
  *            [magic_ok][ver_ok][crc_ok]
  *   M2 0xA2: [copy result 0=start-or-none/1=committed/0xFF=failed]
  *            [detail: fail_step or 0xFF=not-pending]
+ *            （字节序统一 b1=copy result, b2=detail：boot_safe_mode.c
+ *            实现与 zcanpro_boot_diag_capture.py 解码同序，wire 即文档序；
+ *            OTA-ARCH-0920-D5，勿再单独改其一）
  *   M3 0xA3: [pass][fail_step 0xFF=verifying][target 0=Backup/1=App]
  *   M4 0xA4: [jump target addr LE 4B] (App entry 0x08004100) */
 

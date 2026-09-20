@@ -55,22 +55,35 @@ int8_t boot_backup_pending(const ota_metadata_t *meta)
 }
 
 /**
- * @brief  erase one flash sector with bounded polling
+ * @brief  erase the App flash region with bounded polling
+ * @note   IRQ-off + flash unlock/lock around the erase burst, same
+ *         single-bank discipline as meta_write_to_flash (boot_metadata.c)
+ *         and copy_program_region below. Flash stays locked until the
+ *         first write of the boot session: with metadata primary valid
+ *         (normal OTA path) Boot performs no earlier flash write, so an
+ *         erase without unlock always fails -> copy_fail_step=0xFE
+ *         (OTA-ARCH-0920-D5 P0-1). Erase range/sector size unchanged.
  */
 static int8_t copy_erase_app_region(void)
 {
   uint32_t addr;
   flash_status_type status;
 
+  __disable_irq();
+  flash_unlock();
   for (addr = APP_BASE_ADDR; addr < (APP_BASE_ADDR + APP_SIZE);
        addr += FLASH_SECTOR_SIZE)
   {
     status = flash_sector_erase(addr);
     if (status != FLASH_OPERATE_DONE)
     {
+      flash_lock();
+      __enable_irq();
       return -1;
     }
   }
+  flash_lock();
+  __enable_irq();
   return 0;
 }
 
