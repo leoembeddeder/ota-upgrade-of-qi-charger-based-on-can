@@ -70,7 +70,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 │   └── libraries/                          ← CMSIS + AT32 SPL 驱动库
 │
 ├── qi_wireless_code_app/                   ← APP 工程 (App 区 48KB, IROM1=0x08004100)
-│   ├── mdk_project/                        ← Keil 工程，输出 qi_wireless.bin
+│   ├── mdk_project/                        ← Keil 工程，输出 qi_wireless_code_app.bin
 │   ├── mdk_user/                           ← main.c 入口、时钟、中断
 │   ├── mdk_can/                            ← CAN 底层驱动
 │   ├── mdk_app/                            ← can_protocol / ota_download / ota_trigger
@@ -130,7 +130,7 @@ ota-upgrade-of-qi-charger-based-on-can/
 1. 打开 `qi_wireless_code_app/mdk_project/qi_wireless_code_app.uvprojx`
 2. Target → IROM1: `0x08004100` / `0xBF00`
 3. Linker → 勾选 "Use Memory Layout from Target Dialog"
-4. Build → 输出 `Objects/qi_wireless.bin`（裸 bin，不含 XATO 头）
+4. Build → 输出 `Objects/qi_wireless_code_app.bin`（裸 bin，不含 XATO 头）
 
 ### 3.4 产线烧录
 

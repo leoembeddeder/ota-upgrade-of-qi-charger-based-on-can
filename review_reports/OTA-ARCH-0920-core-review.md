@@ -36,7 +36,7 @@ Keil 工程 IROM 实测（uvprojx <Cpu> 行）：
 | 检查项 | 结论 | 证据 |
 |---|---|---|
 | 链接地址头尾重叠 | 通过 | §1 边界算式：四区边界相接零重叠；Keil IROM 实测值与分区表一致 |
-| 标志位持久化 | 通过 | backup_valid/backup_crc32 存于双副本 metadata（backup 先写、primary 后写、逐字读回校验，boot_metadata.c/ota_trigger.c meta_write_to_flash 咽喉点关中断保护）；APP 0x37 只在 verify 全过后置 flag；BOOT 只在 App 区复核过后清 flag |
+| 标志位持久化 | 通过 | backup_valid/backup_crc32 存于双副本 metadata（backup 先写、primary 后写；双侧 meta_write_to_flash 均含逐字读回校验——boot 侧原有、app 侧 N1 收尾补齐同构循环（本报告初版表述为时过早，已按落地事实修正）；咽喉点关中断保护）；APP 0x37 只在 verify 全过后置 flag；BOOT 只在 App 区复核过后清 flag |
 | 搬运中断电恢复 | 通过 | 擦 App 区前已完成 Backup 验签（坏镜像不会触发擦除）；擦/搬/复核任一点断电→flag 仍在→下次上电重跑全链（Boot 每次上电检测）；copy 失败时 fail_step 记入 reserved_trial[0]、copy_retry_count++ 落盘、M2 诊断帧报告，旧 App 若仍可验签则照常启动（flag 保留下轮再试） |
 | 脚本常量一致性 | 通过 | §1 三方对照表 grep 实测一致；zcanpro import 断言 APP_BASE/BACKUP_BASE/DOWNLOAD_ADDR/EXPECTED_SW_VERSION 值正确；pack/verify/merge 常量同源 |
 
@@ -63,7 +63,7 @@ Keil 工程 IROM 实测（uvprojx <Cpu> 行）：
 - C/Python 分区常量三方 grep 一致（§1 表）
 - 遗留槽语义 grep：C 源非注释项 CLEAN；Python 非注释项 CLEAN
 - uvprojx XML：app 工程 TargetName/OutputName/ScatterFile=qi_wireless_code_app，IROM(0x08004100,0xBF00)，slotA/slotB 引用计数=0；bootloader uvprojx 未动（IROM 0x08000000,0x4000）
-- git rm slotB：91 个删除项全部为 D/R 状态，无非删除残留
+- git 状态实测（evaluator 复核 @735fd30）：A=3/D=93/R=89/M=15=200；D=93=90 slotB 删除+3 slotA 侧重写幅度过大未配 rename 的配对删除；R=89 目标路径全部落 qi_wireless_code_app/；全部条目在任务授权范围内（初版口头计数 91/83 为状态快照口径，以实测为准）
 
 未验证项（WSL 无法执行，如实列报）：
 - MDK 编译：bootloader 工程与 qi_wireless_code_app 工程均未在 Keil 下编译（WSL 无 MDK）；C 端改造（boot_metadata/boot_trial/boot_verify/boot_jump/main/boot_safe_mode/ota_trigger/ota_download/can_protocol）仅有静态自查

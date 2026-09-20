@@ -142,6 +142,19 @@ static int8_t meta_write_to_flash(uint32_t addr, const ota_metadata_t *meta)
       return -1;
     }
   }
+
+  /* word-by-word readback verify — same structure as bootloader
+   * boot_metadata.c meta_write_to_flash (evaluator N1, dual-project
+   * same-source); IRQs stay masked for the readback window */
+  for (i = 0; i < words; i++)
+  {
+    if (*(volatile uint32_t *)(addr + (i * 4U)) != src[i])
+    {
+      flash_lock();
+      __enable_irq();
+      return -1;
+    }
+  }
   flash_lock();
 
   __enable_irq();
