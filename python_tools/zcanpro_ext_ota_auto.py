@@ -999,9 +999,10 @@ def confirm_app_after_reset(bus_id):
     三阶段：前 3 次盲探 22 2113 → 失败后 wake_bus + 监听生命周期帧 →
     继续探测并间歇监听。窗口 45s。
 
-    返回 (slot, sw_ver)：slot=复位后 0x2113 应答槽字节（0=A/1=B），
-    sw_ver=0xF195 应答 ASCII rstrip（读失败=None）——两者供 run_ota
-    判定闭环（三条件）使用，本函数内仅记录不断言。
+    返回 (slot, sw_ver, ota_status)：slot=复位后 0x2113 应答槽字节，
+    sw_ver=0xF195 应答 ASCII rstrip（读失败=None），
+    ota_status=0x2112 应答字节（0x05=Confirmed 搬运成功，读失败=None）——
+    三者供 run_ota 判定闭环使用，本函数内仅记录不断言。
 
     三态诊断：
     a) UDS 响应 = 成功；
@@ -1119,6 +1120,19 @@ def confirm_app_after_reset(bus_id):
         _log("DID 0xF195 NRC 0x%02X（计入判定差异明细）" % e.nrc)
     except Exception as e:
         _log("DID 0xF195 读取失败（计入判定差异明细）: %s" % e)
+    ota_status = None
+    try:
+        st = uds_req(bus_id, SID_RDBI, [0x21, 0x12])
+        if len(st) >= 4 and st[0] == (SID_RDBI + SID_PR):
+            ota_status = st[3]
+            _log("DID 0x2112 OTA状态=0x%02X（0x05=Confirmed 搬运成功/"
+                 "0x06=Rolled Back 回滚/0x07=Failed 失败）" % ota_status)
+        else:
+            _log("DID 0x2112 响应异常: " + _hex(st[:8]))
+    except UdsNrcError as e:
+        _log("DID 0x2112 NRC 0x%02X（计入判定差异明细）" % e.nrc)
+    except Exception as e:
+        _log("DID 0x2112 读取失败（计入判定差异明细）: %s" % e)
     try:
         uds_req(bus_id, SID_RD, [0x00])
         _log("复位后 0x34 正响应，已在 APP")
@@ -1126,7 +1140,7 @@ def confirm_app_after_reset(bus_id):
         _log("复位后 0x34 NRC 0x%02X，已在 APP（默认会话下正常）" % e.nrc)
     except RuntimeError as e:
         raise RuntimeError("复位后 0x34 无应答（跳转失败或 APP CAN 未起来）: " + str(e))
-    return slot, sw_ver
+    return slot, sw_ver, ota_status
 
 
 def _read_did_u8_safe(bus_id, did):

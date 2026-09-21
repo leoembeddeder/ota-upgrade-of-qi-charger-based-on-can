@@ -278,6 +278,17 @@ def read_sw_version(bus_id):
 
 # ---------------- 升级执行后端 ----------------
 
+def read_ota_status(bus_id):
+    """UDS 22 21 12 → OTA status byte (0x05=Confirmed)。"""
+    try:
+        rx = uds_req(bus_id, 0x22, [0x21, 0x12])
+        if len(rx) >= 4 and rx[0] == 0x62:
+            return rx[3]
+    except Exception:
+        pass
+    return None
+
+
 def _parse_ota_result(text):
     """升级结果判定：输出含「OTA 成功」→ True（执行器 run_ota 成功路径
     固定打印 ======== OTA 成功 ========）。spec 兼容：「OTA FAIL」按失败。"""
@@ -413,6 +424,7 @@ def run_stress(bus_id, start, end, bin_dir, continue_on_fail, runner):
 
         read_ver = "-"
         read_err = None
+        ota_status = None
         if not os.path.isfile(bin_p):
             ota_res = "文件缺失"
             verdict = "FAIL"
@@ -443,13 +455,17 @@ def run_stress(bus_id, start, end, bin_dir, continue_on_fail, runner):
                                            % WAKE_RETRIES)
                     read_ver = read_sw_version(bus_id)
                     _log("读到版本 : %s（DID 0x%04X）" % (read_ver, EXPECTED_DID))
+                    ota_status = read_ota_status(bus_id)
+                    _log("OTA 状态 : 0x%02X（DID 0x2112，0x05=Confirmed 搬运成功）"
+                         % (ota_status if ota_status is not None else 0xFF))
                 except Exception as e:
                     read_err = e
                     read_ver = "读取失败"
                     _log("版本读取失败: %s" % e)
                 finally:
                     uds_deinit()
-            verdict = "PASS" if (ok and read_ver == expected_full) else "FAIL"
+            ota_ok = (ota_status == 0x05) if ota_status is not None else False
+            verdict = "PASS" if (ok and read_ver == expected_full and ota_ok) else "FAIL"
             if verdict == "FAIL" and ok:
                 _log("FAIL：版本不匹配——读到 %s，预期 %s%s"
                      % (read_ver, expected_full,
