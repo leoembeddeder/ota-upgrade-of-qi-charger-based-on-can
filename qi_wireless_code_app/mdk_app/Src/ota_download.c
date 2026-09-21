@@ -603,16 +603,9 @@ void ota_dl_poll(void)
   can_proto_end_long_op();
   resp[0] = (uint8_t)(UDS_SID_TRANSFER_EXIT + UDS_POSITIVE_RESPONSE_OFFSET);
   can_proto_send_response(resp, 1);
-  /* Single-App activation: after verify_backup_image + commit_backup
-   * succeed the APP resets itself; BOOT sees backup_valid=1, copies
-   * Backup->App, re-verifies, clears the flag, jumps. Host 11 01 stays
-   * as legacy-compatible fallback. Response must hit the wire before
-   * reset: wait TX idle, SHUTDOWN lifecycle frame, then reset.
-   * 0x37 retry idempotence: post-reset retries land on the new APP
-   * (default session -> NRC 0x22); g_trial_ready guards pre-reset
-   * duplicates (positive response, no double commit). */
+  /* 0x37 收尾：verify+commit_backup 成功后不再自行复位，等主机发
+   * 11 01 才复位。0x77 正响应已落总线，g_trial_ready=1 防止重复 commit。
+   * 复位后 BOOT 看到 backup_valid=1 → 搬运 Backup→App → 跳转。
+   * DID 0x2112 此时返回 0x03（Pending Activation），等 11 01 激活。 */
   (void)can_driver_wait_tx_idle(50U);
-  lifecycle_set_state(LIFECYCLE_SHUTDOWN);
-  (void)can_driver_wait_tx_idle(20U);
-  NVIC_SystemReset();
 }
