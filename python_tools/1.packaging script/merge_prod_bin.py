@@ -33,6 +33,24 @@ DEFAULT_BOOT = os.path.join(
 DEFAULT_APP = os.path.join(APP_BIN_DIR, "app_image.bin")
 DEFAULT_OUT = os.path.join(BURN_BIN_DIR, "prod_image.bin")
 
+
+def _find_latest_app_image():
+    """扫描 app bin/ 目录，返回 mtime 最新的 app_image*.bin 路径。
+    pack_image.py 按版本号自动命名（app_image_v{x}_{y}_{z}.bin），
+    固定名 app_image.bin 仅在版本串缺失时作为 fallback 产出。"""
+    if not os.path.isdir(APP_BIN_DIR):
+        return None
+    candidates = []
+    for name in os.listdir(APP_BIN_DIR):
+        if name.startswith("app_image") and name.endswith(".bin"):
+            path = os.path.join(APP_BIN_DIR, name)
+            if os.path.isfile(path):
+                candidates.append((os.path.getmtime(path), path))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
 BOOT_BASE = 0x08000000
 BOOT_SIZE = 0x4000
 APP_SIZE = 0xC000
@@ -70,8 +88,8 @@ def main(argv=None):
         description="Merge Bootloader + App image into one production bin")
     parser.add_argument("--boot", default=DEFAULT_BOOT,
                         help="bootloader.bin path (default: Objects/bootloader.bin)")
-    parser.add_argument("--app", default=DEFAULT_APP,
-                        help="packed App XATO image path (default: app bin/app_image.bin)")
+    parser.add_argument("--app", default=None,
+                        help="packed App XATO image path (default: auto-detect newest app_image*.bin in app bin/)")
     parser.add_argument("--out", default=DEFAULT_OUT,
                         help="output merged bin (default: burn bin/prod_image.bin)")
     parser.add_argument("--hex", action="store_true",
@@ -84,6 +102,14 @@ def main(argv=None):
     if not os.path.isfile(args.boot):
         sys.stderr.write("ERROR: Bootloader not found: {}\n".format(args.boot))
         return 1
+    if args.app is None:
+        args.app = _find_latest_app_image()
+        if args.app is None:
+            sys.stderr.write(
+                "ERROR: app bin/ 下未找到 app_image*.bin。"
+                "请先运行 pack_image.py 打包。\n")
+            return 1
+        print("APP image auto-detected: {}".format(args.app))
     if not os.path.isfile(args.app):
         sys.stderr.write("ERROR: APP image not found: {}\n".format(args.app))
         return 1
