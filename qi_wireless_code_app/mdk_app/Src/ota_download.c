@@ -244,7 +244,7 @@ static int8_t verify_backup_image(void)
     }
     sha256_update(&ctx, payload + ofs, n);
     ofs += n;
-    can_proto_send_pending(UDS_SID_TRANSFER_EXIT);
+    can_proto_pump_long_op();  /* 时间闸门：仅距上次 0x78 超过 4500ms 才补发 */
   }
   sha256_final(&ctx, hash);
   if (uECC_verify(pk, hash, hdr->signature) != 1)
@@ -532,7 +532,7 @@ void ota_dl_handle_transfer_exit(uint8_t *data, uint16_t len)
   }
   if (g_exit_pending != 0U)
   {
-    can_proto_send_pending(UDS_SID_TRANSFER_EXIT);
+    can_proto_pump_long_op();  /* 时间闸门：重复 0x37 不再洪泛 0x78 */
     return;
   }
   if (g_active == 0U)

@@ -442,6 +442,10 @@ static void proto_send_nrc(uint8_t service_id, uint8_t nrc)
 }
 
 static uint8_t  g_long_op_sid;
+static uint32_t g_long_op_last_pending_ms = 0U;
+
+/** @brief  P2* 补发阈门：距上次 0x78 超过此时长才允许补发下一帧 */
+#define LONG_OP_PENDING_REFRESH_MS  4500U
 
 /**
  * @brief  recover CAN after Flash stall (IRQ may have missed bus-off)
@@ -504,6 +508,7 @@ static void proto_begin_long_op(uint8_t service_id)
   proto_can_busoff_recover();
   (void)sit1145_normal_mode_set();
   proto_send_pending(service_id);
+  g_long_op_last_pending_ms = timer_get_tick();
   (void)can_driver_wait_tx_idle(50U);
 }
 
@@ -516,9 +521,18 @@ static void proto_end_long_op(void)
 
 void can_proto_pump_long_op(void)
 {
+  /* 时间闸门：仅在距上次 0x78 接近 P2*（4500ms）时才补发，
+   * 防止擦除循环/主循环以毫秒级频率洪泛 NRC 0x78（UDS 规范：
+   * 首次 0x78 后应在 P2* 内返回最终响应，仅当处理将再次
+   * 超过 P2* 时才需再次发送 0x78）。 */
+  if ((timer_get_tick() - g_long_op_last_pending_ms) < LONG_OP_PENDING_REFRESH_MS)
+  {
+    return;
+  }
   proto_can_busoff_recover();
   (void)sit1145_normal_mode_set();
   proto_send_pending(g_long_op_sid);
+  g_long_op_last_pending_ms = timer_get_tick();
   (void)can_driver_wait_tx_idle(20U);
 }
 
