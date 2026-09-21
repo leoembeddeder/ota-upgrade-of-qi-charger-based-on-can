@@ -785,11 +785,13 @@ def uds_ecu_reset(bus_id):
     /mnt/k/slot_switch_forensics_0919.md §3 M4'）。改为非 suppress 11 01：
     uds_request 等 51 01 正响应，超时重发 ≤3 次。
 
-    三次全超时不立即判死：新版固件（0x37 收尾 APP 自复位，见
-    ota_download.c ota_dl_poll）在本步之前可能已自行复位，51 01 不可达
-    属预期形态；最终判定权在复位确认窗口的三条件闭环（2113==目标槽 +
-    0xF195==预期版本），复位未生效时判定逻辑会自动补发 11 01 一次并给
-    断电重启指引。"""
+    三次全超时不立即判死、脚本不再补发：现行固件 0x37 收尾 APP 不
+    自行复位（ota_download.c ota_dl_poll 注释：0e167e8 起等主机 11 01
+    才复位），51 01 三次无应答属应答丢失/总线异常；旧自复位架构固件
+    在本步前已复位时 51 01 不可达亦属预期形态。两种情形判定权均在
+    复位确认窗口：confirm_app_after_reset()（:996，22 2113 盲探→
+    生命周期帧监听→raw 探测）+ 判定闭环（见脚本头注释），失败输出
+    判别矩阵并给断电重启指引。本函数无 11 01 补发机制。"""
     last_err = None
     for attempt in range(1, 4):
         if stopTask:
@@ -806,8 +808,9 @@ def uds_ecu_reset(bus_id):
             _log("11 01 第 %d/3 次未收到 51 01: %s" % (attempt, e))
             if attempt < 3:
                 time.sleep(0.5)
-    _log("11 01 三次均未收到 51 01（%s）。新固件 0x37 后已自复位时此形态"
-         "属预期；切槽是否生效由复位确认窗口三条件判定" % last_err)
+    _log("11 01 三次均未收到 51 01（%s）。现行固件 0x37 收尾不自行"
+         "复位（等主机 11 01），此形态属应答丢失/总线异常；旧自复位"
+         "架构固件则属预期形态。切槽是否生效由复位确认窗口判定" % last_err)
 
 
 def read_did_u8(bus_id, did):
@@ -1193,7 +1196,8 @@ def _raise_ota_fail(bus_id, from_slot, dest, to_slot, got_ver, expect_ver,
                  "（重定位/签名/Device Info 公钥配对；safe-mode fail_step 语义见"
                  "脚本头注释）或试运行确认失败")
     lines.append("  · 2113=升级前槽 且 2114=目标槽 → trial PENDING 已落盘但设备未复位"
-                 "（11 01 投递问题；脚本已自动补发过仍无效时）→ 请断电重启后重跑")
+                 "（11 01 投递问题：uds_ecu_reset 三次重试 3000ms/次均无 51 01 应答，"
+                 "脚本无补发机制，判定转复位确认窗口）→ 请断电重启后重跑")
     lines.append("  · 2113=升级前槽 且 2114=0xFE → 无切槽证据链：0x37 commit 未发生"
                  "或 metadata 被重置（挂死后重烧/多次异常掉电）→ 查 0x37 段日志"
                  "与设备恢复方式")

@@ -987,11 +987,21 @@ static void handle_diag_session_ctrl(uint8_t *data, uint16_t len)
  *           入队时补发一次再等一次）→ lifecycle SHUTDOWN 广播 → 按
  *           handle 等广播帧发送完成（50ms）→ 全发送缓冲空闲兜底
  *           （50ms）→ 保险延迟 3ms → NVIC_SystemReset()。
- *         两次 51 01 等待均失败（极端总线故障）仍继续复位：主机侧 OTA
- *         脚本闭环在 2113 未变且 2114==目标槽时自动补发 11 01，且两轮
- *         50ms 已远超主机 P2 窗口，设备侧无限阻塞无意义，复位交给主机
- *         补发闭环处理。suppress(0x80) 分支不发正响应，跳过对 51 01 的
- *         等待，只等 SHUTDOWN 广播 + 兜底 + 保险延迟。
+ *         两次 51 01 等待均失败（极端总线故障）仍继续复位：主机侧真实
+ *         兜底是 zcanpro_ext_ota_auto.py uds_ecu_reset() 对 11 01 的
+ *         ≤3 次重试（单次响应窗 response_timeout_ms=3000ms，失败间隔
+ *         0.5s）+ 复位后 confirm_app_after_reset() 确认窗口（22 2113
+ *         盲探→生命周期帧监听）+ 失败时判别矩阵与断电重启指引；
+ *         主机侧不存在按 2113/2114 判定结果再次发起 11 01 的机制。
+ *         时序如实：设备通告 P2=50ms（can_protocol.h UDS_P2_TIMEOUT_MS，
+ *         ISO 14229 会话参数语义）与主机工具实际单次响应窗 3000ms 是
+ *         两个层面，不再混用；本路径名义最坏 4×50ms+3ms=203ms，病理
+ *         场景叠加 proto SF 路径 ISOTP_N_As=1000ms 窗×2（发送重试或
+ *         发送后内部 TX-idle 等待）≈2.2s（isotp.h:72），均在主机工具
+ *         单次响应窗内。两次失败仍复位的决策理由：设备侧无限阻塞只会
+ *         挂死无信息，复位后 Boot 按已落盘 metadata 处理，主机确认
+ *         窗口可得明确判别信息。suppress(0x80) 分支不发正响应，跳过
+ *         对 51 01 的等待，只等 SHUTDOWN 广播 + 兜底 + 保险延迟。
  * @param  data: UDS payload
  * @param  len:  payload length
  * @retval none
@@ -1022,13 +1032,16 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
     return;
   }
 
-  /* 切槽激活现状（与 ota_download.c ota_dl_poll 同步）：新版 APP 在
-   * 0x37 收尾 verify+commit_backup 成功后已自行复位（77 先落总线再
-   * SHUTDOWN+NVIC_SystemReset），Boot 按 trial PENDING 切槽，不再依赖
-   * 主机复位。本 handler 保留：①旧 APP（无自复位逻辑）兼容；②应答
-   * 丢失/复位未生效时主机补发（OTA 脚本判定闭环检测到 2113 未变且
-   * 2114==目标槽时自动补发一次）。无论谁触发复位，metadata 均已在
-   * commit_backup 落盘（backup_valid flag），BOOT 搬运不受影响。 */
+  /* 切槽激活现状（与 ota_download.c ota_dl_poll 注释同步）：0x37 收尾
+   * verify+commit_backup 成功后 APP 不自行复位（0e167e8 起；0x77 先落
+   * 总线，g_trial_ready=1 防重复 commit），等主机发 11 01 才复位；
+   * Boot 按 trial PENDING 切槽。本 handler 保留：①旧 APP（自复位架构
+   * 版本）兼容；②51 01 应答丢失/复位未生效时，主机由
+   * zcanpro_ext_ota_auto.py uds_ecu_reset() 重试 11 01 ≤3 次（单次窗
+   * 3000ms），三次全超时不再补发，转入 confirm_app_after_reset()
+   * 确认窗口判定，失败输出判别矩阵+断电重启指引。无论谁触发复位，
+   * metadata 均已在 commit_backup 落盘（backup_valid flag），BOOT 搬运
+   * 不受影响。 */
 
   if (!suppress)
   {
@@ -1050,7 +1063,10 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
       {
         /* 首次等待超时/终态失败：补发一次 51 01 再等一次。正常帧
          * 250kbps 下约 0.5ms 发完，走到这里说明总线持续繁忙或故障；
-         * 两次都失败属极端场景，仍继续复位（理由见 @note） */
+         * 两次都失败属极端场景，仍继续复位——主机侧真实兜底是
+         * uds_ecu_reset() ≤3 次重试（3000ms/次）+确认窗口+断电指引，
+         * 名义最坏 203ms/病理 ~2.2s 均在主机单次响应窗 3000ms 内，
+         * 设备侧无限阻塞只会挂死无信息（详见 @note） */
         h_before = h_after;
         proto_send_response(resp, 2);
         if ((can_driver_last_tx_handle(&h_after) == 0) && (h_after != h_before))
