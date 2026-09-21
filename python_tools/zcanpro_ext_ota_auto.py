@@ -11,13 +11,11 @@ ZCANPRO 扩展脚本 — Qi 无线充 CAN-UDS OTA（单 App 架构，OTA-ARCH-09
   ⑤ 运行本脚本：10 02→27→31 擦 Backup 区→34/36 写入 0x08010000→
      37 验签提交（设备自复位）→ BOOT 搬运 Backup→App（擦 App 区→
      复制→复核→清标志→跳转）→ 复位后版本核验。
-EXPECTED_SW_VERSION 固化 "QC_JYF_FW_1.1.2"，选 bin 版本匹配优先/
-mtime 次序（旧版本残留绝不被选中），不符→拒闪（fail-closed）。
-命令行 --firmware <path> 可指定发送 bin（跳过自动选择；版本闸门照常执行，
-指定文件 strings 不含 EXPECTED_SW_VERSION 同样拒闪 fail-closed）。
-判定闭环：①复位后 APP 应答 ②0xF195==EXPECTED_SW_VERSION
+EXPECTED_SW_VERSION 固化 ""（通用模式）：不做版本闸门，自动选 mtime
+最新的载荷升级；升级后从被刷镜像 strings 提取版本做判定闭环。
+命令行 --firmware <path> 可指定发送 bin（跳过自动选择）。
+判定闭环：①复位后 APP 应答 ②0xF195==被刷镜像 strings 版本
 （0x2113 在单 App 架构恒为 0x00，仅信息展示）。
-仓库固件 SW_VERSION_STR 保持 QC_JYF_FW_1.1.1 零触碰（铁律）。
 
 导入: 高级功能 -> 扩展脚本 -> 打开本文件
 运行前: 先打开 CAN 通道 (250 kbps, Classical CAN, 扩展帧)
@@ -41,17 +39,11 @@ except ImportError:
 # ======== 用户配置 ========
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# EXPECTED_SW_VERSION：升级目标版本（判定闭环第③条件）。
-#   当前固化 = "QC_JYF_FW_1.1.2"（用户 2026-09-19 指令：预期版本固定 1.1.2）。
-#   期望版本如何切换 = 只改本常量即可；留空 "" 则恢复缺省行为——从被刷
-#   镜像 payload 的 strings 提取（QC_JYF_FW_x.y.z，即固件 can_protocol.c
-#   SW_VERSION_STR 编译常量，版本唯一真相源；空串提取回退逻辑保留）。
-#   设置后：选中 bin 内版本串 ≠ 本值 → 拒闪（构建链检查指引）；
-#   升级后 0xF195 ≠ 本值 → OTA 判定 FAIL（差异明细+判别矩阵指引）。
-#   载荷构建前提：用户侧 Keil 把 SW_VERSION_STR 改为 QC_JYF_FW_1.1.2 后
-#   Rebuild APP → pack（新 bin strings 含 1.1.2 才能过拒闪门）；仓库固件
-#   SW_VERSION_STR 保持 QC_JYF_FW_1.1.1 零触碰（铁律，本脚本不改固件）。
-EXPECTED_SW_VERSION = "QC_JYF_FW_1.1.2"
+# EXPECTED_SW_VERSION：升级目标版本（判定闭环第②条件）。
+#   通用模式=""（默认）：不校验版本，自动选 mtime 最新载荷；升级后
+#   从被刷镜像 strings 提取版本作为判定基准。
+#   指定版本="QC_JYF_FW_x.y.z"：仅选版本匹配的候选，不符→拒闪。
+EXPECTED_SW_VERSION = ""
 
 # BASELINE_SW_VERSION：升级前基线版本（用户五步流程第①步烧录的 1.1.1
 # 基线）。仅用于升级前基线确认打印（异常时醒目提醒，不拦截流程），
@@ -120,12 +112,12 @@ def _extract_sw_version(blob):
 
 
 def _pick_firmware():
-    """Payload selection (single-App arch): version-match first, mtime
-    second. Candidates = Keil app build + every .bin under app bin/
+    """Payload selection (single-App arch): pick newest by mtime.
+    Candidates = Keil app build + every .bin under app bin/
     (packed or raw, all must be App-window linked; validate_image
-    enforces the reset-vector window). EXPECTED_SW_VERSION non-empty:
-    only version-matched candidates qualify, newest mtime wins; no
-    match -> fail-closed error (stale versions are never selected)."""
+    enforces the reset-vector window). EXPECTED_SW_VERSION=""（通用模式）:
+    no version gate, newest mtime wins; post-upgrade judgment extracts
+    version from the flashed image strings."""
     candidates = []
     seen = set()
 
@@ -149,27 +141,6 @@ def _pick_firmware():
     if not candidates:
         raise RuntimeError("firmware not found; build chain: SW_VERSION_STR -> "
                            "Keil Rebuild qi_wireless_code_app -> pack_image.py")
-    if EXPECTED_SW_VERSION:
-        matched = []
-        for path, tag in candidates:
-            try:
-                ver = _extract_sw_version(open(path, "rb").read())
-            except Exception:
-                ver = None
-            _log("候选载荷 %s（%s）strings 版本=%s" % (path, tag, ver or "未找到"))
-            if ver == EXPECTED_SW_VERSION:
-                matched.append((os.path.getmtime(path), path, tag))
-        if not matched:
-            raise RuntimeError(
-                "载荷选择 fail-closed：无任何候选 bin 版本==EXPECTED_SW_VERSION=%s"
-                "（旧版本残留绝不被选中）。构建链：用户侧 SW_VERSION_STR→目标"
-                "版本→Keil Rebuild qi_wireless_code_app→pack_image.py"
-                "（仓库固件保持 1.1.1 零触碰）" % EXPECTED_SW_VERSION)
-        matched.sort(key=lambda t: t[0], reverse=True)
-        _mt, path, tag = matched[0]
-        _log("载荷选择：版本匹配 %s → %s（%s，mtime 最新）"
-             % (EXPECTED_SW_VERSION, path, tag))
-        return path
     candidates.sort(key=lambda t: os.path.getmtime(t[0]), reverse=True)
     path, tag = candidates[0]
     _log("载荷选择（mtime 最新）：%s（%s）" % (path, tag))
