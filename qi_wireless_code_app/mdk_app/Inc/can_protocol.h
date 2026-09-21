@@ -205,6 +205,7 @@ extern "C" {
 /* ========================================================================== */
 
 #define ROUTINE_ERASE_MEMORY        0xFF00U   /*!< erase inactive slot (APP download) */
+#define ROUTINE_CLEAR_FAULTS        0x2100U   /*!< Clear Faults: 清除充电故障 (Qi 侧要求)，默认会话可执行 */
 
 extern const uint8_t g_app_ecdsa_pubkey[65];
 

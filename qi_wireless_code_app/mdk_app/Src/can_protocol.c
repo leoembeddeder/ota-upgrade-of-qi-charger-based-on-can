@@ -1551,14 +1551,64 @@ static void handle_security_access(uint8_t *data, uint16_t len)
 
 /**
  * @brief  RoutineControl (0x31)
- * @note   APP 实现槽擦写全链（ota_download.c）：0x31 擦除非活跃槽 →
- *         0x34/0x36 下载编程 → 0x37 验签+commit_backup 后自复位，BOOT 搬运至 App 区；
- *         门禁=PROGRAMMING 会话+SecurityAccess（handler 内逐项检查）。
- *         Boot 仅在复位后按 trial metadata 选槽/回滚/进 safe mode，
- *         不承担下载编程（旧"Boot safe mode only"架构已废弃）。
+ * @note   按 rid 分发：
+ *         - 0x2100 Clear Faults：默认会话即可执行，不检查 Programming 会话 /
+ *           SecurityAccess（Qi 侧要求，门禁过严会回 NRC 0x22 导致协议不通）；
+ *           StartRoutine 执行逻辑暂留空（TODO），正响应 71 01 21 00 00；
+ *           StopRoutine/RequestRoutineResults 暂不支持，回 NRC 0x31。
+ *         - 其余 rid（含 0xFF00）：原样转 ota_dl_handle_erase()，APP 实现
+ *           槽擦写全链（ota_download.c）：0x31 擦除非活跃槽 → 0x34/0x36 下载
+ *           编程 → 0x37 验签+commit_backup 后自复位，BOOT 搬运至 App 区；
+ *           门禁=PROGRAMMING 会话+SecurityAccess（handler 内逐项检查）。
+ *           Boot 仅在复位后按 trial metadata 选槽/回滚/进 safe mode，
+ *           不承担下载编程（旧"Boot safe mode only"架构已废弃）。
  */
 static void handle_routine_control(uint8_t *data, uint16_t len)
 {
+  uint8_t  resp[5];
+  uint8_t  sub_func;
+  uint8_t  suppress;
+  uint16_t rid;
+
+  /* 长度检查先于 rid 分发：len<4 的畸形请求统一回 NRC 0x13 */
+  if (len < 4U)
+  {
+    proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+
+  sub_func = data[1] & UDS_SUBFUNC_MASK;
+  suppress = data[1] & UDS_SUBFUNC_SUPPRESS_POS_RESP;
+  rid      = ((uint16_t)data[2] << 8) | (uint16_t)data[3];
+
+  if (rid == ROUTINE_CLEAR_FAULTS)
+  {
+    /* Clear Faults 分支：仅支持 StartRoutine(0x01)。
+     * suppressPosResp 只抑制正响应，NRC 仍须发送（ISO 14229-1）。
+     * 本分支刻意不检查 Programming 会话/SecurityAccess：
+     * 默认会话必须可执行，否则又回 0x22，协议不通。 */
+    if (sub_func != 0x01U)
+    {
+      proto_send_nrc(UDS_SID_ROUTINE_CONTROL, UDS_NRC_REQUEST_OUT_OF_RANGE);
+      return;
+    }
+
+    /* TODO: 待定义 Qi 侧故障标志/寄存器清除动作（Qi 侧故障标志清单待确认） */
+
+    if (!suppress)
+    {
+      resp[0] = UDS_SID_ROUTINE_CONTROL + UDS_POSITIVE_RESPONSE_OFFSET; /* 0x71 */
+      resp[1] = 0x01U;                  /* StartRoutine 回显（suppress 位已剥除） */
+      resp[2] = (uint8_t)(rid >> 8);    /* 0x21 */
+      resp[3] = (uint8_t)(rid & 0xFFU); /* 0x00 */
+      resp[4] = 0x00U;                  /* RoutineStatusRecord: 0x00 = 成功 */
+      proto_send_response(resp, 5U);    /* 5 字节 ≤ 7，单帧直发，无流控/多帧 */
+    }
+    return;
+  }
+
+  /* 其余 rid（含 0xFF00 erase）：保持原行为，data/len 原样转发，
+   * 门禁逻辑一字不改，仍在 ota_dl_handle_erase 内逐项检查 */
   ota_dl_handle_erase(data, len);
 }
 
