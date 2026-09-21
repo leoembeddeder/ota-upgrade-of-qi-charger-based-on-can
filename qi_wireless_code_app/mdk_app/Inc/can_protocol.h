@@ -128,7 +128,7 @@ extern "C" {
 #define DID_FW_TYPE                 0x2010U   /*!< firmware type, uint8, read/write */
 
 /** @brief  Device-specific DIDs (defined in peripheral SRS) */
-#define DID_OTA_STATE               0x2112U   /*!< OTA state from metadata */
+#define DID_OTA_STATE               0x2112U   /*!< OTA status: 0=idle 1=downloading 3=pending 5=confirmed 6=rolled_back */
 #define DID_ACTIVE_SLOT             0x2113U   /*!< active firmware slot */
 #define DID_PENDING_SLOT            0x2114U   /*!< pending firmware slot */
 #define DID_LAST_BOOT_REASON        0x2115U   /*!< last boot reason */

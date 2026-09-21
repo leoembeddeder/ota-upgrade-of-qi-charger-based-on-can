@@ -704,7 +704,43 @@ static int8_t fill_did_payload(uint16_t did, uint8_t *out, uint8_t *olen)
     case DID_OTA_STATE:
     {
       ota_metadata_t meta;
-      out[0] = (ota_metadata_read(&meta) == 0) ? meta.ota_state : 0xFFU;
+      uint8_t status;
+      if (ota_metadata_read(&meta) != 0U)
+      {
+        out[0] = 0xFFU;
+        *olen = 1U;
+        return 0;
+      }
+      /* OTA Status DID 0x2112 八状态定义:
+       * 0x00 Idle               无 OTA 操作，无待报告结果
+       * 0x01 Downloading        正在下载固件到备份区
+       * 0x02 Validating         传输完成，正在验证（CRC/签名）
+       * 0x03 Pending Activation 验证成功，等待 11 01 激活重启
+       * 0x04 Trial Boot         新 APP 启动未确认（单 App 架构不适用）
+       * 0x05 Confirmed          OTA 搬运成功，新固件已生效
+       * 0x06 Rolled Back        搬运失败，已回滚到旧固件
+       * 0x07 Failed             下载或验证失败，旧固件保留 */
+      if (meta.ota_state == OTA_STATE_DOWNLOADING)
+      {
+        status = 0x01U;  /* Downloading */
+      }
+      else if (meta.backup_valid != 0U)
+      {
+        status = 0x03U;  /* Pending Activation */
+      }
+      else if (meta.last_boot_reason == 0x03U)
+      {
+        status = 0x05U;  /* Confirmed: OTA 搬运成功 */
+      }
+      else if (meta.last_boot_reason == 0x04U)
+      {
+        status = 0x06U;  /* Rolled Back: 搬运失败回滚 */
+      }
+      else
+      {
+        status = 0x00U;  /* Idle */
+      }
+      out[0] = status;
       *olen = 1U;
       return 0;
     }
