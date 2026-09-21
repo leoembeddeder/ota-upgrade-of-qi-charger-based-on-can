@@ -90,6 +90,9 @@ void can_driver_init(void);
 
 /**
  * @brief  transmit a CAN extended frame
+ * @note   每帧成功入队时在驱动内部记录递增 handle（见
+ *         can_driver_last_tx_handle / can_driver_wait_tx_frame）；
+ *         返回值语义不变。
  * @param  id:   29-bit extended identifier
  * @param  data: pointer to transmit data buffer
  * @param  len:  data length (0~8)
@@ -105,10 +108,42 @@ int8_t can_driver_recv(uint32_t *id, uint8_t *data, uint8_t *len);
 
 /**
  * @brief  wait until a TX mailbox has finished (or timeout)
+ * @note   笼统 TX-idle 判定（current_tstat ∈ {IDLE, TRANSMITTED}）：
+ *         多 mailbox 场景可能被其他帧/空缓冲的状态满足，仅适用于
+ *         「尽力排空」类等待。需要确认「指定帧已真正发出」时用
+ *         can_driver_wait_tx_frame；ECUReset(11 01) 路径已改用后者，
+ *         本函数本体语义不变，其余调用点行为不受影响。
  * @param  timeout_ms: maximum wait
  * @retval 0 on success, -1 on timeout
  */
 int8_t can_driver_wait_tx_idle(uint32_t timeout_ms);
+
+/**
+ * @brief  get the handle stamped by the last successful can_driver_send()
+ * @param  handle: out, handle of the last successful send
+ * @retval 0 on success, -1 if no frame has been sent since boot
+ */
+int8_t can_driver_last_tx_handle(uint8_t *handle);
+
+/**
+ * @brief  wait until the frame identified by handle has been transmitted
+ * @note   按 TSTAT handle 精确判定指定帧发送完成（判定依据见
+ *         can_driver.c 函数注释）；ABORTED/REJECTED 终态失败提前返回 -1。
+ * @param  handle: frame handle recorded at enqueue time
+ * @param  timeout_ms: maximum wait in ms
+ * @retval 0 = frame transmitted OK, -1 = timeout or terminal failure
+ */
+int8_t can_driver_wait_tx_frame(uint8_t handle, uint32_t timeout_ms);
+
+/**
+ * @brief  wait until all TX buffers are idle (fallback completion check)
+ * @note   CAST CAN-CTRL 无 bxCAN 式 mailbox TME 标志，退路判定 =
+ *         current_tstat ∈ {IDLE, TRANSMITTED} 且 STB FIFO EMPTY，
+ *         仅作复位前兜底确认。
+ * @param  timeout_ms: maximum wait in ms
+ * @retval 0 = all TX resources idle, -1 = timeout
+ */
+int8_t can_driver_wait_tx_all_idle(uint32_t timeout_ms);
 
 /**
  * @brief  register a callback for received CAN frames

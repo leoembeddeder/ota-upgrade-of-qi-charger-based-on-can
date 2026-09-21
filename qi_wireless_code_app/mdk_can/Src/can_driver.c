@@ -62,6 +62,15 @@ static volatile can_busoff_recovery_callback_t busoff_recovery_cb = (can_busoff_
 /** @brief  flag set by error ISR when bus-off recovery is needed */
 static volatile uint8_t busoff_recovery_pending = 0;
 
+/** @brief  rolling per-frame TX handle, stamped into CAN tx buffer (wraps at 255) */
+static uint8_t g_tx_handle_seq = 0U;
+
+/** @brief  handle recorded by the last successful can_driver_send() */
+static uint8_t g_tx_last_handle = 0U;
+
+/** @brief  1 after at least one successful can_driver_send() since boot */
+static uint8_t g_tx_last_valid = 0U;
+
 static void can_hw_config_in_reset(void);
 
 /* private functions ---------------------------------------------------------*/
@@ -253,6 +262,14 @@ void can_driver_pins_standby(void)
  * @brief  transmit a CAN extended frame
  * @note   NOT thread-safe - call only from main loop context.
  *         Do not call from ISR or multiple threads without external locking.
+ *         每次成功入队为该帧盖一个递增 handle（uint8 循环回绕）并记录：
+ *         AT32 CAST CAN-CTRL 无 bxCAN 式 mailbox TME 标志，库通过
+ *         tbtyp.handle + TSTAT（handle_1/tstat_1 当前帧、handle_2/tstat_2
+ *         最近完成帧）提供「指定帧发送完成」的判定通道，供
+ *         can_driver_wait_tx_frame() 按 handle 精确等待某一帧，避免笼统
+ *         TX-idle 判定在多缓冲（PTB+STB FIFO）场景下误把其他帧/空缓冲
+ *         的状态当成目标帧完成（ECUReset 51 01 偶发丢失的竞态根因）。
+ *         返回值语义保持 0/-1 不变，现有调用方不受影响。
  * @param  id:   29-bit extended identifier
  * @param  data: pointer to transmit data buffer
  * @param  len:  data length (0~8)
@@ -280,7 +297,7 @@ int8_t can_driver_send(uint32_t id, uint8_t *data, uint8_t len)
   tx_buf.frame_type     = CAN_FRAME_DATA;
   tx_buf.fd_format      = CAN_FORMAT_CLASSIC;
   tx_buf.fd_rate_switch = CAN_BRS_OFF;
-  tx_buf.handle         = 0;
+  tx_buf.handle         = g_tx_handle_seq;  /* 帧标识 handle，见函数注释 */
   tx_buf.tx_timestamp   = FALSE;
 
   /* set data length code */
@@ -338,6 +355,14 @@ int8_t can_driver_send(uint32_t id, uint8_t *data, uint8_t len)
     can_txbuf_transmit(CAN1, CAN_TRANSMIT_STB_ONE);
   }
 
+  /* 记录本帧 handle 并推进序号（仅在真正入队成功后更新，供调用方
+   * 用发送前后 handle 对比识别静默入队失败）。uint8 自然回绕：等待方
+   * 在发送后立即按 handle 等待，一次等待窗内不可能跨越 256 次成功
+   * 发送，回绕不构成误判 */
+  g_tx_last_handle = g_tx_handle_seq;
+  g_tx_last_valid  = 1U;
+  g_tx_handle_seq++;
+
   return 0;
 }
 
@@ -392,6 +417,115 @@ int8_t can_driver_wait_tx_idle(uint32_t timeout_ms)
     can_transmit_status_get(CAN1, &tx_status);
     if ((tx_status.current_tstat == CAN_TSTAT_IDLE) ||
         (tx_status.current_tstat == CAN_TSTAT_TRANSMITTED))
+    {
+      return 0;
+    }
+  } while ((timer_get_tick() - start) < timeout_ms);
+
+  return -1;
+}
+
+/**
+ * @brief  get the handle stamped by the last successful can_driver_send()
+ * @note   调用方在发送前后各取一次 handle：若未推进，说明该帧因缓冲
+ *         满/参数错未真正入队（can_driver_send 返回 -1 路径），据此可
+ *         区分「发送失败」与「已入队但尚未发出」，避免对陈旧 handle
+ *         空等得到假完成。
+ * @param  handle: out, handle of the last successful send
+ * @retval 0 on success, -1 if no frame has been sent since boot
+ */
+int8_t can_driver_last_tx_handle(uint8_t *handle)
+{
+  if ((handle == (uint8_t *)0) || (g_tx_last_valid == 0U))
+  {
+    return -1;
+  }
+  *handle = g_tx_last_handle;
+  return 0;
+}
+
+/**
+ * @brief  wait until the frame identified by handle has been transmitted
+ * @note   判定依据（AT32F426 CAST CAN-CTRL）：
+ *         本控制器没有 bxCAN 式 mailbox TME 标志，固件库
+ *         at32f422_426_can.c:842 can_transmit_status_get() 实读 tstat
+ *         寄存器两组字段——current_handle/tstat_1（tstat_bit.handle_1
+ *         [7:0] / tstat_1 [10:8]）为当前处理帧的标识与状态，
+ *         final_handle/tstat_2（handle_2 [23:16] / tstat_2 [26:24]）为
+ *         最近完成帧的标识与状态；库在 can_txbuf_write() 中把
+ *         tx_buf.handle 写入 tbtyp_bit.handle（at32f422_426_can.c:422），
+ *         header 对 handle 的定义即「frame identification using TSTAT」。
+ *         因此「指定帧已发送完成」的可靠判定 = 「TSTAT 任一组 handle
+ *         匹配且状态为 CAN_TSTAT_TRANSMITTED(0x03)」。
+ *         状态语义（at32f422_426_can.h:366-372）：TRANSMITTED=0x03
+ *         发送成功；LOST_ARBITRATION(0x02)/DISTURBED(0x05) 由硬件按
+ *         REALIM/RETLIM 自动重发，不算终态，继续轮询；
+ *         ABORTED(0x04)/REJECTED(0x06) 为终态失败，帧不会再上总线，
+ *         立即返回 -1 让上层走补发，不空等超时。
+ *         顺序安全性：调用方（handle_ecu_reset）在本函数返回前不发起
+ *         新发送，final 槽不会被后续帧覆盖；其他帧的状态（含他帧
+ *         TRANSMITTED）一律不作为本帧完成证据——这正是旧 TX-idle 笼统
+ *         判定的竞态根因，此处按 handle 隔离。
+ * @param  handle: frame handle recorded at enqueue time
+ *         (can_driver_last_tx_handle)
+ * @param  timeout_ms: maximum wait in ms
+ * @retval 0 = frame transmitted OK, -1 = timeout or terminal failure
+ */
+int8_t can_driver_wait_tx_frame(uint8_t handle, uint32_t timeout_ms)
+{
+  uint32_t start = timer_get_tick();
+  can_transmit_status_type tx_status;
+
+  do
+  {
+    can_transmit_status_get(CAN1, &tx_status);
+
+    /* 指定帧完成的正证据：任一组 handle 匹配且状态 TRANSMITTED */
+    if (((tx_status.final_handle == handle) &&
+         (tx_status.final_tstat == CAN_TSTAT_TRANSMITTED)) ||
+        ((tx_status.current_handle == handle) &&
+         (tx_status.current_tstat == CAN_TSTAT_TRANSMITTED)))
+    {
+      return 0;
+    }
+
+    /* 本帧终态失败：不会再上总线，立即交给上层补发 */
+    if ((tx_status.final_handle == handle) &&
+        ((tx_status.final_tstat == CAN_TSTAT_ABORTED) ||
+         (tx_status.final_tstat == CAN_TSTAT_REJECTED)))
+    {
+      return -1;
+    }
+
+    /* 其他帧/其他 handle 的状态一律不作为本帧完成证据 */
+  } while ((timer_get_tick() - start) < timeout_ms);
+
+  return -1;
+}
+
+/**
+ * @brief  wait until all TX buffers are idle (fallback completion check)
+ * @note   退路判定：本控制器（CAST CAN-CTRL）没有 bxCAN 式「全部
+ *         mailbox TME 置位」接口，等价组合为：PTB 空闲/已发完
+ *         （current_tstat ∈ {CAN_TSTAT_IDLE(0x00),
+ *         CAN_TSTAT_TRANSMITTED(0x03)}）且 STB FIFO 排空
+ *         （can_stb_status_get == CAN_STB_STATUS_EMPTY(0x00)）。
+ *         仅作按 handle 精确判定之后、复位前的兜底确认（所有已入队
+ *         帧均已离开发送缓冲），不替代 can_driver_wait_tx_frame。
+ * @param  timeout_ms: maximum wait in ms
+ * @retval 0 = all TX resources idle, -1 = timeout
+ */
+int8_t can_driver_wait_tx_all_idle(uint32_t timeout_ms)
+{
+  uint32_t start = timer_get_tick();
+  can_transmit_status_type tx_status;
+
+  do
+  {
+    can_transmit_status_get(CAN1, &tx_status);
+    if (((tx_status.current_tstat == CAN_TSTAT_IDLE) ||
+         (tx_status.current_tstat == CAN_TSTAT_TRANSMITTED)) &&
+        (can_stb_status_get(CAN1) == CAN_STB_STATUS_EMPTY))
     {
       return 0;
     }

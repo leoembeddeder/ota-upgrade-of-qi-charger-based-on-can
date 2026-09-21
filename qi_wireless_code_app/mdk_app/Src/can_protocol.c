@@ -979,6 +979,19 @@ static void handle_diag_session_ctrl(uint8_t *data, uint16_t len)
 
 /**
  * @brief  ECUReset (0x11)
+ * @note   竞态修复后顺序（旧序：发 51 01 → SHUTDOWN 广播插队 → 笼统
+ *         TX-idle 等待 20ms（返回值被忽略）→复位，广播帧抢占总线并
+ *         污染状态判定，多 mailbox 场景下51 01 尚在仲裁/重发时即被
+ *         误判完成，复位导致帧丢失→主机 P2 超时）：
+ *           发 51 01 → 按 handle 等该帧真正发送完成（50ms；超时或未
+ *           入队时补发一次再等一次）→ lifecycle SHUTDOWN 广播 → 按
+ *           handle 等广播帧发送完成（50ms）→ 全发送缓冲空闲兜底
+ *           （50ms）→ 保险延迟 3ms → NVIC_SystemReset()。
+ *         两次 51 01 等待均失败（极端总线故障）仍继续复位：主机侧 OTA
+ *         脚本闭环在 2113 未变且 2114==目标槽时自动补发 11 01，且两轮
+ *         50ms 已远超主机 P2 窗口，设备侧无限阻塞无意义，复位交给主机
+ *         补发闭环处理。suppress(0x80) 分支不发正响应，跳过对 51 01 的
+ *         等待，只等 SHUTDOWN 广播 + 兜底 + 保险延迟。
  * @param  data: UDS payload
  * @param  len:  payload length
  * @retval none
@@ -988,6 +1001,11 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
   uint8_t resp[8];
   uint8_t sub_func;
   uint8_t suppress;
+  uint8_t h_before;
+  uint8_t h_after;
+  uint8_t h_bc0;
+  uint8_t have_prev;
+  uint32_t t0;
 
   if (len < 2U)
   {
@@ -1016,11 +1034,73 @@ static void handle_ecu_reset(uint8_t *data, uint16_t len)
   {
     resp[0] = UDS_SID_ECU_RESET + UDS_POSITIVE_RESPONSE_OFFSET;
     resp[1] = sub_func;
+
+    /* 发送前后对比 handle：proto_send_response 经 ISO-TP SF →
+     * can_driver_send 无返回值；若两路缓冲满且 N_As 窗口内仍失败，
+     * 帧根本没入队，handle 不推进——据此识别静默失败，避免对陈旧
+     * handle 空等得到假完成 */
+    have_prev = (can_driver_last_tx_handle(&h_before) == 0) ? 1U : 0U;
     proto_send_response(resp, 2);
+
+    if ((can_driver_last_tx_handle(&h_after) == 0) &&
+        ((have_prev == 0U) || (h_after != h_before)))
+    {
+      /* 已入队：等 51 01 真正发送完成（按 handle 精确判定） */
+      if (can_driver_wait_tx_frame(h_after, 50U) != 0)
+      {
+        /* 首次等待超时/终态失败：补发一次 51 01 再等一次。正常帧
+         * 250kbps 下约 0.5ms 发完，走到这里说明总线持续繁忙或故障；
+         * 两次都失败属极端场景，仍继续复位（理由见 @note） */
+        h_before = h_after;
+        proto_send_response(resp, 2);
+        if ((can_driver_last_tx_handle(&h_after) == 0) && (h_after != h_before))
+        {
+          (void)can_driver_wait_tx_frame(h_after, 50U);
+        }
+      }
+    }
+    else
+    {
+      /* 51 01 未入队（缓冲满且 isotp N_As 窗口内重试仍失败）：直接
+       * 补发一次并等待；仍失败则放弃，理由同上 */
+      have_prev = (can_driver_last_tx_handle(&h_before) == 0) ? 1U : 0U;
+      proto_send_response(resp, 2);
+      if ((can_driver_last_tx_handle(&h_after) == 0) &&
+          ((have_prev == 0U) || (h_after != h_before)))
+      {
+        (void)can_driver_wait_tx_frame(h_after, 50U);
+      }
+    }
   }
 
+  /* SHUTDOWN 广播移到 51 01 确认之后：不再插在响应与发送完成等待之间 */
+  have_prev = (can_driver_last_tx_handle(&h_bc0) == 0) ? 1U : 0U;
   lifecycle_set_state(LIFECYCLE_SHUTDOWN);
-  (void)can_driver_wait_tx_idle(20U);
+
+  if ((can_driver_last_tx_handle(&h_after) == 0) &&
+      ((have_prev == 0U) || (h_after != h_bc0)))
+  {
+    /* 广播帧已入队：按 handle 等其发送完成 */
+    (void)can_driver_wait_tx_frame(h_after, 50U);
+  }
+  /* 广播被 lifecycle tx_ready 门禁跳过或入队失败（handle 未推进）：
+   * 无帧可等，直接进入全缓冲空闲兜底 */
+
+  /* 兜底：等全部发送资源空闲（CAST 无 TME 标志的等价判定，见
+   * can_driver_wait_tx_all_idle 注释）——确认所有已入队帧均已离开
+   * 发送缓冲再复位 */
+  (void)can_driver_wait_tx_all_idle(50U);
+
+  /* 复位前保险延迟 3ms：覆盖发送完成判定之外的极端窗口（末位总线
+   * 传输、收发器传播延迟、TSTAT 更新滞后）。timer_drv 无独立阻塞
+   * 延时接口，沿用工程既有 SysTick tick 轮询写法（同本文件
+   * can_lp_enter_normal 的 tick 等待机制），不自造周期级忙等 */
+  t0 = timer_get_tick();
+  while ((timer_get_tick() - t0) < 3U)
+  {
+    __NOP();
+  }
+
   NVIC_SystemReset();
 }
 
