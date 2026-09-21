@@ -1636,7 +1636,7 @@ def run_ota(bus_id):
             if stopTask:
                 raise RuntimeError("用户停止脚本")
             time.sleep(0.05)
-        to_slot, got_ver = confirm_app_after_reset(bus_id)
+        to_slot, got_ver, ota_status = confirm_app_after_reset(bus_id)
 
         _log("[人话] 重启后设备回报：0x2113=%s（0x00=App 区运行），版本=%s；"
              "开始最终判定…" % (_fmt_slot(to_slot), got_ver or "未读到"))
