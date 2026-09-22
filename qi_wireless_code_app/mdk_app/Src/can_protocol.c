@@ -100,13 +100,24 @@ static uint8_t  g_sa_sig_block_seq        = 0;
 #define QI_IAP_PREPARE_TIMEOUT_MS  2500U
 #define QI_VER_QUERY_TIMEOUT_MS    500U   /*!< DID 0x2013 Qi 版本查询回复超时 */
 
+/* DID 0x2013 应答版本串：固定前缀 "QC_JYF_MCU2_FW_1.1."（19B）+
+ * 1B 版本数字 = 20B ASCII（规格：Qi 版本号为个位数，例：读回 3 →
+ * "QC_JYF_MCU2_FW_1.1.3"）。拼接用 memcpy+单字节赋值，勿 sprintf。 */
+#define QI_VER_STR_PREFIX          "QC_JYF_MCU2_FW_1.1."
+#define QI_VER_STR_PREFIX_LEN      19U
+#define QI_VER_STR_LEN             20U   /* 19B 前缀 + 1B 数字 */
+
+/* 编译期自检：前缀恰 19 字节、串总长恰 20 字节（改前缀/宏时当场报错） */
+typedef char qi_ver_str_len_ok[(sizeof(QI_VER_STR_PREFIX) - 1U == QI_VER_STR_PREFIX_LEN)
+                            && (QI_VER_STR_PREFIX_LEN + 1U == QI_VER_STR_LEN) ? 1 : -1];
+
 static uint32_t g_qi_iap_last_tx_ms = 0U;
 
 static uint8_t  g_qi_iap_state    = QI_IAP_IDLE;
 static uint8_t  g_qi_iap_progress = 0U;
 static uint16_t g_qi_iap_total    = 0U;
 static uint16_t g_qi_iap_sent     = 0U;
-static uint16_t g_qi_fw_version   = 0U;     /*!< Qi 版本缓存：DID 0x2133/0x2013 读出源；由 0x01 上报解析或 0x2013 主动问询回复更新 */
+static uint16_t g_qi_fw_version   = 0U;     /*!< Qi 版本缓存：DID 0x2133/0x2132 读出源（2B LE 原样）；0x2013 主动问询路径存个位数数值 0~9，用于拼完整版本串。由 0x01 上报解析或 0x2013 问询回复更新。已知取舍：判无效仍是 !=0，版本 0 被当"无缓存"（实际版本 1~9，可接受） */
 
 /** @brief  deferred UDS response while waiting for Qi chip ACK */
 static uint32_t g_qi_iap_wait_start_ms = 0U; /*!< timestamp when WAIT_ACK entered */
@@ -444,6 +455,56 @@ static void proto_send_nrc(uint8_t service_id, uint8_t nrc)
   resp[1] = service_id;
   resp[2] = nrc;
   proto_send_response(resp, 3);
+}
+
+/**
+ * @brief  Qi 版本回复首字节 → 个位数数字 + ASCII 字符（稳健化）
+ * @note   规格：版本号为个位数。v<=9 按数值取；v 为 ASCII '0'~'9'
+ *         （0x30~0x39）原样取；其他值 v%10 容错。返回 0~9 数值（缓存用），
+ *         *ch 输出数字字符。
+ * @param  v:   Qi 回复首字节
+ * @param  ch:  输出数字字符 '0'~'9'
+ * @retval 版本个位数数值 0~9
+ */
+static uint8_t qi_ver_norm_digit(uint8_t v, char *ch)
+{
+  uint8_t d;
+
+  if (v <= 9U)
+  {
+    d = v;                                  /* 数值个位数（规格格式） */
+  }
+  else if ((v >= (uint8_t)'0') && (v <= (uint8_t)'9'))
+  {
+    d = (uint8_t)(v - (uint8_t)'0');        /* ASCII '0'~'9' 原样 */
+  }
+  else
+  {
+    d = (uint8_t)(v % 10U);                 /* 容错：规格为个位数，取个位 */
+  }
+  *ch = (char)('0' + (char)d);
+  return d;
+}
+
+/**
+ * @brief  发 DID 0x2013 完整正响应：62 20 13 + 20B ASCII "QC_JYF_MCU2_FW_1.1.X"
+ * @note   23 字节 > 7，proto_send_response 自动走 g_tx_pend 多帧延迟路径
+ *         （can_protocol_poll 末尾 proto_flush_pending_tx 泵出，27 服务
+ *         34 字节 seed/key 同机制）。严禁在帧回调里直接 isotp_tx_send
+ *         多帧（FC 会卡死，见 proto_send_response 注释）。
+ * @param  digit: 版本数字字符 '0'~'9'
+ * @retval none
+ */
+static void qi_ver_send_full_response(char digit)
+{
+  uint8_t resp[3U + QI_VER_STR_LEN];        /* 23B: 62 20 13 + 20B ASCII */
+
+  resp[0] = UDS_SID_READ_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
+  resp[1] = 0x20U;
+  resp[2] = 0x13U;
+  memcpy(&resp[3], QI_VER_STR_PREFIX, QI_VER_STR_PREFIX_LEN);
+  resp[3 + QI_VER_STR_PREFIX_LEN] = (uint8_t)digit;
+  proto_send_response(resp, (uint16_t)sizeof(resp));
 }
 
 static uint8_t  g_long_op_sid;
@@ -1144,8 +1205,8 @@ static void handle_read_data_by_id(uint8_t *data, uint16_t len)
   }
 
   /* DID 0x2013 主动问询：UART 往返延迟走延迟应答（先 7F 22 78，Qi 回复后
-   * 62 20 13 ver_lo ver_hi），不进同步 fill 路径。仅支持单独读；组合读
-   * 回 NRC 0x22（延迟应答无法服务多 DID）。 */
+   * 62 20 13 + 20B ASCII "QC_JYF_MCU2_FW_1.1.X"），不进同步 fill 路径。
+   * 仅支持单独读；组合读回 NRC 0x22（延迟应答无法服务多 DID）。 */
   if ((len == 3U) &&
       ((((uint16_t)data[1] << 8) | (uint16_t)data[2]) == DID_QI_VERSION_QUERY))
   {
@@ -1880,32 +1941,30 @@ static void qi_iap_frame_cb(const qi_frame_t *frame)
   }
 
   /* ---- Qi 版本查询回复（DID 0x2013 主动问询）----
-   * 主格式：CMD 0x03 + 2B 版本 LE；兼容：Qi 侧用通用 ACK(0x00) 携带版本
-   *（仅在 IAP 空闲时采纳，避免误吞 IAP ACK）。收到即同步缓存并直发
-   * 62 20 13 正响应；超时兜底在 qi_ver_query_poll()。 */
+   * 主格式：CMD 0x03 + 版本（规格：个位数）；兼容：Qi 侧用通用 ACK(0x00)
+   * 携带版本（仅在 IAP 空闲时采纳，避免误吞 IAP ACK）。取首字节按个位数
+   * 稳健化解析（qi_ver_norm_digit），缓存 0~9 数值，并回
+   * 62 20 13 + 20B ASCII "QC_JYF_MCU2_FW_1.1.X"（23B，proto_send_response
+   * 自动走 g_tx_pend 多帧延迟路径，帧回调内安全）；
+   * 超时兜底在 qi_ver_query_poll()。 */
   if (g_qi_ver_q_state == 1U)
   {
     const uint8_t *vsrc = (const uint8_t *)0;
-    if ((frame->cmd == QI_CMD_VERSION_QUERY) && (frame->data_len >= 2U))
+    if ((frame->cmd == QI_CMD_VERSION_QUERY) && (frame->data_len >= 1U))
     {
-      vsrc = &frame->data[0];
+      vsrc = &frame->data[0];      /* 问询专用回复：首字节即版本 */
     }
     else if ((frame->cmd == QI_CMD_ACK) && (g_qi_iap_state == QI_IAP_IDLE) &&
              (frame->data_len >= 2U))
     {
-      vsrc = &frame->data[0];
+      vsrc = &frame->data[0];      /* 通用 ACK 须 2B 形状，防误吞 1B 状态 ACK */
     }
     if (vsrc != (const uint8_t *)0)
     {
-      uint8_t resp[5];
-      g_qi_fw_version   = (uint16_t)vsrc[0] | ((uint16_t)vsrc[1] << 8);
-      g_qi_ver_q_state  = 0U;
-      resp[0] = UDS_SID_READ_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
-      resp[1] = 0x20U;
-      resp[2] = 0x13U;
-      resp[3] = vsrc[0];
-      resp[4] = vsrc[1];
-      proto_send_response(resp, 5);
+      char digit;
+      g_qi_fw_version  = qi_ver_norm_digit(vsrc[0], &digit);
+      g_qi_ver_q_state = 0U;
+      qi_ver_send_full_response(digit);
       return;
     }
   }
@@ -2261,9 +2320,12 @@ static void qi_iap_ack_poll(void)
 
 /**
  * @brief  Qi 版本问询超时兜底（DID 0x2013 延迟应答）
- * @note   Called from can_protocol_poll()。回复到达走帧回调直发；
- *         此处只处理 500ms 超时：缓存非 0 回缓存值（产线不断流），
+ * @note   Called from can_protocol_poll()。回复到达走帧回调；
+ *         此处只处理 500ms 超时：缓存非 0 用缓存数字拼完整版本串
+ *         62 20 13 + 20B ASCII "QC_JYF_MCU2_FW_1.1.X"（产线不断流），
  *         缓存为 0 回 NRC 0x22（如需严格问询语义可去掉缓存兜底）。
+ *         已知取舍：缓存判无效仍是 !=0，版本 0 被当"无缓存"
+ *         （实际版本 1~9，可接受）。
  */
 static void qi_ver_query_poll(void)
 {
@@ -2278,13 +2340,9 @@ static void qi_ver_query_poll(void)
   g_qi_ver_q_state = 0U;
   if (g_qi_fw_version != 0U)
   {
-    uint8_t resp[5];
-    resp[0] = UDS_SID_READ_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
-    resp[1] = 0x20U;
-    resp[2] = 0x13U;
-    resp[3] = (uint8_t)(g_qi_fw_version & 0xFFU);
-    resp[4] = (uint8_t)(g_qi_fw_version >> 8);
-    proto_send_response(resp, 5);
+    /* 问询路径缓存为 0~9 数值；0x01 上报路径可能存原始 2B 值，
+     * %10 容错取个位（规格为个位数） */
+    qi_ver_send_full_response((char)('0' + (char)(g_qi_fw_version % 10U)));
   }
   else
   {
