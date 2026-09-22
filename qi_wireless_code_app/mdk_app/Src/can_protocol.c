@@ -98,6 +98,7 @@ static uint8_t  g_sa_sig_block_seq        = 0;
 #define QI_IAP_ACK_TIMEOUT_MS      2000U
 /** @brief  Qi chip prepare/erase timeout (ms) for DID 0x2130 start */
 #define QI_IAP_PREPARE_TIMEOUT_MS  2500U
+#define QI_VER_QUERY_TIMEOUT_MS    500U   /*!< DID 0x2013 Qi 版本查询回复超时 */
 
 static uint32_t g_qi_iap_last_tx_ms = 0U;
 
@@ -112,6 +113,10 @@ static uint32_t g_qi_iap_wait_start_ms = 0U; /*!< timestamp when WAIT_ACK entere
 static uint8_t  g_qi_iap_pending_did[2] = {0U}; /*!< DID bytes for deferred response */
 static uint32_t g_qi_iap_ack_timeout_ms = QI_IAP_ACK_TIMEOUT_MS;
 static uint16_t g_qi_iap_pending_chunk = 0U; /*!< bytes to add to sent after ACK */
+
+/** @brief  DID 0x2013 Qi 版本主动问询（延迟应答）状态 */
+static uint8_t  g_qi_ver_q_state    = 0U;   /*!< 0=idle, 1=waiting Qi 回复 */
+static uint32_t g_qi_ver_q_start_ms = 0U;
 
 /* ========================================================================== */
 /*  Qi charging state variables                                              */
@@ -1138,6 +1143,24 @@ static void handle_read_data_by_id(uint8_t *data, uint16_t len)
     return;
   }
 
+  /* DID 0x2013 主动问询：UART 往返延迟走延迟应答（先 7F 22 78，Qi 回复后
+   * 62 20 13 ver_lo ver_hi），不进同步 fill 路径。仅支持单独读；组合读
+   * 回 NRC 0x22（延迟应答无法服务多 DID）。 */
+  if ((len == 3U) && (data[1] == 0x20U) && (data[2] == 0x13U))
+  {
+    if ((g_qi_ver_q_state != 0U) || (g_qi_iap_state != QI_IAP_IDLE))
+    {
+      /* 查询进行中不排队；Qi IAP 升级中避免 UART 命令交叉 */
+      proto_send_nrc(UDS_SID_READ_DATA_BY_ID, UDS_NRC_CONDITIONS_NOT_CORRECT);
+      return;
+    }
+    g_qi_ver_q_state    = 1U;
+    g_qi_ver_q_start_ms = timer_get_tick();
+    proto_send_pending(UDS_SID_READ_DATA_BY_ID);
+    (void)qi_protocol_send(QI_CMD_VERSION_QUERY, (const uint8_t *)0, 0U, 1U);
+    return;
+  }
+
   resp[0] = UDS_SID_READ_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
   pos = 1U;
   for (i = 1U; i < len; i += 2U)
@@ -1145,6 +1168,13 @@ static void handle_read_data_by_id(uint8_t *data, uint16_t len)
     uint16_t did = ((uint16_t)data[i] << 8) | (uint16_t)data[i + 1U];
     uint8_t payload[32];
     uint8_t plen = 0U;
+
+    if (did == DID_QI_VERSION_QUERY)
+    {
+      /* 组合读含 0x2013：延迟应答无法服务 → NRC 0x22 */
+      proto_send_nrc(UDS_SID_READ_DATA_BY_ID, UDS_NRC_CONDITIONS_NOT_CORRECT);
+      return;
+    }
 
     if (fill_did_payload(did, payload, &plen) != 0)
     {
@@ -1318,6 +1348,12 @@ static void handle_write_data_by_id(uint8_t *data, uint16_t len)
           if (len < 6U)
           {
             proto_send_nrc(UDS_SID_WRITE_DATA_BY_ID, UDS_NRC_INCORRECT_MESSAGE_LENGTH);
+            return;
+          }
+          if (g_qi_ver_q_state != 0U)
+          {
+            /* 版本问询进行中：避免 UART 命令交叉 */
+            proto_send_nrc(UDS_SID_WRITE_DATA_BY_ID, UDS_NRC_CONDITIONS_NOT_CORRECT);
             return;
           }
           g_qi_iap_total    = ((uint16_t)data[4] << 8) | (uint16_t)data[5];
@@ -1842,6 +1878,37 @@ static void qi_iap_frame_cb(const qi_frame_t *frame)
     return;
   }
 
+  /* ---- Qi 版本查询回复（DID 0x2013 主动问询）----
+   * 主格式：CMD 0x03 + 2B 版本 LE；兼容：Qi 侧用通用 ACK(0x00) 携带版本
+   *（仅在 IAP 空闲时采纳，避免误吞 IAP ACK）。收到即同步缓存并直发
+   * 62 20 13 正响应；超时兜底在 qi_ver_query_poll()。 */
+  if (g_qi_ver_q_state == 1U)
+  {
+    const uint8_t *vsrc = (const uint8_t *)0;
+    if ((frame->cmd == QI_CMD_VERSION_QUERY) && (frame->data_len >= 2U))
+    {
+      vsrc = &frame->data[0];
+    }
+    else if ((frame->cmd == QI_CMD_ACK) && (g_qi_iap_state == QI_IAP_IDLE) &&
+             (frame->data_len >= 2U))
+    {
+      vsrc = &frame->data[0];
+    }
+    if (vsrc != (const uint8_t *)0)
+    {
+      uint8_t resp[5];
+      g_qi_fw_version   = (uint16_t)vsrc[0] | ((uint16_t)vsrc[1] << 8);
+      g_qi_ver_q_state  = 0U;
+      resp[0] = UDS_SID_READ_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
+      resp[1] = 0x20U;
+      resp[2] = 0x13U;
+      resp[3] = vsrc[0];
+      resp[4] = vsrc[1];
+      proto_send_response(resp, 5);
+      return;
+    }
+  }
+
   /* ---- Qi status report (0x01) 信息读取 ----
    * 规范 6 字节：status1, status2, power LE, version LE
    * 扩展 ≥13 字节：额外电压/电流/温度/FOD/故障/降额 */
@@ -1921,24 +1988,21 @@ static void qi_iap_frame_cb(const qi_frame_t *frame)
       g_qi_charge_state = QI_CHARGE_FAULT;
     }
 
-    /* 统一帧布局（无论标准帧还是扩展帧）：
-     *   data[0]   = status byte 1
-     *   data[1]   = status byte 2
-     *   data[2-3] = firmware version LE  (与 DID 0x2133 一致)
-     *   data[4-5] = output power LE (mW)
+    /* 帧布局（docs/4. IAP数据通信协议规范.md §2.1，0 基帧偏移）：
+     *   data[0-1] = status1/status2（帧偏移 4-5）
+     *   data[2-3] = 实时功率 LE mW（帧偏移 6-7）
+     *   data[4-5] = 版本号 LE（帧偏移 8-9，与 DID 0x2133 一致）
      * 扩展帧 (≥13B) 额外字段：
      *   data[6]   = voltage, data[7] = current, data[8] = temp
      *   data[9]   = FOD, data[10] = reserved, data[11] = fault
      *   data[12]  = thermal derate
      *
-     * NOTE: 旧版本标准帧/扩展帧的 version/power 偏移不一致，
-     *       此处统一为 data[2-3]=version, data[4-5]=power。
-     *       若 Qi 芯片规格书定义不同，请按实际修正。 */
-    /* 统一解析：data[2-3] = version LE, data[4-5] = power LE */
-    g_qi_fw_version = (uint16_t)frame->data[2]
-                    | ((uint16_t)frame->data[3] << 8);
-    g_qi_output_power_mw = (uint16_t)frame->data[4]
-                         | ((uint16_t)frame->data[5] << 8);
+     * NOTE: 曾按 data[2-3]=version/data[4-5]=power 解析（与规格书
+     *       装反），2026-09-22 对齐规格书修正。 */
+    g_qi_output_power_mw = (uint16_t)frame->data[2]
+                         | ((uint16_t)frame->data[3] << 8);
+    g_qi_fw_version = (uint16_t)frame->data[4]
+                    | ((uint16_t)frame->data[5] << 8);
 
     /* 扩展帧额外字段 */
     if (frame->data_len >= 13U)
@@ -2194,6 +2258,39 @@ static void qi_iap_ack_poll(void)
   }
 }
 
+/**
+ * @brief  Qi 版本问询超时兜底（DID 0x2013 延迟应答）
+ * @note   Called from can_protocol_poll()。回复到达走帧回调直发；
+ *         此处只处理 500ms 超时：缓存非 0 回缓存值（产线不断流），
+ *         缓存为 0 回 NRC 0x22（如需严格问询语义可去掉缓存兜底）。
+ */
+static void qi_ver_query_poll(void)
+{
+  if (g_qi_ver_q_state != 1U)
+  {
+    return;
+  }
+  if ((timer_get_tick() - g_qi_ver_q_start_ms) < QI_VER_QUERY_TIMEOUT_MS)
+  {
+    return;
+  }
+  g_qi_ver_q_state = 0U;
+  if (g_qi_fw_version != 0U)
+  {
+    uint8_t resp[5];
+    resp[0] = UDS_SID_READ_DATA_BY_ID + UDS_POSITIVE_RESPONSE_OFFSET;
+    resp[1] = 0x20U;
+    resp[2] = 0x13U;
+    resp[3] = (uint8_t)(g_qi_fw_version & 0xFFU);
+    resp[4] = (uint8_t)(g_qi_fw_version >> 8);
+    proto_send_response(resp, 5);
+  }
+  else
+  {
+    proto_send_nrc(UDS_SID_READ_DATA_BY_ID, UDS_NRC_CONDITIONS_NOT_CORRECT);
+  }
+}
+
 void can_protocol_poll(void)
 {
   uint32_t now;
@@ -2217,6 +2314,7 @@ void can_protocol_poll(void)
 
   /* Qi IAP ACK poll: non-blocking check for Qi chip UART ACK */
   qi_iap_ack_poll();
+  qi_ver_query_poll();
   ota_dl_poll();
 
   /* Qi IAP auto-complete: if all data sent and no ACK within timeout,

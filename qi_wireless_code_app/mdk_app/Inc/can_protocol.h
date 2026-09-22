@@ -126,6 +126,7 @@ extern "C" {
 
 /** @brief  Firmware management DIDs */
 #define DID_FW_TYPE                 0x2010U   /*!< firmware type, uint8, read/write */
+#define DID_QI_VERSION_QUERY        0x2013U   /*!< 读 Qi 芯片固件版本（主动问询），2B LE；应答 62 20 13 ver_lo ver_hi */
 
 /** @brief  Device-specific DIDs (defined in peripheral SRS) */
 #define DID_OTA_STATE               0x2112U   /*!< OTA status: 0=idle 1=downloading 3=pending 5=confirmed 6=rolled_back */

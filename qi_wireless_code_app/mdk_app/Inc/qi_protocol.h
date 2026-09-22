@@ -42,6 +42,7 @@ extern "C" {
 #define QI_CMD_ACK              0x00U   /**< Qi→MCU 回复指令 */
 #define QI_CMD_STATUS_REPORT    0x01U   /**< Qi→MCU 无线充上报数据 */
 #define QI_CMD_SET_POWER        0x02U   /**< MCU→Qi 设置功率 */
+#define QI_CMD_VERSION_QUERY    0x03U   /**< MCU→Qi 查询固件版本（Qi 侧需支持；回复 CMD 0x03 + 2B 版本 LE） */
 #define QI_CMD_IAP              0xCCU   /**< MCU→Qi IAP 固件升级 */
 
 /* ==========================================================================
