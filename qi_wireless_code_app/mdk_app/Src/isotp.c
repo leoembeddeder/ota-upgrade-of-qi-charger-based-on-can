@@ -9,6 +9,14 @@
 #include "can_driver.h"
 #include "timer_drv.h"
 
+/* FC 送达确认与重试参数（FC 发送竞态修复）：总尝试 ≤3 次，尝试间 1ms
+ * tick 间隔；单帧上总线确认窗口与发 FC 前等上一帧落地窗口取要求的
+ * 5~10ms 区间内 8ms / 5ms。均为本文件内部参数，不动 isotp.h 导出面。 */
+#define ISOTP_FC_ATTEMPTS_MAX           3U
+#define ISOTP_FC_ATTEMPT_GAP_MS         1U
+#define ISOTP_FC_CONFIRM_TIMEOUT_MS     8U
+#define ISOTP_FC_PREWAIT_TIMEOUT_MS     5U
+
 static isotp_rx_ctx_t rx_ctx;
 static isotp_complete_cb_t complete_callback = (isotp_complete_cb_t)0;
 
@@ -37,9 +45,80 @@ static int8_t isotp_can_send(uint32_t can_id, uint8_t *frame, uint8_t len)
   return -1;
 }
 
+static void isotp_delay_ms(uint32_t ms)
+{
+  uint32_t start = timer_get_tick();
+  if (ms == 0U)
+  {
+    return;
+  }
+  while ((timer_get_tick() - start) < ms)
+  {
+  }
+}
+
+/**
+ * @brief  single FC transmit attempt: enqueue + confirm the frame on bus
+ * @note   单次尝试快速出结论，不走 isotp_can_send 的 N_As=1s 自旋（FC
+ *         时效以毫秒计，自旋会占死 RX 调用上下文）。发送结果不丢弃：
+ *         发送前后 last_tx_handle 对比识别静默入队失败（同 ECUReset 51 01
+ *         既有写法），入队成功后按 handle 确认该帧真正上总线，
+ *         ABORTED/REJECTED/确认超时均算失败——旧 (void) 路径对「发了但
+ *         没上总线」完全无感，是实机 FC 静默丢失的直接放大器。
+ * @param  can_id:  FC frame CAN ID
+ * @param  fc_data: filled 8-byte FC frame
+ * @retval 0 = FC confirmed on bus, -1 = this attempt failed
+ */
+static int8_t isotp_send_fc_try(uint32_t can_id, uint8_t *fc_data)
+{
+  uint8_t h_before;
+  uint8_t h_after;
+  uint8_t have_prev;
+
+  have_prev = (can_driver_last_tx_handle(&h_before) == 0) ? 1U : 0U;
+
+  if (can_driver_send(can_id, fc_data, ISOTP_CAN_FRAME_SIZE) != 0)
+  {
+    return -1;
+  }
+
+  if ((can_driver_last_tx_handle(&h_after) != 0) ||
+      ((have_prev != 0U) && (h_after == h_before)))
+  {
+    return -1;
+  }
+
+  return can_driver_wait_tx_frame(h_after, ISOTP_FC_CONFIRM_TIMEOUT_MS);
+}
+
+/**
+ * @brief  send one Flow Control frame with delivery confirmation + retry
+ * @note   FC 发送竞态修复（实机 30 次压测 3 次 RequestDownload FF 后
+ *         无 FC、主机 N_Bs 超时的三层根因修复，邮箱准入层见
+ *         can_driver.c can_try_txbuf 注释）：
+ *         1) 发 FC 前先等上一帧落地：FF 常在上一应答（如擦除应答
+ *            71 01 FF 00）发出后 1~2ms 内到达，两帧挤入同一写锁未稳定
+ *            窗口会放大丢失概率。上一帧已落地时 wait_tx_frame 正证据
+ *            立即返回不增时延；确认超时不停摆，照发 FC。
+ *         2) 发送结果不丢弃 + 自动重试：单次尝试见 isotp_send_fc_try，
+ *            失败按 ISOTP_FC_ATTEMPT_GAP_MS=1ms tick 间隔（isotp_delay_ms
+ *            SysTick 轮询写法）重发，总尝试 ≤ ISOTP_FC_ATTEMPTS_MAX=3 次。
+ *         3) 全部失败兜底：rx_ctx.state 置回 ISOTP_RX_STATE_IDLE（同
+ *            isotp_poll 置位写法），不留 RX_IN_PROGRESS 脏状态，等主机
+ *            N_Bs 超时重发 FF。
+ *         FC 无 suppress 语义，CTS/OVERFLOW 任何状态走同一送达确认。
+ * @param  can_id: FC frame CAN ID
+ * @param  status: FC status (CTS/WAIT/OVERFLOW, ISOTP_FC_STATUS_*)
+ * @param  bs:     Block Size
+ * @param  stmin:  Separation Time
+ * @retval none
+ */
 static void isotp_send_fc(uint32_t can_id, uint8_t status, uint8_t bs, uint8_t stmin)
 {
   uint8_t fc_data[ISOTP_CAN_FRAME_SIZE];
+  uint8_t prev_handle;
+  uint8_t attempt;
+  uint8_t sent;
   uint8_t i;
 
   fc_data[0] = ISOTP_PCI_TYPE_FC | (status & 0x0FU);
@@ -49,7 +128,30 @@ static void isotp_send_fc(uint32_t can_id, uint8_t status, uint8_t bs, uint8_t s
   {
     fc_data[i] = 0xCCU;
   }
-  (void)isotp_can_send(can_id, fc_data, ISOTP_CAN_FRAME_SIZE);
+
+  if (can_driver_last_tx_handle(&prev_handle) == 0)
+  {
+    (void)can_driver_wait_tx_frame(prev_handle, ISOTP_FC_PREWAIT_TIMEOUT_MS);
+  }
+
+  sent = 0U;
+  for (attempt = 0U; attempt < ISOTP_FC_ATTEMPTS_MAX; attempt++)
+  {
+    if (attempt > 0U)
+    {
+      isotp_delay_ms(ISOTP_FC_ATTEMPT_GAP_MS);
+    }
+    if (isotp_send_fc_try(can_id, fc_data) == 0)
+    {
+      sent = 1U;
+      break;
+    }
+  }
+
+  if (sent == 0U)
+  {
+    rx_ctx.state = ISOTP_RX_STATE_IDLE;
+  }
 }
 
 static uint8_t isotp_stmin_to_ms(uint8_t stmin)
@@ -210,18 +312,6 @@ void isotp_rx_process(uint8_t *data, uint8_t len)
 
     default:
       break;
-  }
-}
-
-static void isotp_delay_ms(uint32_t ms)
-{
-  uint32_t start = timer_get_tick();
-  if (ms == 0U)
-  {
-    return;
-  }
-  while ((timer_get_tick() - start) < ms)
-  {
   }
 }
 

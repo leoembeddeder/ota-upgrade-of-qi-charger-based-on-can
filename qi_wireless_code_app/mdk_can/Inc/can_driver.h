@@ -92,11 +92,12 @@ void can_driver_init(void);
  * @brief  transmit a CAN extended frame
  * @note   每帧成功入队时在驱动内部记录递增 handle（见
  *         can_driver_last_tx_handle / can_driver_wait_tx_frame）；
- *         返回值语义不变。
+ *         首选邮箱被拒（STB 满/写锁 ERROR）时自动回退另一邮箱再试一次
+ *         （FC 发送竞态修复），两个都失败才 -1；返回值语义不变。
  * @param  id:   29-bit extended identifier
  * @param  data: pointer to transmit data buffer
  * @param  len:  data length (0~8)
- * @retval 0 on success, -1 on failure (bus busy or invalid parameter)
+ * @retval 0 on success, -1 on failure (both TX buffers rejected or invalid parameter)
  */
 int8_t can_driver_send(uint32_t id, uint8_t *data, uint8_t len);
 

@@ -259,6 +259,47 @@ void can_driver_pins_standby(void)
 }
 
 /**
+ * @brief  try to enqueue and trigger one frame in a specific TX buffer
+ * @note   发送邮箱准入/写入/触发的最小单元（FC 发送竞态修复）。准入判据
+ *         与库内部一致（at32f422_426_can.c can_txbuf_write）：PTB 在
+ *         ctrlstat.tpe==TRUE（写锁未清）时拒写、STB 在
+ *         ctrlstat.tsnext==TRUE 时拒写，STB 另有 FIFO 满预检。任一步被
+ *         拒即 -1 且不留半成品（can_txbuf_write 在触碰缓冲 RAM 前就
+ *         会因写锁返回 ERROR）。旧 can_driver_send 对该 ERROR 直接 -1
+ *         不换另一邮箱——「tstat 说空、写锁还锁着」窗口内整帧静默丢失
+ *         （实机 30 次压测 3 次 FF 后无 FC 的根因层 2），故由
+ *         can_driver_send 在本函数返回 -1 时回退另一邮箱再试一次。
+ * @param  sel:    CAN_TXBUF_PTB / CAN_TXBUF_STB
+ * @param  tx_buf: frame descriptor (id/dlc/data/handle already filled)
+ * @retval 0 = enqueued and triggered, -1 = rejected (locked/full/write error)
+ */
+static int8_t can_try_txbuf(can_txbuf_select_type sel, can_txbuf_type *tx_buf)
+{
+  if (sel == CAN_TXBUF_STB)
+  {
+    if (can_stb_status_get(CAN1) == CAN_STB_STATUS_FULL)
+    {
+      return -1;
+    }
+  }
+
+  if (can_txbuf_write(CAN1, sel, tx_buf) != SUCCESS)
+  {
+    return -1;
+  }
+
+  if (sel == CAN_TXBUF_PTB)
+  {
+    can_txbuf_transmit(CAN1, CAN_TRANSMIT_PTB);
+  }
+  else
+  {
+    can_txbuf_transmit(CAN1, CAN_TRANSMIT_STB_ONE);
+  }
+  return 0;
+}
+
+/**
  * @brief  transmit a CAN extended frame
  * @note   NOT thread-safe - call only from main loop context.
  *         Do not call from ISR or multiple threads without external locking.
@@ -269,17 +310,19 @@ void can_driver_pins_standby(void)
  *         can_driver_wait_tx_frame() 按 handle 精确等待某一帧，避免笼统
  *         TX-idle 判定在多缓冲（PTB+STB FIFO）场景下误把其他帧/空缓冲
  *         的状态当成目标帧完成（ECUReset 51 01 偶发丢失的竞态根因）。
- *         返回值语义保持 0/-1 不变，现有调用方不受影响。
+ *         双邮箱回退（FC 发送竞态修复）：首选邮箱被拒（STB 满/
+ *         can_txbuf_write 写锁 ERROR）时换另一邮箱再试一次，两个都失败
+ *         才 -1，详见 can_try_txbuf 注释。返回值语义保持 0/-1 不变，
+ *         现有调用方不受影响。
  * @param  id:   29-bit extended identifier
  * @param  data: pointer to transmit data buffer
  * @param  len:  data length (0~8)
- * @retval 0 on success, -1 on failure (bus busy or invalid parameter)
+ * @retval 0 on success, -1 on failure (both TX buffers rejected or invalid parameter)
  */
 int8_t can_driver_send(uint32_t id, uint8_t *data, uint8_t len)
 {
   can_txbuf_type tx_buf;
   can_txbuf_select_type txbuf_sel;
-  can_stb_status_type stb_status;
   can_transmit_status_type tx_status;
   uint8_t i;
 
@@ -320,8 +363,12 @@ int8_t can_driver_send(uint32_t id, uint8_t *data, uint8_t len)
     tx_buf.data[i] = data[i];
   }
 
-  /* try primary transmit buffer (PTB) first for higher priority.
-   * TRANSMITTED(3) also means PTB is free for a new frame. */
+  /* mailbox pick unchanged: try primary transmit buffer (PTB) first for
+   * higher priority while tstat says the current slot is free/done
+   * (TRANSMITTED(3) also means the slot is reusable); otherwise STB first.
+   * tstat only biases the try order — actual admission lives in
+   * can_try_txbuf (STB-full pre-check + can_txbuf_write), whose rejection
+   * now falls back to the other mailbox instead of failing outright. */
   can_transmit_status_get(CAN1, &tx_status);
   if ((tx_status.current_tstat == CAN_TSTAT_IDLE) ||
       (tx_status.current_tstat == CAN_TSTAT_TRANSMITTED))
@@ -330,29 +377,24 @@ int8_t can_driver_send(uint32_t id, uint8_t *data, uint8_t len)
   }
   else
   {
-    /* check secondary transmit buffer (STB) */
-    stb_status = can_stb_status_get(CAN1);
-    if (stb_status == CAN_STB_STATUS_FULL)
-    {
-      return -1;  /* both buffers full */
-    }
     txbuf_sel = CAN_TXBUF_STB;
   }
 
-  /* write to transmit buffer */
-  if (can_txbuf_write(CAN1, txbuf_sel, &tx_buf) != SUCCESS)
+  /* dual-mailbox fallback (FC TX race fix): the old code returned -1 the
+   * moment can_txbuf_write() rejected the pick, never trying the other
+   * buffer (PTB write-locked => never tried STB; STB blocked/full => never
+   * tried PTB). Inside the "tstat says free but the ctrlstat write lock
+   * (tpe/tsnext, see at32f422_426_can.c can_txbuf_write) is still set"
+   * window a critical frame such as the ISO-TP FC vanished silently —
+   * root cause of 3/30 stress runs with no FC after RequestDownload FF.
+   * Try the other mailbox once on rejection; -1 only if both reject. */
+  if (can_try_txbuf(txbuf_sel, &tx_buf) != 0)
   {
-    return -1;
-  }
-
-  /* trigger transmission */
-  if (txbuf_sel == CAN_TXBUF_PTB)
-  {
-    can_txbuf_transmit(CAN1, CAN_TRANSMIT_PTB);
-  }
-  else
-  {
-    can_txbuf_transmit(CAN1, CAN_TRANSMIT_STB_ONE);
+    txbuf_sel = (txbuf_sel == CAN_TXBUF_PTB) ? CAN_TXBUF_STB : CAN_TXBUF_PTB;
+    if (can_try_txbuf(txbuf_sel, &tx_buf) != 0)
+    {
+      return -1;
+    }
   }
 
   /* 记录本帧 handle 并推进序号（仅在真正入队成功后更新，供调用方
