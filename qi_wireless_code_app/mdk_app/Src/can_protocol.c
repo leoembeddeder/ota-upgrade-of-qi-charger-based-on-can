@@ -106,7 +106,7 @@ static uint8_t  g_qi_iap_state    = QI_IAP_IDLE;
 static uint8_t  g_qi_iap_progress = 0U;
 static uint16_t g_qi_iap_total    = 0U;
 static uint16_t g_qi_iap_sent     = 0U;
-static uint16_t g_qi_fw_version   = 0U;     /*!< DID 0x2133 / 0x01 上报版本号 */
+static uint16_t g_qi_fw_version   = 0U;     /*!< Qi 版本缓存：DID 0x2133/0x2013 读出源；由 0x01 上报解析或 0x2013 主动问询回复更新 */
 
 /** @brief  deferred UDS response while waiting for Qi chip ACK */
 static uint32_t g_qi_iap_wait_start_ms = 0U; /*!< timestamp when WAIT_ACK entered */
@@ -1146,7 +1146,8 @@ static void handle_read_data_by_id(uint8_t *data, uint16_t len)
   /* DID 0x2013 主动问询：UART 往返延迟走延迟应答（先 7F 22 78，Qi 回复后
    * 62 20 13 ver_lo ver_hi），不进同步 fill 路径。仅支持单独读；组合读
    * 回 NRC 0x22（延迟应答无法服务多 DID）。 */
-  if ((len == 3U) && (data[1] == 0x20U) && (data[2] == 0x13U))
+  if ((len == 3U) &&
+      ((((uint16_t)data[1] << 8) | (uint16_t)data[2]) == DID_QI_VERSION_QUERY))
   {
     if ((g_qi_ver_q_state != 0U) || (g_qi_iap_state != QI_IAP_IDLE))
     {
