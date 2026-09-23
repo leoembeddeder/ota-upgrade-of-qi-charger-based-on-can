@@ -31,13 +31,15 @@
 #include "at32f422_426.h"
 #include <string.h>
 
-/* TEMPORARY TEST SWITCH: set to 0 to restore strict verify (added 2026-09-23, will be reverted) */
-#define OTA_VERIFY_FAIL_BYPASS  1
+/* VERIFY ENFORCE SWITCH: 1 = strict check (normal), 0 = force pass on failure (TEMPORARY for testing, added 2026-09-23) */
+#define OTA_VERIFY_ENFORCE  0
 
-#if (OTA_VERIFY_FAIL_BYPASS == 1)
+#if (OTA_VERIFY_ENFORCE == 0)
 /* Bypass-hit marker (debugger-watchable): nonzero = at least one verify
- * failure was bypassed. Warning text of the bypass event:
- * "verify FAILED but bypass=1, continue" (no text logger on this MCU). */
+ * failure was force-passed. Distinguishes a real pass (0) from a
+ * failed-but-passed run. Warning text of the bypass event:
+ * "verify FAILED but ENFORCE=0, force pass" (no text logger on this
+ * MCU). */
 static volatile uint8_t g_verify_bypass_hit = 0U;
 #endif
 
@@ -603,8 +605,8 @@ void ota_dl_poll(void)
   }
   if (verify_backup_image() != 0)
   {
-#if (OTA_VERIFY_FAIL_BYPASS == 1)
-    /* verify FAILED but bypass=1, continue -> commit_backup -> 0x77 ->
+#if (OTA_VERIFY_ENFORCE == 0)
+    /* verify FAILED but ENFORCE=0: force pass -> commit_backup -> 0x77 ->
      * auto reset as if verify passed (verify computation above ran in
      * full, only the rejection is bypassed). Single switch controls all
      * bypass logic; the three other failure paths stay untouched. */
