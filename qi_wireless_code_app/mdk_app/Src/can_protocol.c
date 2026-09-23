@@ -853,7 +853,8 @@ static int8_t fill_did_payload(uint16_t did, uint8_t *out, uint8_t *olen)
        * 0x00 Idle               无 OTA 操作，无待报告结果
        * 0x01 Downloading        正在下载固件到备份区
        * 0x02 Validating         传输完成，正在验证（CRC/签名）
-       * 0x03 Pending Activation 验证成功，等待 11 01 激活重启
+       * 0x03 Pending Activation 验签提交成功，随即自复位激活
+       * （2026-09-23 起自动复位，无 11 01 等待）
        * 0x04 Trial Boot         新 APP 启动未确认（单 App 架构不适用）
        * 0x05 Confirmed          OTA 搬运成功，新固件已生效
        * 0x06 Rolled Back        搬运失败，已回滚到旧固件
