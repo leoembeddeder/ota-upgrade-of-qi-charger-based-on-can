@@ -199,6 +199,7 @@ python merge_prod_bin.py
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-09-23 | **恢复 0x37 升级完成自复位 + 删除 11 01 ECUReset 服务**：升级完成后 APP 自动复位（`0x77`→SHUTDOWN→`NVIC_SystemReset`），主机无需 `11 01`；`0x11` 服务删除（不再应答 `51 01`/不再应答后复位，请求回 NRC serviceNotSupported）；OTA 脚本删除 `uds_ecu_reset` 步骤，升级完成信号后直接等待复位重启并验证 |
 | 2026-09-23 | **README 测试用例数量对齐**：目录树（§2）与文档索引（§7）两处「62 条测试用例」更正为 **69 条**，与 docs/10 实际清点一致（69 个唯一 TC 编号，分项表 5+11+6+6+5+7+10+5+6+8=69）；docs/10 本身已为 69 无需改动 |
 | 2026-09-19 | **OTA 恢复包移植批**（移植自 `backup/fix-package-0f4583f`，终审 PASS_WITH_RISKS 85，适配基线 f933c2d）：**0x37 收尾自复位切槽**——APP 在 verify+commit_trial 成功后先发 77、等 TX 空闲→SHUTDOWN→NVIC_SystemReset，Boot 按 trial PENDING 切槽，主机 11 01 保留为旧 APP 兼容/复位未生效补发；**擦除路径有界等待**（`flash_sector_erase_bounded` 局部轮询上限 `OTA_ERASE_POLLS_MAX`，超时 `flash_lock`+`__enable_irq` 恢复后回 NRC 0x72 可观测失败）；OTA 脚本判定闭环三条件（APP 应答+0x2113==目标槽+0xF195==预期版本，缺一即 FAIL+差异明细）+ 非 suppress 11 01 + 重定位宿主自检 + 版本感知拒闪 + 失败日志 0x37 NRC 语义输出；注释同步 can_protocol.c/h；docs/3 工作流同步 0x37 自复位语义；**`SW_VERSION_STR` 保持 `QC_JYF_FW_1.1.1`**（1.1.2 升级载荷由用户按需自行构建） |
 | 2026-09-18 | **XATO 镜像头删除 version 字段声明**：双工程 `image_header_t`/`ota_image_header_t` 的 `version[16]`（0x4C）从定义删除，同偏移改 `hdr_reserved_ver[16]` 保留占位（打包固定填 `0x00`，偏移锁定不可回收）；打包/OTA 脚本拼装处同改保留 padding，解析侧无 0x4C 残留引用（已复核）；头总长 256B 与 magic/长度/CRC32/签名/时间戳偏移逐字节不变（gcc offsetof 前后实测一致），旧 bin/新 bin 双向兼容；固件仅头文件声明变化、无代码引用该区，无需重编译烧录 |

@@ -156,7 +156,7 @@ TRANSFER_BLOCK_DATA = 128
 
 UDS_REQ_ID = 0x18DA0D03
 UDS_RESP_ID = 0x18DA030D
-SID_DSC, SID_ER, SID_RDBI, SID_SA = 0x10, 0x11, 0x22, 0x27
+SID_DSC, SID_RDBI, SID_SA = 0x10, 0x22, 0x27
 SID_WDBI, SID_RC, SID_RD, SID_TD, SID_RTE = 0x2E, 0x31, 0x34, 0x36, 0x37
 SID_TP = 0x3E
 SID_NRC, SID_PR = 0x7F, 0x40
@@ -776,43 +776,6 @@ def uds_try(bus_id, sid, payload, suppress=0):
         return None
 
 
-def uds_ecu_reset(bus_id):
-    """切槽激活：非 suppress 11 01（等待 51 01 正响应）。
-
-    旧实现用 uds_try 发 11 81（suppress）：ZCANPRO suppress 投递不可证
-    ——发送失败被静默吞掉、无应答可核，设备未复位时 metadata trial
-    PENDING 停留，Boot 不进试运行，升级"假成功"（取证报告
-    /mnt/k/slot_switch_forensics_0919.md §3 M4'）。改为非 suppress 11 01：
-    uds_request 等 51 01 正响应，超时重发 ≤3 次。
-
-    三次全超时不立即判死、脚本不再补发：现行固件 0x37 收尾 APP 不
-    自行复位（ota_download.c ota_dl_poll 注释：0e167e8 起等主机 11 01
-    才复位），51 01 三次无应答属应答丢失/总线异常；旧自复位架构固件
-    在本步前已复位时 51 01 不可达亦属预期形态。两种情形判定权均在
-    复位确认窗口：confirm_app_after_reset()（:996，22 2113 盲探→
-    生命周期帧监听→raw 探测）+ 判定闭环（见脚本头注释），失败输出
-    判别矩阵并给断电重启指引。本函数无 11 01 补发机制。"""
-    last_err = None
-    for attempt in range(1, 4):
-        if stopTask:
-            raise RuntimeError("用户停止脚本")
-        try:
-            _log("ECUReset 11 01（非 suppress，等 51 01 正响应；第 %d/3 次）" % attempt)
-            uds_req(bus_id, SID_ER, [0x01])
-            _log("收到 51 01，MCU 复位中（Boot 将按 trial PENDING 切槽）")
-            return
-        except SafeModeError:
-            raise
-        except Exception as e:
-            last_err = e
-            _log("11 01 第 %d/3 次未收到 51 01: %s" % (attempt, e))
-            if attempt < 3:
-                time.sleep(0.5)
-    _log("11 01 三次均未收到 51 01（%s）。现行固件 0x37 收尾不自行"
-         "复位（等主机 11 01），此形态属应答丢失/总线异常；旧自复位"
-         "架构固件则属预期形态。切槽是否生效由复位确认窗口判定" % last_err)
-
-
 def read_did_u8(bus_id, did):
     rx = uds_req(bus_id, SID_RDBI, [(did >> 8) & 0xFF, did & 0xFF])
     if len(rx) < 4:
@@ -1195,9 +1158,9 @@ def _raise_ota_fail(bus_id, from_slot, dest, to_slot, got_ver, expect_ver,
     lines.append("  · 2113=升级前槽 且 2115=0x04 或 2116≥1 → Boot 回滚：新槽验签失败"
                  "（重定位/签名/Device Info 公钥配对；safe-mode fail_step 语义见"
                  "脚本头注释）或试运行确认失败")
-    lines.append("  · 2113=升级前槽 且 2114=目标槽 → trial PENDING 已落盘但设备未复位"
-                 "（11 01 投递问题：uds_ecu_reset 三次重试 3000ms/次均无 51 01 应答，"
-                 "脚本无补发机制，判定转复位确认窗口）→ 请断电重启后重跑")
+    lines.append("  · 2113=升级前槽 且 2114=目标槽 → metadata 已提交但自复位"
+                 "未生效（0x37 收尾自动复位失败/未执行，无外部请求依赖）"
+                 "→ 请断电重启后重跑（断电重启即触发 BOOT 搬运）")
     lines.append("  · 2113=升级前槽 且 2114=0xFE → 无切槽证据链：0x37 commit 未发生"
                  "或 metadata 被重置（挂死后重烧/多次异常掉电）→ 查 0x37 段日志"
                  "与设备恢复方式")
@@ -1632,9 +1595,9 @@ def run_ota(bus_id):
         else:
             _log("[人话] 数据传输结束但 0x37 应答异常（详见上方技术日志）；"
                  "是否提交成功以复位后版本核验为准")
-        _log("---- Reset ----")
-        uds_ecu_reset(bus_id)
-        _log("[人话] 已发送重启指令；BOOT 搬运 Backup→App 约需数秒，等待设备回报…")
+        _log("---- 等待设备自复位 ----")
+        _log("[人话] 0x37 提交成功，设备自复位中（无需主机请求）；"
+             "BOOT 搬运 Backup→App 约需数秒，等待设备回报…")
         t0 = time.time()
         while time.time() - t0 < 2.0:
             if stopTask:

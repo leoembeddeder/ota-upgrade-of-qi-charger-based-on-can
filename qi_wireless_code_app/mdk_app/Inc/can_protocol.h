@@ -67,7 +67,6 @@ extern "C" {
 /* ========================================================================== */
 
 #define UDS_SID_DIAG_SESSION_CTRL    0x10U        /*!< DiagnosticSessionControl */
-#define UDS_SID_ECU_RESET            0x11U        /*!< ECUReset */
 #define UDS_SID_READ_DATA_BY_ID      0x22U        /*!< ReadDataByIdentifier */
 #define UDS_SID_WRITE_DATA_BY_ID     0x2EU        /*!< WriteDataByIdentifier */
 #define UDS_SID_SECURITY_ACCESS      0x27U        /*!< SecurityAccess */

@@ -504,8 +504,8 @@ int8_t can_driver_last_tx_handle(uint8_t *handle)
  *         REALIM/RETLIM 自动重发，不算终态，继续轮询；
  *         ABORTED(0x04)/REJECTED(0x06) 为终态失败，帧不会再上总线，
  *         立即返回 -1 让上层走补发，不空等超时。
- *         顺序安全性：调用方（handle_ecu_reset）在本函数返回前不发起
- *         新发送，final 槽不会被后续帧覆盖；其他帧的状态（含他帧
+ *         顺序安全性：调用方在本函数返回前不发起新发送（原 ECUReset
+ *         调用场景，2026-09-23 随 11 01 服务删除），final 槽不会被后续帧覆盖；其他帧的状态（含他帧
  *         TRANSMITTED）一律不作为本帧完成证据——这正是旧 TX-idle 笼统
  *         判定的竞态根因，此处按 handle 隔离。
  * @param  handle: frame handle recorded at enqueue time
