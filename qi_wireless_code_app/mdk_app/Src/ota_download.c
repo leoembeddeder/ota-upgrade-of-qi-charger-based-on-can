@@ -31,6 +31,16 @@
 #include "at32f422_426.h"
 #include <string.h>
 
+/* TEMPORARY TEST SWITCH: set to 0 to restore strict verify (added 2026-09-23, will be reverted) */
+#define OTA_VERIFY_FAIL_BYPASS  1
+
+#if (OTA_VERIFY_FAIL_BYPASS == 1)
+/* Bypass-hit marker (debugger-watchable): nonzero = at least one verify
+ * failure was bypassed. Warning text of the bypass event:
+ * "verify FAILED but bypass=1, continue" (no text logger on this MCU). */
+static volatile uint8_t g_verify_bypass_hit = 0U;
+#endif
+
 #define FLASH_PHYSICAL_END  0x08020000U
 #define VERIFY_CHUNK        256U
 
@@ -593,9 +603,17 @@ void ota_dl_poll(void)
   }
   if (verify_backup_image() != 0)
   {
+#if (OTA_VERIFY_FAIL_BYPASS == 1)
+    /* verify FAILED but bypass=1, continue -> commit_backup -> 0x77 ->
+     * auto reset as if verify passed (verify computation above ran in
+     * full, only the rejection is bypassed). Single switch controls all
+     * bypass logic; the three other failure paths stay untouched. */
+    g_verify_bypass_hit = 1U;
+#else
     can_proto_end_long_op();
     can_proto_send_nrc(UDS_SID_TRANSFER_EXIT, UDS_NRC_GENERAL_PROGRAMMING_FAILURE);
     return;
+#endif
   }
   if (commit_backup() != 0)
   {
