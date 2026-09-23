@@ -61,6 +61,7 @@ dkms.conf
 
 # Keil build artifacts
 *.Bak
+*.bak
 *.axf
 *.htm
 *.build_log.htm
