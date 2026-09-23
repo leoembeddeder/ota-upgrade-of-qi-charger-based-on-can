@@ -563,6 +563,11 @@ void ota_dl_handle_transfer_exit(uint8_t *data, uint16_t len)
 void ota_dl_poll(void)
 {
   uint8_t resp[1];
+  uint8_t h_before;
+  uint8_t h_after;
+  uint8_t h_bc0;
+  uint8_t have_prev;
+  uint32_t t0;
 
   if (g_exit_pending == 0U)
   {
@@ -602,17 +607,47 @@ void ota_dl_poll(void)
   g_trial_ready = 1U;
   can_proto_end_long_op();
   resp[0] = (uint8_t)(UDS_SID_TRANSFER_EXIT + UDS_POSITIVE_RESPONSE_OFFSET);
-  can_proto_send_response(resp, 1);
   /* 0x37 finish: after verify + commit_backup succeed the APP resets
    * itself -- upgrade completion triggers reset directly, no host
-   * request needed (11 01 ECUReset service removed 2026-09-23). 0x77
-   * must reach the wire before the reset: wait TX idle -> SHUTDOWN
-   * lifecycle frame -> wait TX idle -> NVIC_SystemReset. On the next
-   * boot the BOOT copies Backup->App and re-verifies. g_trial_ready=1
-   * keeps a retried 0x37 before the reset idempotent (positive
-   * response, no double commit). */
-  (void)can_driver_wait_tx_idle(50U);
+   * request needed (11 01 ECUReset service removed 2026-09-23). On the
+   * next boot the BOOT copies Backup->App and re-verifies.
+   * g_trial_ready=1 keeps a retried 0x37 before the reset idempotent
+   * (positive response, no double commit).
+   *
+   * Frame-dispatch race guard (same triple pattern as the removed
+   * handle_ecu_reset): the generic TX-idle check can be satisfied by a
+   * previous frame / empty mailbox while the target frame is still
+   * queued, and an immediate reset would kill the frame (the "51 01
+   * lost" race recorded in can_driver.c). So (1) confirm enqueue via
+   * last_tx_handle before/after the send and wait THIS frame out by
+   * handle for 0x77, (2) same handle-precise wait for the SHUTDOWN
+   * broadcast, (3) drain all TX buffers + 3ms insurance delay before
+   * NVIC_SystemReset(). */
+  have_prev = (can_driver_last_tx_handle(&h_before) == 0) ? 1U : 0U;
+  can_proto_send_response(resp, 1);
+  if ((can_driver_last_tx_handle(&h_after) == 0) &&
+      ((have_prev == 0U) || (h_after != h_before)))
+  {
+    (void)can_driver_wait_tx_frame(h_after, 50U);
+  }
+
+  have_prev = (can_driver_last_tx_handle(&h_bc0) == 0) ? 1U : 0U;
   lifecycle_set_state(LIFECYCLE_SHUTDOWN);
-  (void)can_driver_wait_tx_idle(20U);
+  if ((can_driver_last_tx_handle(&h_after) == 0) &&
+      ((have_prev == 0U) || (h_after != h_bc0)))
+  {
+    (void)can_driver_wait_tx_frame(h_after, 50U);
+  }
+
+  /* drain every queued frame off the wire, then a short insurance
+   * delay covering TX-complete edge windows (bus transfer tail,
+   * transceiver propagation, TSTAT update lag) */
+  (void)can_driver_wait_tx_all_idle(50U);
+  t0 = timer_get_tick();
+  while ((timer_get_tick() - t0) < 3U)
+  {
+    __NOP();
+  }
+
   NVIC_SystemReset();
 }

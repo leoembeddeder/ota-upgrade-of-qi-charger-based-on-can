@@ -112,7 +112,7 @@ int8_t can_driver_recv(uint32_t *id, uint8_t *data, uint8_t *len);
  * @note   笼统 TX-idle 判定（current_tstat ∈ {IDLE, TRANSMITTED}）：
  *         多 mailbox 场景可能被其他帧/空缓冲的状态满足，仅适用于
  *         「尽力排空」类等待。需要确认「指定帧已真正发出」时用
- *         can_driver_wait_tx_frame；ECUReset(11 01) 路径已改用后者，
+ *         can_driver_wait_tx_frame；原 ECUReset(11 01) 路径曾改用后者，2026-09-23 随服务删除，
  *         本函数本体语义不变，其余调用点行为不受影响。
  * @param  timeout_ms: maximum wait
  * @retval 0 on success, -1 on timeout
