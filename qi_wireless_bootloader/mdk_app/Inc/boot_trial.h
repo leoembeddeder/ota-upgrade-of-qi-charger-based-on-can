@@ -33,7 +33,7 @@ int8_t boot_backup_pending(const ota_metadata_t *meta);
  * @brief  copy Backup region firmware into App region
  * @note   power-loss safe: backup_valid stays set until copy + recheck
  *         pass; each power-on retries. Steps: verify Backup image
- *         (magic/length/CRC/ECDSA + vectors target App window) -> erase
+ *         (magic/length/CRC + vectors target App window) -> erase
  *         App region -> word copy -> re-verify App -> update metadata
  *         (app_valid, clear backup_valid) -> save.
  * @retval 0 on success, -1 on failure (fail_step stored in
@@ -43,7 +43,7 @@ int8_t boot_backup_pending(const ota_metadata_t *meta);
 int8_t boot_copy_backup(ota_metadata_t *meta);
 
 /**
- * @brief  verify App region image (magic/length/CRC/ECDSA + vectors)
+ * @brief  verify App region image (magic/length/CRC + vectors)
  * @retval 0 if valid, -1 on failure (g_verify_fail_step set)
  */
 int8_t boot_app_image_ok(void);

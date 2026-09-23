@@ -1,7 +1,7 @@
 /**
  **************************************************************************
  * @file     boot_verify.h
- * @brief    XATO image verification (header + CRC + ECDSA + vectors)
+ * @brief    XATO image verification (header + CRC + vectors)
  **************************************************************************
  */
 
@@ -28,15 +28,12 @@ typedef struct
   uint8_t  reserved[160];
 } ota_image_view_t;
 
-/** @brief  Magic marker value to detect public key corruption in Flash */
-#define ECDSA_PUBKEY_MAGIC  0x4B594550U  /* "KEYP" */
-
 /** @brief  last verification failure step
- *          0=pass 1=magic 2=length 3=CRC 4=reset-window 5=pubkey 6=ECDSA */
+ *          0=pass 1=magic 2=length 3=CRC 4=reset-window
+ *          5/6 已废弃（ECDSA 验签已移除，2026-09-24），不再产生 */
 extern volatile uint8_t g_verify_fail_step;
 
 void boot_verify_set_progress_cb(void (*cb)(void));
-const uint8_t *boot_verify_get_public_key(void);
 
 /**
  * @brief  verify XATO image at src_base; reset vector must fall inside

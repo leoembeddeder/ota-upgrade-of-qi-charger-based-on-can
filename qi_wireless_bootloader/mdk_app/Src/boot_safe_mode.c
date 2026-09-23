@@ -40,8 +40,8 @@
   *     2 = image_length 为 0 或超出槽范围
   *     3 = 镜像 CRC32 校验失败
   *     4 = Reset handler 不在槽内（跨槽链接镜像）
-  *     5 = ECDSA 公钥缺失/无效（Device Info 与内置均不可用）
-  *     6 = ECDSA P-256 验签失败
+  *     5 = 已废弃（ECDSA 验签已移除，2026-09-24）不再产生
+  *     6 = 已废弃（ECDSA 验签已移除，2026-09-24）不再产生
   *
   **************************************************************************
   */
@@ -127,7 +127,7 @@ void boot_diag_can_init(void)
   /* 初始化语义同 enter_safe_mode 既有调用（can_driver_init 自含
    * sit1145_init→Normal）；提前到 main.c step2 仅为 M1~M4 可发帧。
    * 影响面：仅 CAN1/GPIOA/GPIOB/SPI1 时钟引脚+收发器 Normal，与
-   * 决策链（flash 读写/CRC/ECDSA）零交集；enter_safe_mode 内原调用
+   * 决策链（flash 读写/CRC）零交集；enter_safe_mode 内原调用
    * 保留（路径语义不变，重复 init 幂等复位）。 */
   can_driver_init();
   (void)sit1145_normal_mode_set();
