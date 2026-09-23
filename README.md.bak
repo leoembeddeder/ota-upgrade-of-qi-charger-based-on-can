@@ -100,7 +100,7 @@ ota-upgrade-of-qi-charger-based-on-can/
     ├── 合并-CAN协议-UDS-OTA工作流.md        ← CAN 协议与 OTA 完整工作流
     ├── 2. Flash 分配方案.md                 ← Flash 分区细节
     ├── 9. APP镜像打包与产线烧录.md          ← 打包脚本用法
-    ├── 10. CAN-UDS OTA 测试用例表.md        ← 69 条测试用例
+    ├── 10. CAN-UDS OTA 测试用例表.md        ← 62 条测试用例
     ├── 11~14. 签名 / IAP 对比 / 宏定义      ← 专题文档
     ├── 15. 计划安排表.md
     ├── keys/                               ← ECDSA P-256 密钥对
@@ -199,7 +199,6 @@ python merge_prod_bin.py
 
 | 日期 | 变更内容 |
 |------|----------|
-| 2026-09-23 | **README 测试用例数量对齐**：目录树（§2）与文档索引（§7）两处「62 条测试用例」更正为 **69 条**，与 docs/10 实际清点一致（69 个唯一 TC 编号，分项表 5+11+6+6+5+7+10+5+6+8=69）；docs/10 本身已为 69 无需改动 |
 | 2026-09-19 | **OTA 恢复包移植批**（移植自 `backup/fix-package-0f4583f`，终审 PASS_WITH_RISKS 85，适配基线 f933c2d）：**0x37 收尾自复位切槽**——APP 在 verify+commit_trial 成功后先发 77、等 TX 空闲→SHUTDOWN→NVIC_SystemReset，Boot 按 trial PENDING 切槽，主机 11 01 保留为旧 APP 兼容/复位未生效补发；**擦除路径有界等待**（`flash_sector_erase_bounded` 局部轮询上限 `OTA_ERASE_POLLS_MAX`，超时 `flash_lock`+`__enable_irq` 恢复后回 NRC 0x72 可观测失败）；OTA 脚本判定闭环三条件（APP 应答+0x2113==目标槽+0xF195==预期版本，缺一即 FAIL+差异明细）+ 非 suppress 11 01 + 重定位宿主自检 + 版本感知拒闪 + 失败日志 0x37 NRC 语义输出；注释同步 can_protocol.c/h；docs/3 工作流同步 0x37 自复位语义；**`SW_VERSION_STR` 保持 `QC_JYF_FW_1.1.1`**（1.1.2 升级载荷由用户按需自行构建） |
 | 2026-09-18 | **XATO 镜像头删除 version 字段声明**：双工程 `image_header_t`/`ota_image_header_t` 的 `version[16]`（0x4C）从定义删除，同偏移改 `hdr_reserved_ver[16]` 保留占位（打包固定填 `0x00`，偏移锁定不可回收）；打包/OTA 脚本拼装处同改保留 padding，解析侧无 0x4C 残留引用（已复核）；头总长 256B 与 magic/长度/CRC32/签名/时间戳偏移逐字节不变（gcc offsetof 前后实测一致），旧 bin/新 bin 双向兼容；固件仅头文件声明变化、无代码引用该区，无需重编译烧录 |
 | 2026-09-18 | **打包产物 XATO 镜像头不再携带版本号**：头 version 区（0x4C，16B）打包固定填 `0x00`；删打包脚本 `IMAGE_VERSION` 常量及 pack/verify/OTA/relocate 全链路对头 version 字段的写入/解析/日志；固件删 `ota_get_image_version()`（Boot/APP 校验均不依赖该字段）；版本号唯一定义在固件 `SW_VERSION_STR`，发版只改固件常量 + 文档；头总长 256B/magic/长度/CRC/签名偏移全部不变，旧 bin 兼容 |
@@ -279,7 +278,7 @@ python merge_prod_bin.py
 | [合并-CAN协议-UDS-OTA工作流](docs/合并-CAN协议-UDS-OTA工作流.md) | CAN 协议与 UDS OTA 完整工作流实操手册 |
 | [2. Flash 分配方案](docs/2.%20Flash%20分配方案.md) | 128KB Flash 分区、Metadata 结构、XATO 头 |
 | [9. APP镜像打包与产线烧录](docs/9.%20APP镜像打包与产线烧录.md) | 打包脚本用法、Keil IROM 配置 |
-| [10. CAN-UDS OTA 测试用例表](docs/10.%20CAN-UDS%20OTA%20测试用例表.md) | 69 条测试用例 (P0/P1/P2) |
+| [10. CAN-UDS OTA 测试用例表](docs/10.%20CAN-UDS%20OTA%20测试用例表.md) | 62 条测试用例 (P0/P1/P2) |
 | [11. 签名校验与脚本使用](docs/11.%20签名校验与脚本使用.md) | 签名工具使用说明 |
 | [12. 签名原理与Seed机制](docs/12.%20签名原理与Seed机制.md) | ECDSA P-256 + SHA-256 原理 |
 | [13. 官方IAP例程vs自定义Bootloader对比](docs/13.%20官方IAP例程vs自定义Bootloader对比.md) | 官方 IAP 方案与本项目 Bootloader 对比 |
