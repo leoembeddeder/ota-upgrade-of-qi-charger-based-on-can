@@ -41,6 +41,8 @@ static int8_t meta_validate(const ota_metadata_t *meta)
   return 0;
 }
 
+
+
 static void meta_fill_defaults(ota_metadata_t *meta)
 {
   memset((void *)meta, 0, sizeof(ota_metadata_t));

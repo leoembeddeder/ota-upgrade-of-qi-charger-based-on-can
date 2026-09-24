@@ -98,8 +98,10 @@ static void can_hw_config_in_reset(void)
   can_bittime_type can_bittime_struct;
   can_filter_config_type can_filter_struct;
 
+  /* 正常通信模式（非 Listen-only / 自测） */
   can_mode_set(CAN1, CAN_MODE_COMMUNICATE);
 
+  /* 250 kbps / 75% SP：18 MHz tq / 72 = 250k */
   can_bittime_default_para_init(&can_bittime_struct);
   can_bittime_struct.bittime_div  = CAN_BITTIME_DIV;
   can_bittime_struct.ac_rsaw_size = CAN_BITTIME_SJW;
@@ -107,6 +109,7 @@ static void can_hw_config_in_reset(void)
   can_bittime_struct.ac_bts2_size = CAN_BITTIME_BTS2;
   can_bittime_set(CAN1, &can_bittime_struct);
 
+  /* Filter 0：物理 UDS 请求 0x18DA0D03，29 位精确匹配 */
   can_filter_default_para_init(&can_filter_struct);
   can_filter_struct.code_para.id         = CAN_ID_UDS_REQUEST;
   can_filter_struct.code_para.id_type    = CAN_ID_EXTENDED;
@@ -119,6 +122,7 @@ static void can_hw_config_in_reset(void)
   can_filter_set(CAN1, CAN_FILTER_NUM_0, &can_filter_struct);
   can_filter_enable(CAN1, CAN_FILTER_NUM_0, TRUE);
 
+  /* Filter 1：功能寻址 0x18DB33xx（SA 任意），对应 CAN_ID_FUNCTIONAL_REQUEST */
   can_filter_default_para_init(&can_filter_struct);
   can_filter_struct.code_para.id         = 0x18DB3300U;
   can_filter_struct.code_para.id_type    = CAN_ID_EXTENDED;
@@ -132,15 +136,30 @@ static void can_hw_config_in_reset(void)
   can_filter_enable(CAN1, CAN_FILTER_NUM_1, TRUE);
 }
 
+
+/**
+ * @brief  CAN1 上电初始化（250 kbps 扩展帧），完成后保持软件复位
+ * @note   只做硬件与软件状态准备，不上总线。
+ *         真正退出复位、开中断在 can_driver_online()
+ *         （SIT1145 已进 Normal，或生命周期从 Standby 唤醒之后）。
+ *         可重复调用：再次 init 等于重新配时钟/GPIO/滤波并清空软件 FIFO。
+ */
 void can_driver_init(void)
 {
   gpio_init_type gpio_init_struct;
 
+
+  /* ---- 时钟 ----
+   * GPIOA：PA11/PA12。
+   * CAN1：外设时钟。
+   * 内核时钟必须切 PLL（180 MHz）。复位默认 HEXT 8 MHz，
+   * 位时序仍按 180 MHz 配的话，实际只有约 11 kbps，对端全是错误帧。 */
   crm_periph_clock_enable(CRM_GPIOA_PERIPH_CLOCK, TRUE);
   crm_periph_clock_enable(CRM_CAN1_PERIPH_CLOCK, TRUE);
-
   crm_can_clock_select(CRM_CAN1, CRM_CAN_CLOCK_SOURCE_PLL);
 
+  /* ---- PA11 = CAN_RX，复用 AF4，上拉 ----
+   * 总线隐性为高，不上拉复位后 RX 可能浮空被读成显性。 */
   gpio_default_para_init(&gpio_init_struct);
   gpio_init_struct.gpio_pins           = GPIO_PINS_11;
   gpio_init_struct.gpio_mode           = GPIO_MODE_MUX;
@@ -150,6 +169,8 @@ void can_driver_init(void)
   gpio_init(GPIOA, &gpio_init_struct);
   gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE11, GPIO_MUX_4);
 
+  /* ---- PA12 = CAN_TX，复用 AF4，无上下拉 ----
+   * TX 由控制器推挽驱动，再加上下拉会和总线显性/隐性抢电平。 */
   gpio_default_para_init(&gpio_init_struct);
   gpio_init_struct.gpio_pins           = GPIO_PINS_12;
   gpio_init_struct.gpio_mode           = GPIO_MODE_MUX;
@@ -159,54 +180,97 @@ void can_driver_init(void)
   gpio_init(GPIOA, &gpio_init_struct);
   gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE12, GPIO_MUX_4);
 
+  /* ---- SIT1145：SPI 配寄存器并尽量切到 Normal ----
+   * 返回 1=成功、0=失败。失败再试一次（上电 SPI/芯片未就绪）。
+   * 第二次仍失败也继续：控制器配置不能卡死启动，
+   * online 路径里还会再 sit1145_normal_mode_set()。 */
   if (sit1145_init() == 0U)
   {
     (void)sit1145_init();
   }
 
+  /* ---- 控制器进软件复位后再写模式/位时序/滤波 ----
+   * can_reset：CRM 外设复位，CTRLSTAT.RESET=1。
+   * can_software_reset(TRUE)：保持复位，配置位此时才可写。
+   * can_hw_config_in_reset：250k + Filter0 物理 UDS + Filter1 功能寻址。
+   * 这里故意不 can_software_reset(FALSE)：收发器若还在 Standby，
+   * 提前出复位会在空总线上堆积错误，甚至进 bus-off。 */
   can_reset(CAN1);
   can_software_reset(CAN1, TRUE);
   can_hw_config_in_reset();
   /* Stay in software reset until SIT1145 leaves Standby (can_driver_online). */
 
-  rx_fifo_head  = 0;
-  rx_fifo_tail  = 0;
+  /* ---- 软件侧状态清零（硬件复位清不掉这些静态量） ---- */
+  rx_fifo_head  = 0;  /* ISR 写指针 */
+  rx_fifo_tail  = 0;  /* 主循环读指针 */
   rx_fifo_count = 0;
   rx_callback   = (can_rx_callback_t)0;
   busoff_recovery_cb     = (can_busoff_recovery_callback_t)0;
   busoff_recovery_pending = 0;
 }
 
+
+/**
+ * @brief  CAN1 下线：关中断并进入软件复位，不再 ACK / 发帧
+ * @note   不关时钟、不改 GPIO、不动 SIT1145、不清软件 FIFO。
+ *         给生命周期进 Standby 用：必须在收发器切 Standby、引脚改 WUP
+ *         监听之前调用，避免 RXD 被拉低时控制器当成显性而 bus-off。
+ *         恢复走 can_driver_online()（会再配滤波、出复位、开中断）。
+ */
 void can_driver_offline(void)
 {
+  /* 先关 NVIC，避免关外设中断使能时已经 pending 的 IRQ 再进一次 */
   nvic_irq_disable(CAN1_RX_IRQn);
   nvic_irq_disable(CAN1_ERR_IRQn);
+
+  /* 再关控制器内部 RX / 错误中断源 */
   can_interrupt_enable(CAN1, CAN_RIE_INT, FALSE);
   can_interrupt_enable(CAN1, CAN_EIE_INT, FALSE);
+
+  /* 软件复位：停止位时序、不 ACK、配置寄存器保持可写。
+   * 不用 can_reset() 全外设复位，避免把刚配好的滤波清掉后还要再配一遍；
+   * online 路径在需要时会自己 can_reset + can_hw_config_in_reset。 */
   can_software_reset(CAN1, TRUE);
 }
 
+
+/**
+ * @brief  CAN1 上线：重建配置、退出软件复位、打开 RX/ERR 中断
+ * @note   前置：can_driver_init() 已配过时钟/GPIO；SIT1145 已 Normal。
+ *         从 Standby 唤醒时，必须先等 RXD 结束强制低，再调本函数，
+ *         否则一出复位就看到显性，容易直接 bus-off。
+ */
 void can_driver_online(void)
 {
+  /* 配置期间禁止一切 CAN 中断，避免半配好的滤波被 ISR 用到 */
   nvic_irq_disable(CAN1_RX_IRQn);
   nvic_irq_disable(CAN1_ERR_IRQn);
   can_interrupt_enable(CAN1, CAN_RIE_INT, FALSE);
   can_interrupt_enable(CAN1, CAN_EIE_INT, FALSE);
 
-  /* 软件复位里挂 6 分钟后再上线，整外设复位并清 pending，避免 RX 中断/滤波器失效 */
+  /* 整外设复位 + 再进软件复位，然后重写模式/位时序/滤波。
+   * 只靠 software_reset 位，长时间挂着（注释里的「6 分钟」）
+   * 后再上线，出现过 RX 中断或滤波器不恢复的情况，所以这里用 CRM
+   * can_reset 把外设翻一遍。 */
   can_reset(CAN1);
   can_software_reset(CAN1, TRUE);
   can_hw_config_in_reset();
-  can_flag_clear(CAN1, CAN_RIF_FLAG);
-  can_flag_clear(CAN1, CAN_ROIF_FLAG);
-  can_flag_clear(CAN1, CAN_EIF_FLAG);
-  can_flag_clear(CAN1, CAN_BEIF_FLAG);
-  can_flag_clear(CAN1, CAN_ALIF_FLAG);
-  can_flag_clear(CAN1, CAN_EPIF_FLAG);
+
+  /* 清控制器状态，避免复位前挂起的帧/错误一开中断就进 ISR */
+  can_flag_clear(CAN1, CAN_RIF_FLAG);   /* RX 完成 */
+  can_flag_clear(CAN1, CAN_ROIF_FLAG);  /* RX 溢出 */
+  can_flag_clear(CAN1, CAN_EIF_FLAG);   /* 错误汇总 */
+  can_flag_clear(CAN1, CAN_BEIF_FLAG);  /* 总线错误 */
+  can_flag_clear(CAN1, CAN_ALIF_FLAG);  /* 仲裁丢失 */
+  can_flag_clear(CAN1, CAN_EPIF_FLAG);  /* 错误被动 */
   NVIC_ClearPendingIRQ(CAN1_RX_IRQn);
   NVIC_ClearPendingIRQ(CAN1_ERR_IRQn);
 
+  /* 退出软件复位：此时开始采样总线、对有效帧 ACK */
   can_software_reset(CAN1, FALSE);
+
+  /* 先开外设中断源，再开 NVIC。
+   * RX 优先级 1，ERR 优先级 2：收帧优先于错误处理。 */
   can_interrupt_enable(CAN1, CAN_RIE_INT, TRUE);
   can_interrupt_enable(CAN1, CAN_EIE_INT, TRUE);
   nvic_irq_enable(CAN1_RX_IRQn, 1, 0);
@@ -255,6 +319,8 @@ void can_driver_pins_active(void)
   gpio_init(GPIOA, &gpio_init_struct);
   gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE12, GPIO_MUX_4);
 }
+
+
 
 void can_driver_pins_standby(void)
 {
@@ -439,6 +505,18 @@ void can_driver_register_rx_callback(can_rx_callback_t cb)
   rx_callback = cb;
 }
 
+
+/**
+ * @brief  从软件 RX FIFO 取出最老的一帧
+ * @param  id   输出 29 位扩展 ID
+ * @param  data 输出数据，调用方保证至少 8 字节
+ * @param  len  输出本帧数据长度 0~8
+ * @retval  0  取到一帧
+ *         -1  空队列或参数空指针
+ * @note   关中断拷贝再改 tail/count，避免与 RX ISR 抢同一格。
+ *         不读硬件邮箱；硬件 → FIFO 在 can_driver_rx_irq_handler()。
+ *         主循环可连续调，直到返回 -1。
+ */
 int8_t can_driver_recv(uint32_t *id, uint8_t *data, uint8_t *len)
 {
   uint8_t i;
@@ -449,6 +527,7 @@ int8_t can_driver_recv(uint32_t *id, uint8_t *data, uint8_t *len)
     return -1;
   }
 
+  /* ISR 会改 head/count，读-改-写必须原子 */
   __disable_irq();
   if (rx_fifo_count == 0U)
   {
@@ -469,6 +548,27 @@ int8_t can_driver_recv(uint32_t *id, uint8_t *data, uint8_t *len)
   return 0;
 }
 
+
+/**
+ * @brief  等待当前 TX 槽空闲或已发完，最多 timeout_ms
+ * @param  timeout_ms  超时（与 timer_get_tick() 同一单位，本工程是 ms）
+ * @retval  0  current_tstat 已是 IDLE 或 TRANSMITTED
+ *         -1  超时；不区分「还在发」还是「被中止/拒绝」
+ *
+ * @note   只看 current_tstat，不看：
+ *         - 这是不是刚刚 send 的那一帧（不核对 handle）
+ *         - STB 三格 FIFO 里还有没有排队（不调 can_stb_status_get）
+ *
+ *         因此：PTB 刚发完、STB 里还塞着下一帧时也会返回 0。
+ *         多邮箱场景下「别的帧/空槽的状态」就能把条件满足。
+ *
+ *         适用：Boot M1~M4、普通尽力排空（超时就丢，不挡主流程）。
+ *         不适用：复位前确认 0x77 / UDS 应答已上总线
+ *         → can_driver_wait_tx_frame(handle)
+ *         → 再 can_driver_wait_tx_all_idle()（额外要求 STB 为空）
+ *
+ *         忙等，不 sleep、不喂看门狗；timeout 过大要考虑调用上下文。
+ */
 int8_t can_driver_wait_tx_idle(uint32_t timeout_ms)
 {
   uint32_t start = timer_get_tick();

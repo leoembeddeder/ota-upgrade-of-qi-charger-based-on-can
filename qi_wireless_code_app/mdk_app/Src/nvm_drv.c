@@ -136,8 +136,7 @@ nvm_status_t nvm_drv_set_valid(void)
 
   flash_unlock();
 
-  status = flash_write_word(NVM_CONFIG_BASE_ADDR + NVM_VALIDITY_OFFSET,
-                            NVM_VALIDITY_MAGIC);
+  status = flash_write_word(NVM_CONFIG_BASE_ADDR + NVM_VALIDITY_OFFSET, NVM_VALIDITY_MAGIC);
   if (status == NVM_STATUS_OK)
   {
     nvm_initialized = 1;
