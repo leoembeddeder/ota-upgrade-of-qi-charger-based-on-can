@@ -59,6 +59,12 @@ int main(void)
   /* step 4: verify App region and jump */
   if (boot_app_image_ok() == 0)
   {
+    /* Persist last_boot_reason before jumping: its consumer reads it at
+     * next power-on from metadata. The success path never saved it before
+     * (only copy-fail / safe-mode / metadata-repair paths did), so the
+     * stored value stayed stale forever. Save once here, after App verify
+     * passes and before M4 / jump. */
+    (void)boot_metadata_save(&g_meta);
     boot_jump_to_app(APP_ENTRY_ADDR); /* does not return */
   }
 
