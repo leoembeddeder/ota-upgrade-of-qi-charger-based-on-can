@@ -23,20 +23,6 @@
 
 ota_metadata_t g_meta;
 
-/* VERIFY ENFORCE SWITCH: 1 = strict check (normal), 0 = force pass on failure (TEMPORARY for testing, added 2026-09-23) */
-#define BOOT_VERIFY_ENFORCE  0
-
-#if (BOOT_VERIFY_ENFORCE == 0)
-/* Bypass-hit marker (debugger-watchable) distinguishing a real pass from
- * a failed-but-passed run: 0x00 = all verifies really passed;
- * bit0 (0x01) = Backup pre-copy verify failed but force-passed;
- * bit1 (0x02) = App post-copy re-verify failed but force-passed;
- * bit2 (0x04) = jump-gate verify (boot_app_image_ok) failed but
- * force-passed. Warning text of a bypass event: "verify FAILED but
- * ENFORCE=0, force pass" (no text logger on this MCU). */
-static volatile uint8_t g_boot_verify_bypass_hit = 0U;
-#endif
-
 uint8_t detect_boot_reason(void)
 {
   uint8_t reason = BOOT_REASON_POWER_ON;
@@ -156,14 +142,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
     meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
     (void)boot_metadata_save(meta);
     boot_diag_m3(0U, g_verify_fail_step, 0U);
-#if (BOOT_VERIFY_ENFORCE == 0)
-    /* verify FAILED but ENFORCE=0: force pass, continue copying
-     * (verification computation ran in full; only the rejection is
-     * bypassed; failure record above kept as failed-but-allowed) */
-    g_boot_verify_bypass_hit |= 0x01U;
-#else
     return -1;
-#endif
   }
   boot_diag_m3(1U, g_verify_fail_step, 0U);
 
@@ -209,13 +188,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
     meta->last_boot_reason = BOOT_REASON_COPY_FAIL;
     (void)boot_metadata_save(meta);
     boot_diag_m3(0U, g_verify_fail_step, 1U);
-#if (BOOT_VERIFY_ENFORCE == 0)
-    /* verify FAILED but ENFORCE=0: force pass, continue to commit
-     * (failure record above kept as failed-but-allowed) */
-    g_boot_verify_bypass_hit |= 0x02U;
-#else
     return -1;
-#endif
   }
 
   /* 5. commit: only now clear the pending flag (power-loss safe) */
@@ -223,16 +196,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
   meta->backup_valid = 0U;
   meta->ota_state    = OTA_STATE_IDLE;
   meta->last_boot_reason = BOOT_REASON_OTA_ACT;
-#if (BOOT_VERIFY_ENFORCE == 0)
-  if (g_boot_verify_bypass_hit == 0U)
-  {
-    meta->copy_fail_step = 0U; /* cleared only on a real clean run */
-  }
-  /* failed-but-allowed run: keep the recorded copy_fail_step as the
-   * persistent record (g_boot_verify_bypass_hit has the live detail) */
-#else
   meta->copy_fail_step = 0U;
-#endif
   (void)boot_metadata_save(meta);
   boot_diag_m3(1U, g_verify_fail_step, 1U);
   return 0;
@@ -245,13 +209,5 @@ int8_t boot_app_image_ok(void)
   {
     return 0;
   }
-#if (BOOT_VERIFY_ENFORCE == 0)
-  /* verify FAILED but ENFORCE=0: force pass at the jump gate too --
-   * a strict gate here would strand an already force-passed copy in
-   * safe mode and break the end-to-end test flow */
-  g_boot_verify_bypass_hit |= 0x04U;
-  return 0;
-#else
   return -1;
-#endif
 }
