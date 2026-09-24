@@ -82,8 +82,8 @@ int main(void)
   }
 
   /* step 5: no bootable App image */
-  enter_safe_mode(g_meta.copy_fail_step != 0U ?
-                  0x03U : 0x02U);
+  enter_safe_mode(g_meta.copy_fail_step != 0U ? 0x03U : 0x02U);
+  
   while (1)
   {
     __NOP();

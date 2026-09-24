@@ -185,15 +185,26 @@ void boot_diag_m1(const void *meta)
   boot_diag_frame_send(p, 6U);
 }
 
+
+/**
+ * @brief  上报 Boot 诊断帧 M2（单 APP 架构下的 copy 结果）
+ *
+ * 组 3 字节诊断载荷并发出，字节序与文档、函数参数一致
+ *（OTA-ARCH-0920-D5：b1=ret，b2=info）。
+ *
+ * @param ret   b1，copy 结果
+ *              - 0    : 序列开始 / 无 pending（当 b2=0xFF）
+ *              - 1    : copy 已提交
+ *              - 0xFF : copy 失败
+ * @param info  b2，细节
+ *              - 失败时为 fail_step
+ *              - 0xFF 表示 not pending
+ *
+ * @note  帧格式：p[0]=0xA2，p[1]=ret，p[2]=info。
+ *        与 M1/M3/M4 同一套「参数顺序 = 线上顺序」。
+ */
 void boot_diag_m2(int8_t ret, uint8_t info)
 {
-  /* M2 payload (single-App arch): b1=copy result
-   * (0=sequence start / no pending when b2=0xFF, 1=copy committed,
-   * 0xFF=copy failed) b2=detail (fail_step on failure, 0xFF=not pending)
-   * — wire order == documented order == param order, same pattern as
-   *   M1/M3/M4; byte order unified per OTA-ARCH-0920-D5 (body previously
-   *   sent p[1]=info/p[2]=ret, inverted vs header doc + this comment,
-   *   capture-side M2 misread risk on retest) */
   uint8_t p[3];
 
   p[0] = 0xA2U;

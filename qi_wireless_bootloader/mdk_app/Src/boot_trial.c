@@ -49,30 +49,46 @@ uint8_t detect_boot_reason(void)
   return reason;
 }
 
+
+
+/**
+ * @brief  是否有待激活的 Backup→App 搬运
+ * @param  meta  已由 boot_metadata_init() 加载的 RAM 副本
+ * @retval 1  backup_valid != 0，main step3 应走 boot_copy_backup()
+ *         0  无待搬运，跳过拷贝
+ * @note   只读旗子，不读 Backup 区、不算 CRC。
+ *         旗子由 APP commit_backup() 置位，仅搬运成功才清。
+ */
 int8_t boot_backup_pending(const ota_metadata_t *meta)
 {
   return (meta->backup_valid != 0U) ? 1 : 0;
 }
 
-/**
- * @brief  erase the App flash region with bounded polling
- * @note   IRQ-off + flash unlock/lock around the erase burst, same
- *         single-bank discipline as meta_write_to_flash (boot_metadata.c)
- *         and copy_program_region below. Flash stays locked until the
- *         first write of the boot session: with metadata primary valid
- *         (normal OTA path) Boot performs no earlier flash write, so an
- *         erase without unlock always fails -> copy_fail_step=0xFE
- *         (OTA-ARCH-0920-D5 P0-1). Erase range/sector size unchanged.
+
+
+ /**
+ * @brief  擦除整个 APP 区 Flash
+ *
+ * 从 APP_BASE_ADDR 起，按扇区擦除 APP_SIZE 字节。
+ * 全程关中断并持有 Flash 解锁，避免擦除过程被打断。
+ *
+ * @retval  0   全部扇区擦除成功
+ * @retval -1  某一扇区擦除失败（已重新上锁并开中断）
+ *
+ * @note  static 仅本文件可见。失败时已擦部分不会回滚。
+ * @warning 会清掉 APP 区全部内容，调用前确认地址/长度宏正确。
  */
 static int8_t copy_erase_app_region(void)
 {
   uint32_t addr;
   flash_status_type status;
 
-  __disable_irq();
+  /* 擦扇区期间禁止被 ISR 打断 */
+  __disable_irq();    
+  /* 允许写 Flash 控制寄存器 */
   flash_unlock();
-  for (addr = APP_BASE_ADDR; addr < (APP_BASE_ADDR + APP_SIZE);
-       addr += FLASH_SECTOR_SIZE)
+
+  for (addr = APP_BASE_ADDR; addr < (APP_BASE_ADDR + APP_SIZE); addr += FLASH_SECTOR_SIZE)
   {
     status = flash_sector_erase(addr);
     if (status != FLASH_OPERATE_DONE)
@@ -86,6 +102,7 @@ static int8_t copy_erase_app_region(void)
   __enable_irq();
   return 0;
 }
+
 
 /**
  * @brief  word-program [src, src+len) at dst, then readback verify
@@ -125,6 +142,16 @@ static int8_t copy_program_region(uint32_t dst, const uint8_t *src,
   return 0;
 }
 
+
+/**
+ * @brief  将 Backup 区待激活镜像搬运到 App 区并提交
+ * @param  meta  RAM 中的 metadata（调用前 backup_valid 应为 1）
+ * @retval  0  commit 完成（旗子已清、已 save）
+ *         -1  中途失败（旗子仍为 1，已 save 失败上下文）
+ * @note   向量窗强制按 App 区解释：Backup 里的镜像必须是链接到
+ *         0x08004000 的图，不能是「在 Backup 地址上能跑」的图。
+ *         M3 target：0=Backup，1=App；fail_step=0xFF 表示「即将开始验」。
+ */
 int8_t boot_copy_backup(ota_metadata_t *meta)
 {
   const ota_image_view_t *hdr;
@@ -134,8 +161,7 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
 
   /* 1. verify Backup image; vectors must target the App window */
   boot_diag_m3(0U, 0xFFU, 0U); /* pre-verify marker: target=Backup region */
-  if (boot_verify_image(BACKUP_BASE_ADDR, BACKUP_SIZE,
-                        APP_BASE_ADDR, APP_SIZE) != 0)
+  if (boot_verify_image(BACKUP_BASE_ADDR, BACKUP_SIZE,APP_BASE_ADDR, APP_SIZE) != 0)
   {
     meta->copy_fail_step = g_verify_fail_step;
     meta->copy_retry_count++;
