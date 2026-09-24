@@ -92,52 +92,76 @@ static void safe_heartbeat(uint8_t cause, uint8_t step)
   (void)can_driver_send(CAN_ID_LIFECYCLE_BROADCAST, d, 8U);
 }
 
-/* ===== Boot 诊断标记帧实现（观察不干预，2026-09-20 用户授权诊断版）=====
- * 帧格式/CAN ID 见 boot_safe_mode.h BOOT_DIAG 注释；实现纪律：
- * ① 只报信不改决策——本节函数不写 metadata/不改任何选择逻辑；
- * ② 发送有界——can_driver_send 缓冲满直接 -1 返回，成功才等
- *    can_driver_wait_tx_idle(BOOT_DIAG_TX_TIMEOUT_MS)，总线挂死即弃帧；
- * ③ polling 发送，不依赖中断；safe mode 既有帧零触碰。 */
 #define BOOT_DIAG_TX_TIMEOUT_MS  3U
-
 uint8_t g_diag_meta_src = 0xFFU;
-
+/**
+ * @brief  发送一帧 Boot 诊断标记（CAN ID 0x18FF480D，扩展帧，DLC=8）
+ * @param  payload  至少 1 字节：payload[0] 为标记 0xA1~0xA4
+ * @param  n        有效字节数，范围 1~7（第 8 字节起用 0xCC 填充）
+ * @note   只报信。发送失败或 3ms 内发不完就弃帧，不写 metadata、不改启动路径。
+ */
 static void boot_diag_frame_send(const uint8_t *payload, uint8_t n)
 {
   uint8_t f[8];
   uint8_t i;
 
+  /* 标记占 1 字节，CAN 数据场最多 8，故有效载荷不能超过 7 */
   if ((payload == (const uint8_t *)0) || (n == 0U) || (n > 7U))
   {
     return;
   }
-  f[0] = payload[0];
+  /* 标记字节原样放入 */
+  f[0] = payload[0];    
   for (i = 1U; i < 8U; i++)
   {
+    /* 有数据就拷，没有就填 0xCC，保证 DLC 恒为 8、抓包对齐 */
     f[i] = (uint8_t)((i < n) ? payload[i] : 0xCCU);
   }
+
+  /* 邮箱/软件队列有空才发；成功后再短等 TX 完成，超时即放弃 */
   if (can_driver_send(BOOT_DIAG_CAN_ID, f, 8U) == 0)
   {
     (void)can_driver_wait_tx_idle(BOOT_DIAG_TX_TIMEOUT_MS);
   }
 }
 
+
+/**
+ * @brief  诊断 CAN 提前初始化（main step1：timer 之后、metadata 之前）
+ * @note   目的：让 boot 决策链上的 M1~M4 标记帧（CAN ID 0x18FF480D）
+ *         在读 metadata 之前就能发出。
+ *         只动 CAN1 / GPIOA / SPI1 / SIT1145 Normal，不碰 Flash、CRC、
+ *         metadata、选槽逻辑。失败也不阻断启动。
+ *         与 enter_safe_mode() 内初始化相同；那边再调一次是幂等复位。
+ */
 void boot_diag_can_init(void)
 {
-  /* 初始化语义同 enter_safe_mode 既有调用（can_driver_init 自含
-   * sit1145_init→Normal）；提前到 main.c step2 仅为 M1~M4 可发帧。
-   * 影响面：仅 CAN1/GPIOA/GPIOB/SPI1 时钟引脚+收发器 Normal，与
-   * 决策链（flash 读写/CRC）零交集；enter_safe_mode 内原调用
-   * 保留（路径语义不变，重复 init 幂等复位）。 */
+
+  /* MCU CAN1：时钟、GPIO、位时序 250kbps、滤波；内部会 sit1145_init() */
   can_driver_init();
+
+  /* 收发器再确认进 Normal，保证总线可发；返回值忽略，不挡决策链 */
   (void)sit1145_normal_mode_set();
 }
 
+
+
+/**
+ * @brief  发 M1：报告「这份 metadata 从哪来、自身是否完整、app_valid 是多少」
+ * @param  meta  应为 ota_metadata_t*（boot_metadata_init 里的 RAM 副本）
+ * @note   必须先写 g_diag_meta_src 再调用。
+ *         不写 Flash、不改决策。CAN ID 0x18FF480D，DLC=8，尾部 0xCC。
+ *
+ * 载荷：
+ *   [0] 0xA1
+ *   [1] app_valid（空指针则 0xFF）
+ *   [2] meta_src：0 主区 / 1 备区恢复 / 2 默认值 / 0xFF 未记录
+ *   [3] magic == "MATO" ? 1 : 0
+ *   [4] version == 3     ? 1 : 0
+ *   [5] CRC32（不含末尾 4 字节）与 meta->crc32 一致 ? 1 : 0
+ */
 void boot_diag_m1(const void *meta)
 {
-  /* M1 payload (single-App arch): b1=app_valid b2=meta load source
-   * (0=primary 1=backup-copy 2=defaults 0xFF=n/a) b3=magic_ok
-   * b4=ver_ok b5=crc_ok */
   const ota_metadata_t *m = (const ota_metadata_t *)meta;
   uint8_t p[6];
 
@@ -146,6 +170,7 @@ void boot_diag_m1(const void *meta)
   p[2] = g_diag_meta_src;
   if (m != (const ota_metadata_t *)0)
   {
+    /* 对 RAM 副本当场复验，给抓包侧看「加载结果」而不是 Flash 原件 */
     p[3] = (uint8_t)((m->magic == META_MAGIC) ? 1U : 0U);
     p[4] = (uint8_t)((m->version == META_VERSION) ? 1U : 0U);
     p[5] = (uint8_t)((boot_crc32((const void *)m,

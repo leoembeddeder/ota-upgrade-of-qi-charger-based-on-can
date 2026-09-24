@@ -93,19 +93,34 @@ static int8_t meta_write_to_flash(uint32_t addr, const ota_metadata_t *meta)
   return 0;
 }
 
+
+/**
+ * @brief  校验一份 Flash/RAM 中的 ota_metadata_t 是否可采信
+ * @param  meta  指向主区或备区（或 RAM 副本）
+ * @retval  0  magic + version + CRC 均通过
+ *         -1  任一检查失败（空片、旧版、写损）
+ * @note   不算 app_valid/backup_valid；那些是镜像状态，不是结构完整性。
+ *         CRC 覆盖范围是结构体去掉末尾 crc32 字段
+ *         （META_CRC32_OFFSET = sizeof(ota_metadata_t) - 4）。
+ */
 static int8_t meta_validate(const ota_metadata_t *meta)
 {
   uint32_t computed_crc;
   uint32_t stored_crc;
 
+  /* 扇区身份：必须是 "MATO"，空 Flash 或乱数据在此出局 */
   if (meta->magic != META_MAGIC)
   {
     return -1;
   }
+
+  /* 布局版本：只接受 META_VERSION==3，v2 及更早强制重建 */
   if (meta->version != META_VERSION)
   {
     return -1;
   }
+
+  /* 完整性：先取出尾部存值，再对前面字段重算，避免把 CRC 自己算进去 */
   stored_crc   = meta->crc32;
   computed_crc = boot_crc32((const void *)meta, META_CRC32_OFFSET);
   if (computed_crc != stored_crc)
@@ -114,6 +129,8 @@ static int8_t meta_validate(const ota_metadata_t *meta)
   }
   return 0;
 }
+
+
 
 static void meta_fill_defaults(ota_metadata_t *meta)
 {
@@ -161,38 +178,55 @@ uint32_t boot_crc32(const void *data, uint32_t length)
   return boot_crc32_continue(0xFFFFFFFFU, data, length) ^ 0xFFFFFFFFU;
 }
 
+
+/**
+ * @brief  加载 OTA metadata 到 RAM（主区优先，双备份）
+ * @param  meta  调用方提供的 RAM 缓冲（通常是 g_meta）
+ * @retval  0  主区或备区校验通过，已拷入 meta
+ *         -1  两边都无效，已写入默认值（空片 / 旧版 / CRC 坏）
+ * @note   校验：magic "MATO" + META_VERSION==3 + CRC32。
+ *         v2 及更早直接失败，走默认重建。
+ *         每条路径结束都会设 g_diag_meta_src 并发 M1。
+ *         备区恢复 / 默认重建才会 boot_metadata_save（先备后主）。
+ */
 int8_t boot_metadata_init(ota_metadata_t *meta)
 {
   const ota_metadata_t *primary;
   const ota_metadata_t *backup;
 
+  /* 路径 1：主区 0x0801C000 完整 → 只读入 RAM，不写 Flash */
   primary = (const ota_metadata_t *)META_PRIMARY_ADDR;
   if (meta_validate(primary) == 0)
   {
     memcpy((void *)meta, (const void *)primary, sizeof(ota_metadata_t));
-    g_diag_meta_src = 0U;
+    g_diag_meta_src = 0U;   /* M1.b2 = 主区生效 */
     boot_diag_m1(meta);
     return 0;
   }
 
+  /* 路径 2：主区坏、备区 0x0801C800 完整 → 用备区修主区 */
   backup = (const ota_metadata_t *)META_BACKUP_ADDR;
   if (meta_validate(backup) == 0)
   {
     memcpy((void *)meta, (const void *)backup, sizeof(ota_metadata_t));
     boot_metadata_save(meta);
-    g_diag_meta_src = 1U;
+    g_diag_meta_src = 1U;   /* M1.b2 = 备区生效 */
     boot_diag_m1(meta);
     return 0;
   }
 
+  /* 路径 3：双份都废 → 填默认（app/backup 均无效），落盘后继续 boot */
   meta_fill_defaults(meta);
   meta->crc32 = boot_crc32((const void *)meta, META_CRC32_OFFSET);
   boot_metadata_save(meta);
-  g_diag_meta_src = 2U;
+  g_diag_meta_src = 2U;   /* M1.b2 = 默认值生效 */
   boot_diag_m1(meta);
 
   return -1;
 }
+
+
+
 
 int8_t boot_metadata_save(ota_metadata_t *meta)
 {
