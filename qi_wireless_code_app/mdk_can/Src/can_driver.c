@@ -213,10 +213,25 @@ void can_driver_online(void)
   nvic_irq_enable(CAN1_ERR_IRQn, 2, 0);
 }
 
+/**
+ * @brief  CAN1 收发引脚激活：PA11/PA12 重配回 CAN1 复用（MUX_4）
+ * @note   调用时机：协议层进入 active 时（can_lp_enter_normal，
+ *         can_protocol.c），且须先于 sit1145_normal_mode_set() 与
+ *         can_driver_online()（TXD 必须先回 CAN AF 再切 Normal，
+ *         否则切收发器瞬间 TXD 仍为 GPIO 态，误打显性会卡总线）。
+ *         引脚归属（AT32F422 porta iomux 表 mux4 列，勿记反）：
+ *         PA11 = CAN1_RX（SIT1145 RXD -> MCU，输入）、
+ *         PA12 = CAN1_TX（MCU -> SIT1145 TXD，输出）。
+ *         与 can_driver_pins_standby() 互逆：Standby 下两脚退为 GPIO
+ *         （PA12 推高保隐性、PA11 输入听唤醒），唤醒后由本函数复原。 */
 void can_driver_pins_active(void)
 {
   gpio_init_type gpio_init_struct;
 
+  /* PA11 = CAN1_RX（MUX_4，复用输入）：方向由 CAN 外设接管。
+   * 上拉：收发器未上电/悬空时 RXD 无驱动，上拉把引脚钳在高电平
+   * （CAN 隐性），避免浮空读成显性而误收帧/报错。STRONGER 对纯输入
+   * 脚无实际作用，此处仅与 TX 段写法对称。 */
   gpio_default_para_init(&gpio_init_struct);
   gpio_init_struct.gpio_pins           = GPIO_PINS_11;
   gpio_init_struct.gpio_mode           = GPIO_MODE_MUX;
@@ -226,6 +241,11 @@ void can_driver_pins_active(void)
   gpio_init(GPIOA, &gpio_init_struct);
   gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE11, GPIO_MUX_4);
 
+  /* PA12 = CAN1_TX（MUX_4，复用推挽输出）：直驱 SIT1145 TXD，
+   * 空闲高=隐性（拉低=显性，见 can_driver_pins_standby 注释）。
+   * 无上下拉：稳态电平由推挽驱动决定，PULL_NONE 避免切换瞬间
+   * 上拉与输出级争电流；STRONGER 加强驱动，保证高速 CAN 边沿
+   * 陡峭（250kbps 位时间 4µs，边沿裕量靠驱动强度兜底）。 */
   gpio_default_para_init(&gpio_init_struct);
   gpio_init_struct.gpio_pins           = GPIO_PINS_12;
   gpio_init_struct.gpio_mode           = GPIO_MODE_MUX;
