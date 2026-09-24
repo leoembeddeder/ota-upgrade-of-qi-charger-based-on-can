@@ -71,9 +71,17 @@ static uint8_t rx_fifo_is_full(void)
 
 /**
  * @brief  initialize CAN1 peripheral in extended frame mode at 250kbps
- * @note   configures PA11(CAN_RX) and PA12(CAN_TX) with AF mux,
- *         brings the CAST CAN-CTRL out of software reset after config,
- *         filter accepts all classic extended data frames (bench test).
+ * @note   CAN1 收发引脚激活（PA11/PA12 均 MUX_4）在此一次完成，归属
+ *         （AT32F422 porta iomux 表 mux4 列，勿记反）：PA11 = CAN1_RX
+ *         （SIT1145 RXD -> MCU，输入）、PA12 = CAN1_TX（MCU -> SIT1145
+ *         TXD，输出）；上下拉/驱动配置意图见函数内 GPIO 段注释。
+ *         调用时机：main step 1 boot_diag_can_init 与 enter_safe_mode，
+ *         均初始化语义（本函数清 rx_callback，运行时/恢复路径禁调）；
+ *         前置：SIT1145 先进 Normal（见下 sit1145_init 注释）。
+ *         Boot 无 Standby 引脚退避，故无 App 侧 pins_active/pins_standby
+ *         互逆对。Brings the CAST CAN-CTRL out of software reset after
+ *         config; filter accepts all classic extended data frames
+ *         (bench test).
  * @param  none
  * @retval none
  */
@@ -92,7 +100,10 @@ void can_driver_init(void)
    * Datasheet: CAN clock must come from PLL sourced by HEXT. */
   crm_can_clock_select(CRM_CAN1, CRM_CAN_CLOCK_SOURCE_PLL);
 
-  /* configure PA11 (CAN_RX) as input with pull-up */
+  /* PA11 = CAN1_RX（MUX_4，复用输入）：方向由 CAN 外设接管。
+   * 上拉：SIT1145 未上电/RXD 悬空时钳高电平=CAN 隐性，避免浮空
+   * 读成显性而误收帧/报错。STRONGER 对纯输入脚无实际作用，与
+   * TX 段写法对称。 */
   gpio_default_para_init(&gpio_init_struct);
   gpio_init_struct.gpio_pins           = GPIO_PINS_11;
   gpio_init_struct.gpio_mode           = GPIO_MODE_MUX;
@@ -102,7 +113,10 @@ void can_driver_init(void)
   gpio_init(GPIOA, &gpio_init_struct);
   gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE11, GPIO_MUX_4);
 
-  /* configure PA12 (CAN_TX) as alternate function push-pull */
+  /* PA12 = CAN1_TX（MUX_4，复用推挽输出）：直驱 SIT1145 TXD，
+   * 空闲高=隐性（拉低=显性，会把总线卡死）。无上下拉：稳态电平
+   * 由推挽驱动决定，PULL_NONE 避免上拉与输出级争电流；STRONGER
+   * 加强驱动，保证高速 CAN（250kbps，位时间 4µs）边沿陡峭。 */
   gpio_default_para_init(&gpio_init_struct);
   gpio_init_struct.gpio_pins           = GPIO_PINS_12;
   gpio_init_struct.gpio_mode           = GPIO_MODE_MUX;
