@@ -24,6 +24,7 @@
 int main(void)
 {
   int8_t copy_rc;
+  uint8_t disk_boot_reason;
 
   /* step 1: clocks + drivers */
   system_clock_config();
@@ -33,6 +34,9 @@ int main(void)
 
   /* step 2: metadata (primary -> backup -> defaults) + boot reason */
   boot_metadata_init(&g_meta);
+  /* snapshot the on-disk reason to gate the pre-jump save (step 4):
+   * write only when the detected reason differs (flash wear control) */
+  disk_boot_reason = g_meta.last_boot_reason;
   g_meta.last_boot_reason = detect_boot_reason();
 
   /* step 3: pending backup -> copy into App region */
@@ -62,9 +66,18 @@ int main(void)
     /* Persist last_boot_reason before jumping: its consumer reads it at
      * next power-on from metadata. The success path never saved it before
      * (only copy-fail / safe-mode / metadata-repair paths did), so the
-     * stored value stayed stale forever. Save once here, after App verify
-     * passes and before M4 / jump. */
-    (void)boot_metadata_save(&g_meta);
+     * stored value stayed stale forever. Write only when the detected
+     * reason differs from the value loaded at step 2: a save erases both
+     * 1KB metadata sectors (backup first, then primary) and runs on every
+     * power-on, so the unchanged case is skipped to control flash wear
+     * (10k-cycle budget shared with OTA-path writes). Value-wise the
+     * outcome is identical: an unchanged reason is already on disk. The
+     * copy path may have saved it first (OTA_ACT), making this one
+     * redundant write on OTA boots only — low frequency, acceptable. */
+    if (g_meta.last_boot_reason != disk_boot_reason)
+    {
+      (void)boot_metadata_save(&g_meta);
+    }
     boot_jump_to_app(APP_ENTRY_ADDR); /* does not return */
   }
 
