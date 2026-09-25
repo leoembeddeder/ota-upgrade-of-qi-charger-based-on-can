@@ -72,8 +72,8 @@ void boot_jump_to_app(uint32_t app_addr)
     return;
   }
 
-  /* Boot 诊断标记 M4（观察不干预）：跳转目标 app_addr（LE 4B）；
-   * 发送于 CAN/SPI 关闭与 __disable_irq 之前，polling 有界（≤3ms） */
+  /* Boot 诊断标记 M4：跳转目标 app_addr（LE 4B）。
+   * boot_diag_m4 内部等到帧离开邮箱后再返回，随后才关 CAN。 */
   boot_diag_m4(app_addr);
 
   /* snapshot from Flash before MSP switches to the APP stack */

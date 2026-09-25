@@ -27,12 +27,13 @@ void enter_safe_mode(uint8_t cause);
  * Boot decision chain markers on CAN ID 0x18FF480D (extended, DLC=8),
  * frame = [marker 0xA1..0xA4][data...] padded with 0xCC. Single-App
  * architecture (OTA-ARCH-0920) payloads: see marker prototypes below.
- * Bounded polling TX (<=3ms/frame, give up on timeout); safe-mode legacy
+ * Bounded polling TX (wait until TRANSMITTED, give up on timeout); safe-mode legacy
  * frames (62 21 13 FE fail_step / ABT heartbeat) untouched. */
 #define BOOT_DIAG_CAN_ID  0x18FF480DU
 /* Single-App (OTA-ARCH-0920) marker payloads:
- *   M1 0xA1: [app_valid][meta_src 0=primary/1=backup-copy/2=defaults]
- *            [magic_ok][ver_ok][crc_ok]
+ *   M1 0xA1: [app_valid 出厂=0，OTA 搬运复验通过后=1]
+ *            [meta_src 0=primary/1=backup-copy/2=defaults]
+ *            [magic_ok][ver_ok][crc_ok]  （跳转不看 app_valid）
  *   M2 0xA2: [copy result 0=start-or-none/1=committed/0xFF=failed]
  *            [detail: fail_step or 0xFF=not-pending]
  *            （字节序统一 b1=copy result, b2=detail：boot_safe_mode.c

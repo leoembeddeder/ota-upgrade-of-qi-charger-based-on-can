@@ -92,18 +92,54 @@ static void safe_heartbeat(uint8_t cause, uint8_t step)
   (void)can_driver_send(CAN_ID_LIFECYCLE_BROADCAST, d, 8U);
 }
 
-#define BOOT_DIAG_TX_TIMEOUT_MS  3U
+#define BOOT_DIAG_TX_TIMEOUT_MS  10U
+#define BOOT_DIAG_TX_TRIES       3U
+#define BOOT_DIAG_SETTLE_MS      5U
 uint8_t g_diag_meta_src = 0xFFU;
+
+/**
+ * @brief  等到本帧真正离开发送邮箱
+ * @note   can_driver_wait_tx_idle 把 TSTAT=IDLE 当完成。刚 trigger 时
+ *         硬件还没开发，TSTAT 仍是 IDLE，立刻返回后下一帧会盖 PTB；
+ *         M4 随后 can_reset 会把还在邮箱里的帧清掉。至少等过 1ms
+ *         （一帧约 0.6ms），再要求 PTB 空闲且 STB 为空。
+ */
+static int8_t boot_diag_wait_tx_done(void)
+{
+  uint32_t start = timer_get_tick();
+  can_transmit_status_type st;
+
+  do
+  {
+    can_transmit_status_get(CAN1, &st);
+    if ((st.current_tstat == CAN_TSTAT_ABORTED) ||
+        (st.current_tstat == CAN_TSTAT_REJECTED))
+    {
+      return -1;
+    }
+    if (((timer_get_tick() - start) >= 1U) &&
+        ((st.current_tstat == CAN_TSTAT_IDLE) ||
+         (st.current_tstat == CAN_TSTAT_TRANSMITTED)) &&
+        (can_stb_status_get(CAN1) == CAN_STB_STATUS_EMPTY))
+    {
+      return 0;
+    }
+  } while ((timer_get_tick() - start) < BOOT_DIAG_TX_TIMEOUT_MS);
+
+  return -1;
+}
+
 /**
  * @brief  发送一帧 Boot 诊断标记（CAN ID 0x18FF480D，扩展帧，DLC=8）
  * @param  payload  至少 1 字节：payload[0] 为标记 0xA1~0xA4
  * @param  n        有效字节数，范围 1~7（第 8 字节起用 0xCC 填充）
- * @note   只报信。发送失败或 3ms 内发不完就弃帧，不写 metadata、不改启动路径。
+ * @note   只报信。发送失败或超时弃帧，不写 metadata、不改启动路径。
  */
 static void boot_diag_frame_send(const uint8_t *payload, uint8_t n)
 {
   uint8_t f[8];
   uint8_t i;
+  uint8_t tries;
 
   /* 标记占 1 字节，CAN 数据场最多 8，故有效载荷不能超过 7 */
   if ((payload == (const uint8_t *)0) || (n == 0U) || (n > 7U))
@@ -111,20 +147,33 @@ static void boot_diag_frame_send(const uint8_t *payload, uint8_t n)
     return;
   }
   /* 标记字节原样放入 */
-  f[0] = payload[0];    
+  f[0] = payload[0];
   for (i = 1U; i < 8U; i++)
   {
     /* 有数据就拷，没有就填 0xCC，保证 DLC 恒为 8、抓包对齐 */
     f[i] = (uint8_t)((i < n) ? payload[i] : 0xCCU);
   }
 
-  /* 邮箱/软件队列有空才发；成功后再短等 TX 完成，超时即放弃 */
-  if (can_driver_send(BOOT_DIAG_CAN_ID, f, 8U) == 0)
+  for (tries = 0U; tries < BOOT_DIAG_TX_TRIES; tries++)
   {
-    (void)can_driver_wait_tx_idle(BOOT_DIAG_TX_TIMEOUT_MS);
+    if (can_driver_send(BOOT_DIAG_CAN_ID, f, 8U) == 0)
+    {
+      if (boot_diag_wait_tx_done() == 0)
+      {
+        return;
+      }
+    }
   }
 }
 
+static void boot_diag_delay_ms(uint32_t ms)
+{
+  uint32_t start = timer_get_tick();
+
+  while ((timer_get_tick() - start) < ms)
+  {
+  }
+}
 
 /**
  * @brief  诊断 CAN 提前初始化（main step1：timer 之后、metadata 之前）
@@ -136,12 +185,24 @@ static void boot_diag_frame_send(const uint8_t *payload, uint8_t n)
  */
 void boot_diag_can_init(void)
 {
+  uint8_t i;
 
   /* MCU CAN1：时钟、GPIO、位时序 250kbps、滤波；内部会 sit1145_init() */
   can_driver_init();
 
-  /* 收发器再确认进 Normal，保证总线可发；返回值忽略，不挡决策链 */
-  (void)sit1145_normal_mode_set();
+  /* 冷启动 SPI/收发器可能一次没就绪；Normal 才能把帧打到 CANH/CANL */
+  for (i = 0U; i < 5U; i++)
+  {
+    if (sit1145_get_mode() == SIT1145_MC_NORMAL_MODE)
+    {
+      break;
+    }
+    (void)sit1145_init();
+    (void)sit1145_normal_mode_set();
+  }
+
+  /* 控制器刚出复位需要隐性总线；也给对端适配器一点 ACK 准备时间 */
+  boot_diag_delay_ms(BOOT_DIAG_SETTLE_MS);
 }
 
 
@@ -154,7 +215,7 @@ void boot_diag_can_init(void)
  *
  * 载荷：
  *   [0] 0xA1
- *   [1] app_valid（空指针则 0xFF）
+ *   [1] app_valid（盘上旗子，出厂 0；仅 OTA 搬运复验通过后为 1。空指针则 0xFF）
  *   [2] meta_src：0 主区 / 1 备区恢复 / 2 默认值 / 0xFF 未记录
  *   [3] magic == "MATO" ? 1 : 0
  *   [4] version == 3     ? 1 : 0

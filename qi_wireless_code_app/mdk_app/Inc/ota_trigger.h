@@ -89,8 +89,8 @@ typedef struct
 {
   uint32_t magic;            /* @0x00 0x4F54414D "MATO" */
   uint32_t version;          /* @0x04 META_VERSION = 3 */
-  uint8_t  app_valid;        /* @0x08 App region image valid (M1 diag b1) */
-  uint8_t  backup_valid;     /* @0x09 Backup pending-copy flag */
+  uint8_t  app_valid;        /* @0x08 仅诊断：Boot 搬运复验通过后置 1，出厂 0。跳转不看 */
+  uint8_t  backup_valid;     /* @0x09 APP 0x37 校验备份区后置 1；Boot 复验通过后清 0 */
   uint8_t  copy_fail_step;   /* @0x0A last backup-copy fail_step */
   uint8_t  last_boot_reason; /* @0x0B BOOT_REASON_* */
   uint32_t backup_crc32;     /* @0x0C staging payload CRC (copy pre-check) */

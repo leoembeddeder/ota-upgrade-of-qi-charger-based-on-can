@@ -60,7 +60,7 @@ int main(void)
     boot_diag_m2(0U, 0xFFU); /* no pending copy */
   }
 
-  /* step 4: verify App region and jump */
+  /* step 4: 现场验 App 区镜像再跳。不看 app_valid（那是 OTA 搬运成功粘性标志，出厂为 0） */
   if (boot_app_image_ok() == 0)
   {
     /* Persist last_boot_reason before jumping: its consumer reads it at
