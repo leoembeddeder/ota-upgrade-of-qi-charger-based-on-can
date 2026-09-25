@@ -31,9 +31,8 @@ void enter_safe_mode(uint8_t cause);
  * frames (62 21 13 FE fail_step / ABT heartbeat) untouched. */
 #define BOOT_DIAG_CAN_ID  0x18FF480DU
 /* Single-App (OTA-ARCH-0920) marker payloads:
- *   M1 0xA1: [app_valid 出厂=0，OTA 搬运复验通过后=1]
- *            [meta_src 0=primary/1=backup-copy/2=defaults]
- *            [magic_ok][ver_ok][crc_ok]  （跳转不看 app_valid）
+ *   M1 0xA1: [meta_src 0=primary/1=backup-copy/2=defaults]
+ *            [magic_ok][ver_ok][crc_ok]
  *   M2 0xA2: [copy result 0=start-or-none/1=committed/0xFF=failed]
  *            [detail: fail_step or 0xFF=not-pending]
  *            （字节序统一 b1=copy result, b2=detail：boot_safe_mode.c

@@ -208,42 +208,38 @@ void boot_diag_can_init(void)
 
 
 /**
- * @brief  发 M1：报告「这份 metadata 从哪来、自身是否完整、app_valid 是多少」
+ * @brief  发 M1：报告 metadata 来源与结构是否完整
  * @param  meta  应为 ota_metadata_t*（boot_metadata_init 里的 RAM 副本）
  * @note   必须先写 g_diag_meta_src 再调用。
- *         不写 Flash、不改决策。CAN ID 0x18FF480D，DLC=8，尾部 0xCC。
  *
  * 载荷：
  *   [0] 0xA1
- *   [1] app_valid（盘上旗子，出厂 0；仅 OTA 搬运复验通过后为 1。空指针则 0xFF）
- *   [2] meta_src：0 主区 / 1 备区恢复 / 2 默认值 / 0xFF 未记录
- *   [3] magic == "MATO" ? 1 : 0
- *   [4] version == 3     ? 1 : 0
- *   [5] CRC32（不含末尾 4 字节）与 meta->crc32 一致 ? 1 : 0
+ *   [1] meta_src：0 主区 / 1 备区恢复 / 2 默认值 / 0xFF 未记录
+ *   [2] magic == "MATO" ? 1 : 0
+ *   [3] version == META_VERSION ? 1 : 0
+ *   [4] CRC32（不含末尾 4 字节）与 meta->crc32 一致 ? 1 : 0
  */
 void boot_diag_m1(const void *meta)
 {
   const ota_metadata_t *m = (const ota_metadata_t *)meta;
-  uint8_t p[6];
+  uint8_t p[5];
 
   p[0] = 0xA1U;
-  p[1] = (m != (const ota_metadata_t *)0) ? m->app_valid : 0xFFU;
-  p[2] = g_diag_meta_src;
+  p[1] = g_diag_meta_src;
   if (m != (const ota_metadata_t *)0)
   {
-    /* 对 RAM 副本当场复验，给抓包侧看「加载结果」而不是 Flash 原件 */
-    p[3] = (uint8_t)((m->magic == META_MAGIC) ? 1U : 0U);
-    p[4] = (uint8_t)((m->version == META_VERSION) ? 1U : 0U);
-    p[5] = (uint8_t)((boot_crc32((const void *)m,
+    p[2] = (uint8_t)((m->magic == META_MAGIC) ? 1U : 0U);
+    p[3] = (uint8_t)((m->version == META_VERSION) ? 1U : 0U);
+    p[4] = (uint8_t)((boot_crc32((const void *)m,
                                  sizeof(ota_metadata_t) - 4U) == m->crc32) ? 1U : 0U);
   }
   else
   {
+    p[2] = 0U;
     p[3] = 0U;
     p[4] = 0U;
-    p[5] = 0U;
   }
-  boot_diag_frame_send(p, 6U);
+  boot_diag_frame_send(p, 5U);
 }
 
 

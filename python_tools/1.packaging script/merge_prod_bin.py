@@ -6,8 +6,7 @@ Single-App Flash layout (OTA-ARCH-0920):
   0x08004000  App image (XATO header + firmware, max 48KB = 0xC000)
   0x08010000  Backup region (OTA staging; left erased 0xFF in factory bin)
   0x0801C000  Metadata (left erased; BOOT self-heals defaults on first
-              boot: meta_validate fails -> app_valid=0 -> image verify
-              still runs directly on the App region -> flag set + jump)
+              boot: meta_validate fails -> 默认重建；现场验 App 镜像再跳)
 
 Usage:
     python merge_prod_bin.py

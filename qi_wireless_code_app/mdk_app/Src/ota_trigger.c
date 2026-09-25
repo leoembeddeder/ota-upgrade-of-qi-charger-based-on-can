@@ -49,7 +49,6 @@ static void meta_fill_defaults(ota_metadata_t *meta)
 
   meta->magic             = OTA_META_MAGIC;
   meta->version           = OTA_META_VERSION;
-  meta->app_valid         = 0U;
   meta->backup_valid      = 0U;
   meta->copy_fail_step    = 0U;
   meta->last_boot_reason  = 0U;

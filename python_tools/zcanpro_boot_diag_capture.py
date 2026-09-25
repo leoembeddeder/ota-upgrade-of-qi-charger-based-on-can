@@ -118,12 +118,12 @@ def _decode_m(dat):
         return "?"
     mk = dat[0]
     if mk == 0xA1:
-        src = {0: "主区", 1: "备区恢复", 2: "默认重建"}.get(dat[2] if len(dat) > 2 else 0xFF, "未知")
-        return "M1 metadata  app_valid=%d src=%s magic=%d ver=%d crc=%d" % (
-            dat[1] if len(dat) > 1 else -1, src,
+        src = {0: "主区", 1: "备区恢复", 2: "默认重建"}.get(dat[1] if len(dat) > 1 else 0xFF, "未知")
+        return "M1 metadata  src=%s magic=%d ver=%d crc=%d" % (
+            src,
+            dat[2] if len(dat) > 2 else -1,
             dat[3] if len(dat) > 3 else -1,
-            dat[4] if len(dat) > 4 else -1,
-            dat[5] if len(dat) > 5 else -1)
+            dat[4] if len(dat) > 4 else -1)
     if mk == 0xA2:
         result = dat[1] if len(dat) > 1 else 0xFF
         detail = dat[2] if len(dat) > 2 else 0xFF

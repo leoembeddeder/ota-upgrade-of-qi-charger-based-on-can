@@ -218,7 +218,6 @@ int8_t boot_copy_backup(ota_metadata_t *meta)
   }
 
   /* 5. commit: only now clear the pending flag (power-loss safe) */
-  meta->app_valid    = 1U;
   meta->backup_valid = 0U;
   meta->ota_state    = OTA_STATE_IDLE;
   meta->last_boot_reason = BOOT_REASON_OTA_ACT;

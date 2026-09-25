@@ -34,8 +34,7 @@ int8_t boot_backup_pending(const ota_metadata_t *meta);
  * @note   power-loss safe: backup_valid stays set until copy + recheck
  *         pass; each power-on retries. Steps: verify Backup image
  *         (magic/length/CRC + vectors target App window) -> erase
- *         App region -> word copy -> re-verify App -> update metadata
- *         (app_valid, clear backup_valid) -> save.
+ *         App region -> word copy -> re-verify App -> clear backup_valid -> save.
  * @retval 0 on success, -1 on failure (fail_step stored in
  *         meta.copy_fail_step, copy_retry_count++
  *         saved; flag left set for retry)

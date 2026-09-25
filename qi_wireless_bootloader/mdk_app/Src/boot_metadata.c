@@ -5,7 +5,7 @@
  **************************************************************************
  *
  * Dual-copy metadata at 0x0801C000 / 0x0801C800. Single-App format
- * (META_VERSION=3): v2-and-earlier metadata is rejected -> defaults
+ * (META_VERSION=4): v3 及更早拒绝 -> 默认重建
  * rebuild (Q2 slimming).
  * All writes funnel through meta_write_to_flash (IRQ-off single-bank
  * erase+program+readback) — power-safe, backup copy written first.
@@ -99,7 +99,7 @@ static int8_t meta_write_to_flash(uint32_t addr, const ota_metadata_t *meta)
  * @param  meta  指向主区或备区（或 RAM 副本）
  * @retval  0  magic + version + CRC 均通过
  *         -1  任一检查失败（空片、旧版、写损）
- * @note   不算 app_valid/backup_valid；那些是镜像状态，不是结构完整性。
+ * @note   不算 backup_valid；那是待搬运旗，不是结构完整性。
  *         CRC 覆盖范围是结构体去掉末尾 crc32 字段
  *         （META_CRC32_OFFSET = sizeof(ota_metadata_t) - 4）。
  */
@@ -114,7 +114,7 @@ static int8_t meta_validate(const ota_metadata_t *meta)
     return -1;
   }
 
-  /* 布局版本：只接受 META_VERSION==3，v2 及更早强制重建 */
+  /* 布局版本：只接受 META_VERSION==4，v3 及更早强制重建 */
   if (meta->version != META_VERSION)
   {
     return -1;
@@ -138,7 +138,6 @@ static void meta_fill_defaults(ota_metadata_t *meta)
 
   meta->magic             = META_MAGIC;
   meta->version           = META_VERSION;
-  meta->app_valid         = 0U;
   meta->backup_valid      = 0U;
   meta->copy_fail_step    = 0U;
   meta->last_boot_reason  = BOOT_REASON_POWER_ON;
@@ -184,7 +183,7 @@ uint32_t boot_crc32(const void *data, uint32_t length)
  * @param  meta  调用方提供的 RAM 缓冲（通常是 g_meta）
  * @retval  0  主区或备区校验通过，已拷入 meta
  *         -1  两边都无效，已写入默认值（空片 / 旧版 / CRC 坏）
- * @note   校验：magic "MATO" + META_VERSION==3 + CRC32。
+ * @note   校验：magic "MATO" + META_VERSION==4 + CRC32。
  *         v2 及更早直接失败，走默认重建。
  *         每条路径结束都会设 g_diag_meta_src 并发 M1。
  *         备区恢复 / 默认重建才会 boot_metadata_save（先备后主）。

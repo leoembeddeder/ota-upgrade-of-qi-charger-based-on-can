@@ -17,10 +17,9 @@
  * flag in metadata -> reset -> BOOT erases App region, copies Backup ->
  * App, re-verifies, clears flag, jumps to App.
  *
- * Metadata struct v3 slim layout (28 bytes, crc32 at offset 0x18,
- * META_VERSION=3), defined identically in boot/app projects —
- * C/Python same-source; v2-and-earlier metadata rejected -> defaults
- * rebuild (Q2 slimming).
+ * Metadata struct v4 (28 bytes, crc32 at offset 0x18, META_VERSION=4),
+ * defined identically in boot/app. v3 及更早拒绝 → 默认重建。
+ * v4 删除无门禁意义的 app_valid；backup_valid 仍在 @0x08。
  */
 
 #ifndef __BOOT_METADATA_H
@@ -52,7 +51,7 @@ extern "C" {
 #define SRAM_SIZE               0x5000U
 
 #define META_MAGIC              0x4F54414DU   /* "MATO" */
-#define META_VERSION            3U            /* v3 slim layout (Q2) */
+#define META_VERSION            4U            /* v4: 无 app_valid */
 
 /* boot reason codes */
 #define BOOT_REASON_POWER_ON    0x00U
@@ -69,23 +68,20 @@ extern "C" {
 /* exported types ---------------------------------------------------------- */
 
 /**
- * @brief  OTA metadata structure v3 (28 bytes total, slim layout)
- * @note   Field offsets must stay identical across boot/app projects.
- *         Legacy A/B-slot fields are retained as reserved bytes.
+ * @brief  OTA metadata v4（28B，crc32 @0x18；与 ota_trigger.h 同构）
  */
 typedef struct
 {
   uint32_t magic;            /* @0x00 0x4F54414D "MATO" */
-  uint32_t version;          /* @0x04 META_VERSION = 3 */
-  uint8_t  app_valid;        /* @0x08 仅诊断：Boot 完成 Backup→App 复验后置 1。
-                              * 出厂/Keil 直烧为 0。跳转不看此位，看 boot_app_image_ok() */
-  uint8_t  backup_valid;     /* @0x09 待搬运旗：APP 0x37 校验备份区后置 1；Boot 复验通过后清 0 */
-  uint8_t  copy_fail_step;   /* @0x0A last backup-copy fail_step */
-  uint8_t  last_boot_reason; /* @0x0B BOOT_REASON_* */
-  uint32_t backup_crc32;     /* @0x0C staging payload CRC (copy pre-check) */
+  uint32_t version;          /* @0x04 META_VERSION = 4 */
+  uint8_t  backup_valid;     /* @0x08 APP 校验备份区后置 1；Boot 复验通过后清 0 */
+  uint8_t  copy_fail_step;   /* @0x09 last backup-copy fail_step */
+  uint8_t  last_boot_reason; /* @0x0A BOOT_REASON_* */
+  uint8_t  reserved0;        /* @0x0B 对齐 */
+  uint32_t backup_crc32;     /* @0x0C staging payload CRC */
   uint32_t copy_retry_count; /* @0x10 failed copy attempts (DID 0x2116) */
   uint8_t  ota_state;        /* @0x14 OTA_STATE_* */
-  uint8_t  reserved[3];      /* @0x15 alignment/future */
+  uint8_t  reserved[3];      /* @0x15 */
   uint32_t crc32;            /* @0x18 CRC32 of all above fields */
 } ota_metadata_t;
 

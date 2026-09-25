@@ -15,7 +15,7 @@
  *   Backup   0x08010000..0x0801BFFF  48KB
  *   Metadata 0x0801C000 / 0x0801C800, DeviceInfo 0x0801D000, NVM 0x0801E000
  *
- * ota_metadata_t v3 slim layout (28B, crc32 @0x18, META_VERSION=3),
+ * ota_metadata_t v4 (28B, crc32 @0x18, META_VERSION=4),
  * identical across projects; v2-and-earlier data rejected -> defaults.
  */
 
@@ -45,7 +45,7 @@ extern "C" {
 #define OTA_FLASH_SECTOR_SIZE   0x400U
 
 #define OTA_META_MAGIC          0x4F54414DU   /* "MATO" */
-#define OTA_META_VERSION        3U            /* v3 slim layout (Q2) */
+#define OTA_META_VERSION        4U            /* v4: 无 app_valid */
 #define OTA_IMAGE_MAGIC         0x4F544158U   /* "XATO" */
 
 /* DID diagnostics markers (0x2114 during download reports 0x02 = backup) */
@@ -82,21 +82,20 @@ typedef struct
 } ota_image_header_t;
 
 /**
- * @brief  OTA metadata v3 (28B; crc32 @0x18; identical to
- *         boot_metadata.h; META_VERSION=3)
+ * @brief  OTA metadata v4（28B，crc32 @0x18；与 boot_metadata.h 同构）
  */
 typedef struct
 {
   uint32_t magic;            /* @0x00 0x4F54414D "MATO" */
-  uint32_t version;          /* @0x04 META_VERSION = 3 */
-  uint8_t  app_valid;        /* @0x08 仅诊断：Boot 搬运复验通过后置 1，出厂 0。跳转不看 */
-  uint8_t  backup_valid;     /* @0x09 APP 0x37 校验备份区后置 1；Boot 复验通过后清 0 */
-  uint8_t  copy_fail_step;   /* @0x0A last backup-copy fail_step */
-  uint8_t  last_boot_reason; /* @0x0B BOOT_REASON_* */
-  uint32_t backup_crc32;     /* @0x0C staging payload CRC (copy pre-check) */
+  uint32_t version;          /* @0x04 META_VERSION = 4 */
+  uint8_t  backup_valid;     /* @0x08 APP 校验备份区后置 1；Boot 复验通过后清 0 */
+  uint8_t  copy_fail_step;   /* @0x09 last backup-copy fail_step */
+  uint8_t  last_boot_reason; /* @0x0A BOOT_REASON_* */
+  uint8_t  reserved0;        /* @0x0B 对齐 */
+  uint32_t backup_crc32;     /* @0x0C staging payload CRC */
   uint32_t copy_retry_count; /* @0x10 failed copy attempts (DID 0x2116) */
   uint8_t  ota_state;        /* @0x14 OTA_STATE_* */
-  uint8_t  reserved[3];      /* @0x15 alignment/future */
+  uint8_t  reserved[3];      /* @0x15 */
   uint32_t crc32;            /* @0x18 CRC32 of all above fields */
 } ota_metadata_t;
 
