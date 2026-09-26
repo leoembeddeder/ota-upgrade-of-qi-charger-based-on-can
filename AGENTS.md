@@ -61,6 +61,20 @@
 
 CAN 总线：**250 kbps、Classical、29-bit 扩展帧**。终端电阻 120Ω。CANH/CANL/GND 接充电器。
 
+### 本机环境差异记录（2026-09-26，xuanxuan @ DESKTOP-LMI7A8K）
+
+上表 COM9 / BUSID `7-2` 为旧机器配置，一律以 `usbipd list` 实测为准：
+
+| 项 | 本机实测 |
+|----|----------|
+| WSL 仓库路径 | `/home/xuanxuan/embedded_item/ota-upgrade-of-qi-charger-based-on-can` |
+| ZQWL-CANFD | Windows COM7 / usbipd BUSID **`3-4`**，attach 后 `/dev/ttyACM0` |
+| AT-Link-Plus | Windows COM4 / BUSID **`3-2`**，**禁止 attach** |
+| 用户组 | `xuanxuan` 已在 `dialout`，开串口命令无需 `sg dialout` 包裹 |
+
+新增工具：`python_tools/zqwl_can_send.py`（单帧发送 + 窗口抓包，ISO-TP 首帧自动回 FC），
+与 `zqwl_can_listen.py` 互斥（同一串口只能一个进程打开）。
+
 ### 把盒子交给 WSL（Windows 管理员 PowerShell）
 
 ```powershell
