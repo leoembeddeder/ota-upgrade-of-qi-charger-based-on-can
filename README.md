@@ -265,9 +265,9 @@ python merge_prod_bin.py
 | 故障处理 | 热管理 / FOD / 硬件故障 (E1~E7) | 待实现 |
 | 生命周期广播 | 完整字节格式与事件驱动 (D3/D5/D6) | 当前为简化版 |
 | 低功耗管理 | H1~H8 | 当前仅 SIT1145 收发器级 Standby |
-| | | UDS 空闲 180s → SIT1145 切 Standby 监听，总线活动唤醒 |
+| | | APP 进入后收发器即 Normal、立即可通信；UDS 空闲 30s → SIT1145 切 Standby 监听，总线活动唤醒 |
 | | | MCU 主循环纯轮询，无 WFI/Stop，MCU 本身未休眠 |
-| | | 超时 180s 为硬编码（`CAN_LP_IDLE_TIMEOUT_MS`），非 SRS 要求的 DID 0x2117 可配（该 DID 未实现） |
+| | | 超时 30s 为硬编码（`CAN_LP_IDLE_TIMEOUT_MS`），非 SRS 要求的 DID 0x2117 可配（该 DID 未实现） |
 | UDS 业务流程 | F1~F6 | 待实现 |
 
 ---
