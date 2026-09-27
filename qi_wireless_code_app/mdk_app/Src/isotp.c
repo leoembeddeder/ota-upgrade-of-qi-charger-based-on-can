@@ -62,9 +62,9 @@ static void isotp_delay_ms(uint32_t ms)
  * @note   单次尝试快速出结论，不走 isotp_can_send 的 N_As=1s 自旋（FC
  *         时效以毫秒计，自旋会占死 RX 调用上下文）。发送结果不丢弃：
  *         发送前后 last_tx_handle 对比识别静默入队失败（同 ota_download.c
- *         0x37 收尾写法；原 ECUReset 场景已删除），入队成功后按 handle
+ *         0x37 收尾写法），入队成功后按 handle
  *         确认该帧真正上总线，
- *         ABORTED/REJECTED/确认超时均算失败——旧 (void) 路径对「发了但
+ *         ABORTED/REJECTED/确认超时均算失败——忽略发送结果对「发了但
  *         没上总线」完全无感，是实机 FC 静默丢失的直接放大器。
  * @param  can_id:  FC frame CAN ID
  * @param  fc_data: filled 8-byte FC frame

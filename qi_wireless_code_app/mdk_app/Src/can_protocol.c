@@ -166,7 +166,7 @@ static uint16_t g_lp_last_standby_sec = 0;
 /** sticky：can_lp_hold_standby 两次 standby_mode_set 失败置 1（DID 0x2119 flags bit2） */
 static uint8_t  g_lp_standby_fail = 0;
 /** 上电（trial/非 trial 同路径）推迟到 __enable_irq() 之后再 enter_normal：
- *  harvest/wait_cts 依赖 SysTick；2026-09-27 起上电即 Normal，init 统一置 1 */
+ *  harvest/wait_cts 依赖 SysTick；init 统一置 1 */
 static uint8_t  g_lp_need_online = 0;
 
 /** ignore self-wake for a short window after entering Standby */
@@ -827,7 +827,7 @@ static int8_t fill_did_payload(uint16_t did, uint8_t *out, uint8_t *olen)
     case DID_SW_VERSION:
     {
       /* 版本唯一真相源 = APP 编译时常量 SW_VERSION_STR（本文件顶部）。
-       * 不再从 OTA metadata / XATO 镜像头 version 字段取值：metadata 会被
+       * OTA metadata / XATO 镜像头 version 字段不作版本来源：metadata 会被
        * trial/rollback/defaults 重建改写，双副本全坏时会被默认值破坏性覆盖；
        * 镜像头 version 仅保留镜像标识/打包校验用途，不代表运行代码版本。 */
       device_info_pad32(out, SW_VERSION_STR);
@@ -2186,19 +2186,18 @@ void can_protocol_init(void)
   /* load persistent Qi config from NVM (nvm_drv_init already called in main) */
   qi_nvm_load_config();
 
-  /* 2026-09-27 需求：上电即 Normal，空闲 CAN_LP_IDLE_TIMEOUT_MS（UDS 无收发）
-   * 后才进 Standby。trial 与非 trial 同路径置 g_lp_need_online，由首次
-   * can_protocol_poll 延时 can_lp_enter_normal（SysTick 已就绪；harvest /
-   * sit1145_wait_cts / wait_tx_idle 都看 timer_get_tick）完成
-   * sit1145_normal_mode_set + can_driver_online。trial confirm 流程本就要求
-   * CAN 在线，行为只会更可靠，流程本身不受影响。 */
+  /* 上电即 Normal，空闲 CAN_LP_IDLE_TIMEOUT_MS（UDS 无收发）后进 Standby。
+   * trial 与非 trial 同路径置 g_lp_need_online，由首次 can_protocol_poll
+   * 延时 can_lp_enter_normal（SysTick 已就绪；harvest / sit1145_wait_cts /
+   * wait_tx_idle 都看 timer_get_tick）完成 sit1145_normal_mode_set +
+   * can_driver_online。 */
   if (can_lp_trial_needs_normal() != 0U)
   {
     g_lp_need_online = 1U;
   }
   else
   {
-    /* 非 trial 同样延时 enter_normal，上电即 Normal（不再上电即 hold_standby） */
+    /* 非 trial 同样延时 enter_normal，上电即 Normal */
     g_lp_need_online = 1U;
   }
 }
