@@ -2191,15 +2191,8 @@ void can_protocol_init(void)
    * 延时 can_lp_enter_normal（SysTick 已就绪；harvest / sit1145_wait_cts /
    * wait_tx_idle 都看 timer_get_tick）完成 sit1145_normal_mode_set +
    * can_driver_online。 */
-  if (can_lp_trial_needs_normal() != 0U)
-  {
-    g_lp_need_online = 1U;
-  }
-  else
-  {
-    /* 非 trial 同样延时 enter_normal，上电即 Normal */
-    g_lp_need_online = 1U;
-  }
+  /* trial / 非 trial 统一上电 Normal，首次 poll 延时 enter_normal */
+  g_lp_need_online = 1U;
 }
 
 /**
@@ -2389,8 +2382,9 @@ void can_protocol_poll(void)
   }
 
 #if (!defined(CAN_LP_STANDBY_ENABLE) || (CAN_LP_STANDBY_ENABLE != 0U)) && (CAN_LP_IDLE_TIMEOUT_MS > 0U)
-  /* 有符号比较（同 g_announce_due_ms 判定风格）：RX 中断若在取样 now 后
-   * 刷新 g_uds_last_ms，无符号减法会下溢成巨大值导致误进 Standby */
+  /* 有符号比较（同 g_announce_due_ms 判定风格）：同轮 poll 内 mark_uds（响应发送 /
+   * 唤醒 enter_normal）刷新 g_uds_last_ms 后，过期 now 参与无符号减法会下溢成
+   * 巨大值导致误进 Standby */
   if ((int32_t)(now - g_uds_last_ms) >= (int32_t)CAN_LP_IDLE_TIMEOUT_MS)
   {
     can_lp_enter_standby();
