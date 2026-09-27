@@ -152,7 +152,7 @@ static uint8_t  g_qi_last_fault_detail[4] = {0U};  /*!< DID 0x2110, 4-byte fault
 /* Qi persistent config (loaded from NVM at init) */
 static uint16_t g_qi_power_limit_mw   = 1500U;  /*!< DID 0x210D, 1500 mW = 15W default */
 
-/** @brief  SIT1145 Normal + CAN online. Power-on default is Standby. */
+/** @brief  SIT1145 Normal + CAN online. Power-on is Normal (idle 30 s → Standby). */
 static uint8_t  g_can_awake = 0;
 static uint8_t  g_need_lifecycle_announce = 0;
 static uint32_t g_uds_last_ms = 0;
@@ -163,7 +163,10 @@ static uint8_t  g_lp_wup_count = 0;
 static uint8_t  g_lp_woke_from_standby = 0;
 static uint8_t  g_lp_last_wake_src = 0;
 static uint16_t g_lp_last_standby_sec = 0;
-/** OTA trial 推迟到 __enable_irq() 之后再 enter_normal：harvest/wait_cts 依赖 SysTick */
+/** sticky：can_lp_hold_standby 两次 standby_mode_set 失败置 1（DID 0x2119 flags bit2） */
+static uint8_t  g_lp_standby_fail = 0;
+/** 上电（trial/非 trial 同路径）推迟到 __enable_irq() 之后再 enter_normal：
+ *  harvest/wait_cts 依赖 SysTick；2026-09-27 起上电即 Normal，init 统一置 1 */
 static uint8_t  g_lp_need_online = 0;
 
 /** ignore self-wake for a short window after entering Standby */
@@ -173,9 +176,11 @@ static uint8_t  g_lp_need_online = 0;
 /** after CAN online, spin-poll RX so host hardware retransmit of 10 01 can be ACKed */
 #define CAN_LP_RX_HARVEST_MS      30U
 
-/** 180 s with no UDS RX/TX → SIT1145 Standby (ISO 11898-2 WUP can wake)
- *  受 CAN_LP_STANDBY_ENABLE 总开关控制：开关=0 时该超时路径整段不编译 */
-#define CAN_LP_IDLE_TIMEOUT_MS  (180UL * 1000UL)
+/** 30 s with no UDS RX/TX → SIT1145 Standby (ISO 11898-2 WUP can wake)
+ *  受 CAN_LP_STANDBY_ENABLE 总开关控制（can_protocol.h）：
+ *  =1（含未定义，生产语义）：上电即 Normal，仅空闲超时进 Standby；
+ *  =0：空闲停机整段不编译 */
+#define CAN_LP_IDLE_TIMEOUT_MS  (30UL * 1000UL)
 
 static void can_lp_mark_uds(void)
 {
@@ -371,16 +376,33 @@ static void can_lp_enter_normal(void)
 }
 
 /* Standby 进入函数：受 CAN_LP_STANDBY_ENABLE 总开关控制（can_protocol.h）。
- * 开关=0（回归调试期临时禁用）时不编译，源码完整保留，唤醒/恢复路径不受影响；
- * 生产恢复改 1 后本段与历史实现逐字节一致。 */
-#if (CAN_LP_STANDBY_ENABLE != 0U)
+ * =1（含未定义，生产语义）：仅空闲超时进 Standby，上电即 Normal；
+ * =0：空闲停机整段不编译，源码完整保留，唤醒/恢复路径不受影响。 */
+#if !defined(CAN_LP_STANDBY_ENABLE) || (CAN_LP_STANDBY_ENABLE != 0U)
 static void can_lp_hold_standby(void)
 {
+  uint32_t t0;
+
   /* 先关 MCU CAN、再切收发器 Standby，最后才改 GPIO。
    * 若还在 Normal 就把 TXD 改成 GPIO，会在总线上打出显性。 */
   can_driver_offline();
   sit1145_wake_enable();
-  (void)sit1145_standby_mode_set();
+
+  /* 模式切换失败：延时 1ms 重试一次（与原 sit1145_init 步骤10 同模式）。
+   * 两次都失败仍继续后续收尾（收发器态未知，但 MCU 侧必须下线），
+   * 置 sticky 标记 g_lp_standby_fail，经 DID 0x2119 flags bit2 可观测。
+   * TODO: 现有诊断计数器无 Standby 进入失败专用计数，
+   *       如需计数/遥测升级请新增计数器后在此累加。 */
+  if (sit1145_standby_mode_set() == 0U)
+  {
+    t0 = timer_get_tick();
+    while ((timer_get_tick() - t0) < 1U) { __NOP(); }
+    if (sit1145_standby_mode_set() == 0U)
+    {
+      g_lp_standby_fail = 1U;
+    }
+  }
+
   sit1145_wakeup_clear();
   can_driver_pins_standby();
   g_can_awake = 0U;
@@ -923,9 +945,10 @@ static int8_t fill_did_payload(uint16_t did, uint8_t *out, uint8_t *olen)
       *olen = 1U;
       return 0;
     case DID_SIT1145_LP_STATUS:
-      /* [0] bit0=ever_standby bit1=last_wake_was_wup
+      /* [0] bit0=ever_standby bit1=last_wake_was_wup bit2=standby_fail(sticky)
        * [1] wup_count  [2-3] last_standby_sec LE */
       out[0] = (uint8_t)((g_lp_ever_standby != 0U) | ((g_lp_woke_from_standby != 0U) << 1) |
+                         ((g_lp_standby_fail != 0U) << 2) |
                          ((g_lp_last_wake_src & 0x0FU) << 4));
       out[1] = g_lp_wup_count;
       out[2] = (uint8_t)(g_lp_last_standby_sec & 0xFFU);
@@ -2163,26 +2186,20 @@ void can_protocol_init(void)
   /* load persistent Qi config from NVM (nvm_drv_init already called in main) */
   qi_nvm_load_config();
 
-  /* CAN_LP_STANDBY_ENABLE=1：sit1145_init() 已进 Standby。OTA trial 必须在
-   * SysTick 中断起来后再 enter_normal（harvest / sit1145_wait_cts / wait_tx_idle
-   * 都看 timer_get_tick）。其余上电保持 Standby。
-   * CAN_LP_STANDBY_ENABLE=0（回归调试期临时禁用）：上电/复位一律不进 Standby，
-   * 与 trial 同路径置 g_lp_need_online，首次 can_protocol_poll 统一延时
-   * can_lp_enter_normal（SysTick 已就绪），CAN 常在线；trial confirm 流程
-   * 本就要求 CAN 在线，行为只会更可靠，流程本身不受影响。 */
+  /* 2026-09-27 需求：上电即 Normal，空闲 CAN_LP_IDLE_TIMEOUT_MS（UDS 无收发）
+   * 后才进 Standby。trial 与非 trial 同路径置 g_lp_need_online，由首次
+   * can_protocol_poll 延时 can_lp_enter_normal（SysTick 已就绪；harvest /
+   * sit1145_wait_cts / wait_tx_idle 都看 timer_get_tick）完成
+   * sit1145_normal_mode_set + can_driver_online。trial confirm 流程本就要求
+   * CAN 在线，行为只会更可靠，流程本身不受影响。 */
   if (can_lp_trial_needs_normal() != 0U)
   {
     g_lp_need_online = 1U;
   }
   else
   {
-#if (CAN_LP_STANDBY_ENABLE != 0U)
-    g_lp_need_online = 0U;
-    can_lp_hold_standby();
-#else
-    /* 临时禁用：非 trial 上电同样延时 enter_normal，保持 CAN 在线 */
+    /* 非 trial 同样延时 enter_normal，上电即 Normal（不再上电即 hold_standby） */
     g_lp_need_online = 1U;
-#endif
   }
 }
 
@@ -2372,8 +2389,10 @@ void can_protocol_poll(void)
     }
   }
 
-#if (CAN_LP_STANDBY_ENABLE != 0U) && (CAN_LP_IDLE_TIMEOUT_MS > 0U)
-  if ((now - g_uds_last_ms) >= CAN_LP_IDLE_TIMEOUT_MS)
+#if (!defined(CAN_LP_STANDBY_ENABLE) || (CAN_LP_STANDBY_ENABLE != 0U)) && (CAN_LP_IDLE_TIMEOUT_MS > 0U)
+  /* 有符号比较（同 g_announce_due_ms 判定风格）：RX 中断若在取样 now 后
+   * 刷新 g_uds_last_ms，无符号减法会下溢成巨大值导致误进 Standby */
+  if ((int32_t)(now - g_uds_last_ms) >= (int32_t)CAN_LP_IDLE_TIMEOUT_MS)
   {
     can_lp_enter_standby();
     return;

@@ -31,7 +31,6 @@
 /* 头文件 ------------------------------------------------------------------*/
 #include "sit1145.h"
 #include "timer_drv.h"
-#include "can_protocol.h"   /* CAN_LP_STANDBY_ENABLE：Standby 进入总开关 */
 
 /* ==========================================================================
  *  私有宏定义
@@ -957,7 +956,7 @@ void sit1145_wuf_clear(void)
 
 /**
  * @brief  初始化 SIT1145 CAN 收发器
- * @note   完整初始化流程（10 步）：
+ * @note   完整初始化流程（9 步，2026-09-27 起上电不再进 Standby）：
  *         1. 使能 GPIOA/GPIOB/SPI1 外设时钟
  *         2. 配置 SPI1 数据引脚（PA5=SCK, PA6=MISO, PA7=MOSI）
  *         3. 配置 CS 引脚（PA4，GPIO 输出，默认高=未选中）
@@ -967,7 +966,9 @@ void sit1145_wuf_clear(void)
  *         7. 配置 CAN Control 寄存器（CFDC=1, CMC=01）
  *         8. 配置 Data Rate 寄存器（250kbps）
  *         9. 使能标准 CAN 唤醒（CWE=1）
- *        10. 进入 Standby 模式（APP 低功耗默认状态）
+ *         （原步骤10「进入 Standby 模式」已删：2026-09-27 起上电保持 Normal，
+ *          收发器停留在步骤7 CMC 配置态；空闲 30s 后由 can_protocol 的
+ *          can_lp_enter_standby 进 Standby）
  * @retval 1=初始化成功，0=失败（SPI 通信异常或寄存器回读不匹配）
  */
 uint8_t sit1145_init(void)
@@ -1081,23 +1082,9 @@ uint8_t sit1145_init(void)
   sit1145_wake_enable();    /* 写 CWE=1 到 EVENT_EN 寄存器 */
   sit1145_wakeup_clear();   /* 清除可能残留的 CW 标志 */
 
-  /* ---- 步骤10：进入 Standby 模式（APP 低功耗默认状态）----
-   *   Standby 下 SPI 仍可访问，CAN 总线被动监听
-   *   失败时重试一次
-   *   CAN_LP_STANDBY_ENABLE=0（回归调试期临时禁用）时跳过：收发器不进
-   *   Standby，随后 can_protocol_init → 首次 poll 的 can_lp_enter_normal
-   *   会兜底 sit1145_normal_mode_set + can_driver_online，CAN 常在线。
-   *   宏未定义时保持进入 Standby（生产语义，防误配）。 */
-#if !defined(CAN_LP_STANDBY_ENABLE) || (CAN_LP_STANDBY_ENABLE != 0U)
-  if (sit1145_standby_mode_set() == 0U)
-  {
-    sit1145_delay_ms(1U);
-    if (sit1145_standby_mode_set() == 0U)
-    {
-      return 0;  /* 两次都失败 */
-    }
-  }
-#endif /* CAN_LP_STANDBY_ENABLE */
+  /* （原步骤10「进入 Standby 模式」已删：2026-09-27 需求改为上电保持 Normal，
+   *   收发器停留在步骤7 CMC 配置态；空闲超时进 Standby 与失败重试逻辑移至
+   *   can_protocol.c can_lp_hold_standby） */
 
   return 1;  /* 初始化成功 */
 }

@@ -440,7 +440,8 @@ typedef struct {
  *         7. 配置 CAN Control（CFDC=1, CMC=01）
  *         8. 配置 Data Rate（250kbps）
  *         9. 使能标准 CAN 唤醒（CWE=1）
- *        10. 进入 Standby 模式（APP 低功耗默认状态）
+ *         （原步骤10「进入 Standby 模式」已删：2026-09-27 起上电保持 Normal，
+ *          空闲 30s 后由 can_protocol 进 Standby）
  * @retval 1 成功，0 失败
  */
 uint8_t sit1145_init(void);

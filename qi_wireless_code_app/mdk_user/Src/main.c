@@ -55,7 +55,8 @@ int main(void)
   qi_uart_init();
   __enable_irq();
 
-  /* SIT1145 is in Standby. BOOTUP/OPERATIONAL after first CAN wake. */
+  /* SIT1145 powers up in Normal; enters Standby after 30 s UDS idle.
+   * BOOTUP/OPERATIONAL after CAN online (first poll enter_normal). */
   lifecycle_init();
 
   /* main loop (trial-window logic removed: BOOT owns backup->App copy) */
